@@ -18,6 +18,7 @@ import { ToolboxPage } from "./ToolboxPage";
 import { TooltipLayer } from "./Tooltip";
 import { TitleBar } from "./TitleBar";
 import { PopupMenu } from "./PopupMenu";
+import { SshPromptHost } from "./SshPrompt";
 import "./App.css";
 
 interface Pane {
@@ -594,6 +595,7 @@ export default function App() {
       </main>
 
       <ModalHost />
+      <SshPromptHost />
       <TooltipLayer />
       {dialog?.kind === "tmux" && (
         <TmuxDialog

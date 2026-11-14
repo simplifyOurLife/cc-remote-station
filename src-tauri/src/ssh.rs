@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
-use russh::ChannelMsg;
-use russh::client::{self, ChannelOpenHandle, Handle, KeyboardInteractiveAuthResponse};
+use russh::client::{self, AuthResult, ChannelOpenHandle, Handle, KeyboardInteractiveAuthResponse};
+use russh::{ChannelMsg, MethodKind, MethodSet};
+use tauri::Emitter;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{Algorithm, HashAlg, PublicKey, PublicKeyOrCertificate};
@@ -116,6 +117,66 @@ impl std::fmt::Display for NeedSecret {
 
 impl std::error::Error for NeedSecret {}
 
+/// 登录过程中服务器要的额外输入（验证码、动态口令等）：发 ssh-prompt 事件让前端弹窗，
+/// 握手停在这里等用户回答（ssh_prompt_answer）。不重新连接，验证码不会因为重连而作废
+pub struct Prompter {
+    app: tauri::AppHandle,
+    pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Option<Vec<String>>>>>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptRequest {
+    id: String,
+    host_name: String,
+    name: String,
+    instructions: String,
+    prompts: Vec<PromptField>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct PromptField {
+    text: String,
+    echo: bool,
+}
+
+impl Prompter {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self { app, pending: Mutex::default() }
+    }
+
+    async fn ask(&self, host_name: &str, name: &str, instructions: &str, prompts: Vec<PromptField>) -> Result<Vec<String>> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.lock().unwrap().insert(id.clone(), tx);
+        let count = prompts.len();
+        let req = PromptRequest {
+            id: id.clone(),
+            host_name: host_name.into(),
+            name: name.into(),
+            instructions: instructions.into(),
+            prompts,
+        };
+        self.app.emit("ssh-prompt", req)?;
+        // 服务器一般给几分钟登录时间，超时后弹窗也要收掉
+        let answer = tokio::time::timeout(Duration::from_secs(180), rx).await;
+        self.pending.lock().unwrap().remove(&id);
+        let _ = self.app.emit("ssh-prompt-done", &id);
+        match answer {
+            Ok(Ok(Some(a))) if a.len() == count => Ok(a),
+            Ok(_) => bail!("已取消 {host_name} 的二次验证"),
+            Err(_) => bail!("{host_name} 的二次验证等待超时，请重新连接"),
+        }
+    }
+
+    /// 前端回答或取消（None）
+    pub fn answer(&self, id: &str, answers: Option<Vec<String>>) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(id) {
+            let _ = tx.send(answers);
+        }
+    }
+}
+
 /// 用户在弹窗里临时输入的密码/口令（按主机 id，含跳板机）；
 /// remember 为 true 时认证成功后存入系统凭据管理器
 #[derive(Default)]
@@ -222,6 +283,7 @@ pub async fn connect(
     host: &Host,
     trust: Option<&TrustedKey>,
     creds: &Credentials,
+    prompter: &Prompter,
     forwards: Vec<Forward>,
 ) -> Result<Conn> {
     let unknown = Arc::new(Mutex::new(None));
@@ -243,7 +305,7 @@ pub async fn connect(
             let jump_host = store.get(jump_id)?;
             // NeedSecret / UnknownHostKey 要原样传给前端弹窗，不能被 context 包住后丢掉类型——
             // anyhow 的 downcast 能穿透 context，这里照常加提示
-            let jump = Box::pin(connect(store, known_hosts, &jump_host, trust, creds, vec![]))
+            let jump = Box::pin(connect(store, known_hosts, &jump_host, trust, creds, prompter, vec![]))
                 .await
                 .with_context(|| format!("跳板机 {} 连接失败", jump_host.name))?;
             let channel = jump
@@ -266,7 +328,7 @@ pub async fn connect(
         }
     };
 
-    authenticate(&mut handle, host, creds).await?;
+    authenticate(&mut handle, host, creds, prompter).await?;
     let mut states = Vec::new();
     for f in forwards {
         let error = match handle.tcpip_forward("127.0.0.1", f.remote_port.into()).await {
@@ -287,7 +349,7 @@ pub async fn connect(
 }
 
 /// 密码/口令优先用弹窗里刚输入的，其次是凭据管理器里保存的；都没有或不对就返回 NeedSecret
-async fn authenticate(handle: &mut Handle<Client>, host: &Host, creds: &Credentials) -> Result<()> {
+async fn authenticate(handle: &mut Handle<Client>, host: &Host, creds: &Credentials, prompter: &Prompter) -> Result<()> {
     let user = host.user.as_str();
     let supplied = creds.secrets.get(&host.id).cloned();
     let secret = match &supplied {
@@ -295,20 +357,24 @@ async fn authenticate(handle: &mut Handle<Client>, host: &Host, creds: &Credenti
         None => secret_get(&host.id)?,
     };
     let need = |kind, wrong| NeedSecret { host_id: host.id.clone(), host_name: host.name.clone(), kind, wrong };
+    let mut auth = Auth2fa { handle, user, host_name: &host.name, prompter, password: None, asked: false };
     let ok = match &host.auth {
         Auth::Password => {
             let Some(password) = secret.clone() else {
                 return Err(need("password", false).into());
             };
-            let mut ok = handle.authenticate_password(user, password.clone()).await?.success();
-            // 不少服务器只开 keyboard-interactive，用同一个密码回答其提示
-            if !ok {
-                ok = keyboard_interactive(handle, user, &password).await?;
+            auth.password = Some(password.clone());
+            let mut result = auth.handle.authenticate_password(user, password).await?;
+            // 不少服务器只开 keyboard-interactive：密码提示自动用已有密码回答，验证码之类弹窗问用户
+            if matches!(result, AuthResult::Failure { partial_success: false, .. }) {
+                result = auth.keyboard_interactive().await?;
             }
-            if !ok {
-                return Err(need("password", true).into());
+            match auth.finish(result).await {
+                Ok(true) => true,
+                // 没问过用户就失败，基本是密码不对；问过验证码则密码和验证码都可能错，让用户重新输入密码再来一遍
+                Ok(false) => return Err(need("password", true).into()),
+                Err(e) => return Err(e),
             }
-            true
         }
         Auth::Key { path } => {
             let file = expand_home(path);
@@ -320,34 +386,112 @@ async fn authenticate(handle: &mut Handle<Client>, host: &Host, creds: &Credenti
                 Err(_) if secret.is_some() => return Err(need("passphrase", true).into()),
                 Err(e) => return Err(anyhow::Error::new(e).context(format!("无法读取私钥 {path}"))),
             };
-            let hash = rsa_hash(handle, key.algorithm()).await?;
+            let hash = rsa_hash(auth.handle, key.algorithm()).await?;
             let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
-            handle.authenticate_publickey(user, key).await?.success()
+            let result = auth.handle.authenticate_publickey(user, key).await?;
+            auth.finish(result).await?
         }
-        Auth::Agent => authenticate_agent(handle, user).await?,
+        Auth::Agent => {
+            let result = authenticate_agent(auth.handle, user).await?;
+            auth.finish(result).await?
+        }
     };
-    ensure!(ok, "{}@{} 认证失败", host.user, host.host);
+    ensure!(
+        ok,
+        "{}@{} 认证失败{}",
+        host.user,
+        host.host,
+        if auth.asked { "：验证码不正确或已过期，请重新连接" } else { "" }
+    );
     if let (true, Some(s)) = (creds.remember, supplied) {
         secret_set(&host.id, &s)?;
     }
     Ok(())
 }
 
-/// keyboard-interactive：把密码作为每个提示的答案。
-/// TODO: 验证码类二次验证需要在握手中途弹窗，暂不支持
-async fn keyboard_interactive(handle: &mut Handle<Client>, user: &str, password: &str) -> Result<bool> {
-    let mut resp = handle.authenticate_keyboard_interactive_start(user, None::<String>).await?;
-    for _ in 0..5 {
-        match resp {
-            KeyboardInteractiveAuthResponse::Success => return Ok(true),
-            KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
-            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
-                let answers = prompts.iter().map(|_| password.to_string()).collect();
-                resp = handle.authenticate_keyboard_interactive_respond(answers).await?;
+/// 第一种方式之后的认证：服务器回 partial_success（如 AuthenticationMethods publickey,keyboard-interactive）
+/// 时继续走剩下的方式，遇到验证码就弹窗问用户
+struct Auth2fa<'a> {
+    handle: &'a mut Handle<Client>,
+    user: &'a str,
+    host_name: &'a str,
+    prompter: &'a Prompter,
+    /// 已有的登录密码：密码类提示直接用它回答，不再弹窗
+    password: Option<String>,
+    /// 是否弹窗问过用户（失败时据此提示验证码问题）
+    asked: bool,
+}
+
+impl Auth2fa<'_> {
+    async fn finish(&mut self, mut result: AuthResult) -> Result<bool> {
+        for _ in 0..4 {
+            match result {
+                AuthResult::Success => return Ok(true),
+                AuthResult::Failure { partial_success: false, .. } => return Ok(false),
+                AuthResult::Failure { remaining_methods, .. } => result = self.next(&remaining_methods).await?,
             }
         }
+        Ok(false)
     }
-    Ok(false)
+
+    async fn next(&mut self, remaining: &MethodSet) -> Result<AuthResult> {
+        if remaining.contains(&MethodKind::KeyboardInteractive) {
+            return self.keyboard_interactive().await;
+        }
+        if remaining.contains(&MethodKind::Password) {
+            let password = match self.password.clone() {
+                Some(p) => p,
+                None => {
+                    self.asked = true;
+                    let field = PromptField { text: "密码：".into(), echo: false };
+                    let mut a = self.prompter.ask(self.host_name, "", "服务器要求再输入登录密码", vec![field]).await?;
+                    a.remove(0)
+                }
+            };
+            return Ok(self.handle.authenticate_password(self.user, password).await?);
+        }
+        let names: Vec<&str> = remaining.iter().map(<&str>::from).collect();
+        bail!("服务器还要求 {} 认证，暂不支持", names.join(" / "))
+    }
+
+    /// keyboard-interactive：密码类提示（只答一次，防止密码错时无限重试）用已有密码，其余弹窗问用户
+    async fn keyboard_interactive(&mut self) -> Result<AuthResult> {
+        let mut password = self.password.clone();
+        let mut resp = self.handle.authenticate_keyboard_interactive_start(self.user, None::<String>).await?;
+        for _ in 0..8 {
+            match resp {
+                KeyboardInteractiveAuthResponse::Success => return Ok(AuthResult::Success),
+                KeyboardInteractiveAuthResponse::Failure { remaining_methods, partial_success } => {
+                    return Ok(AuthResult::Failure { remaining_methods, partial_success });
+                }
+                KeyboardInteractiveAuthResponse::InfoRequest { name, instructions, prompts } => {
+                    let mut answers: Vec<Option<String>> = prompts
+                        .iter()
+                        .map(|p| if is_password_prompt(&p.prompt) { password.take() } else { None })
+                        .collect();
+                    // 没有提示的轮次（只显示一段说明）直接回空答案
+                    let ask: Vec<usize> = (0..prompts.len()).filter(|&i| answers[i].is_none()).collect();
+                    if !ask.is_empty() {
+                        self.asked = true;
+                        let fields = ask.iter().map(|&i| PromptField { text: prompts[i].prompt.clone(), echo: prompts[i].echo }).collect();
+                        let got = self.prompter.ask(self.host_name, &name, &instructions, fields).await?;
+                        for (i, a) in ask.into_iter().zip(got) {
+                            answers[i] = Some(a);
+                        }
+                    }
+                    let answers = answers.into_iter().map(Option::unwrap_or_default).collect();
+                    resp = self.handle.authenticate_keyboard_interactive_respond(answers).await?;
+                }
+            }
+        }
+        bail!("服务器的验证步骤太多，已放弃")
+    }
+}
+
+/// 「Password:」「密码：」这类提示用已保存的密码回答；验证码/口令（Verification code、OTP、Passcode…）交给用户
+fn is_password_prompt(prompt: &str) -> bool {
+    let p = prompt.to_lowercase();
+    (p.contains("password") || p.contains("密码")) && !p.contains("one-time") && !p.contains("otp")
 }
 
 /// RSA 密钥要选服务器支持的最强签名哈希；其他算法不能带 hash
@@ -361,7 +505,7 @@ async fn rsa_hash(handle: &Handle<Client>, alg: Algorithm) -> Result<Option<Hash
 
 /// 优先 Windows OpenSSH agent，连不上再试 Pageant
 #[cfg(windows)]
-async fn authenticate_agent(handle: &mut Handle<Client>, user: &str) -> Result<bool> {
+async fn authenticate_agent(handle: &mut Handle<Client>, user: &str) -> Result<AuthResult> {
     match AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
         Ok(agent) => try_agent_keys(handle, user, agent).await,
         Err(_) => {
@@ -374,23 +518,26 @@ async fn authenticate_agent(handle: &mut Handle<Client>, user: &str) -> Result<b
 }
 
 #[cfg(not(windows))]
-async fn authenticate_agent(_handle: &mut Handle<Client>, _user: &str) -> Result<bool> {
+async fn authenticate_agent(_handle: &mut Handle<Client>, _user: &str) -> Result<AuthResult> {
     // TODO: macOS 版接 SSH_AUTH_SOCK
     bail!("当前平台暂不支持 agent 认证")
 }
 
-async fn try_agent_keys<S>(handle: &mut Handle<Client>, user: &str, mut agent: AgentClient<S>) -> Result<bool>
+/// 逐个试 agent 里的密钥；成功或 partial_success（还要二次验证）就停
+async fn try_agent_keys<S>(handle: &mut Handle<Client>, user: &str, mut agent: AgentClient<S>) -> Result<AuthResult>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let mut last = AuthResult::Failure { remaining_methods: MethodSet::empty(), partial_success: false };
     for identity in agent.request_identities().await? {
         let key = identity.public_key().into_owned();
         let hash = rsa_hash(handle, key.algorithm()).await?;
-        if handle.authenticate_publickey_with(user, key, hash, &mut agent).await?.success() {
-            return Ok(true);
+        last = handle.authenticate_publickey_with(user, key, hash, &mut agent).await?;
+        if matches!(last, AuthResult::Success | AuthResult::Failure { partial_success: true, .. }) {
+            break;
         }
     }
-    Ok(false)
+    Ok(last)
 }
 
 fn expand_home(path: &str) -> PathBuf {

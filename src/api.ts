@@ -219,6 +219,8 @@ export const api = {
   terminalResize: (id: string, cols: number, rows: number) =>
     invoke<void>("terminal_resize", { id, cols, rows }),
   terminalClose: (id: string, killSession = false) => invoke<void>("terminal_close", { id, killSession }),
+  /** 回答登录中途的验证码弹窗；null 表示取消 */
+  sshPromptAnswer: (id: string, answers: string[] | null) => invoke<void>("ssh_prompt_answer", { id, answers }),
   notify: (title: string, body: string) => invoke<void>("notify", { title, body }),
   /** 剪贴板有图片则上传到远端并返回路径，没有图片返回 null */
   terminalPasteImage: (id: string) => invoke<string | null>("terminal_paste_image", { id }),

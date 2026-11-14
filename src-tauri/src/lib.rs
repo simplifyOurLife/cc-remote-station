@@ -35,6 +35,8 @@ pub struct AppState {
     toolbox: Arc<mcp::Toolbox>,
     /// 按主机复用连接：同一台主机的多个终端和 MCP 转发走同一条 SSH 连接
     conns: tokio::sync::Mutex<HashMap<String, Arc<Conn>>>,
+    /// 登录中途的验证码等输入：弹窗问用户
+    prompter: ssh::Prompter,
     terminals: Mutex<HashMap<String, TermHandle>>,
     /// 图形对话进程（chat id → stdin 写入端）
     chats: Mutex<HashMap<String, chat::ChatHandle>>,
@@ -83,7 +85,7 @@ async fn get_or_connect(
     }
     let host = state.hosts.get(host_id)?;
     let forwards = host_forwards(state, &host);
-    let conn = Arc::new(ssh::connect(&state.hosts, &state.known_hosts, &host, trust, creds, forwards).await?);
+    let conn = Arc::new(ssh::connect(&state.hosts, &state.known_hosts, &host, trust, creds, &state.prompter, forwards).await?);
     conns.insert(host_id.to_string(), conn.clone());
     Ok((conn, true))
 }
@@ -782,6 +784,12 @@ async fn chat_files(state: State<'_, AppState>, host_id: String, cwd: String) ->
     Ok(chat::list_files(&conn, &cwd).await?)
 }
 
+/// 回答登录中途的验证码弹窗；answers 为 null 表示取消
+#[tauri::command]
+fn ssh_prompt_answer(state: State<'_, AppState>, id: String, answers: Option<Vec<String>>) {
+    state.prompter.answer(&id, answers);
+}
+
 /// 把主窗口从托盘里叫出来
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -873,6 +881,7 @@ pub fn run() {
                 guard,
                 toolbox,
                 conns: Default::default(),
+                prompter: ssh::Prompter::new(app.handle().clone()),
                 terminals: Default::default(),
                 chats: Default::default(),
             });
@@ -885,6 +894,7 @@ pub fn run() {
             claude_mcp_state,
             claude_mcp_apply,
             terminal_open,
+            ssh_prompt_answer,
             terminal_write,
             terminal_resize,
             terminal_close,
