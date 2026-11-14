@@ -3,6 +3,7 @@
 //! /mcp/<name> 是工具箱里的本机命令（stdio，见 toolbox.rs），共用同一个令牌。
 
 mod guard;
+mod import;
 mod tasks;
 mod toolbox;
 mod tools;
@@ -20,6 +21,7 @@ use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
 pub use guard::{BackupEntry, Guard};
+pub use import::{ImportCandidate, scan as scan_imports};
 pub use toolbox::{TestResult, Toolbox, cloud_url, http_target, validate as validate_toolbox};
 use tasks::Tasks;
 use tools::ToolOut;

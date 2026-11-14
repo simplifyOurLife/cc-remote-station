@@ -81,6 +81,14 @@ export type ToolboxItem = {
   alias: string;
 } & ToolSource;
 
+/** 本机配置里找到的 MCP；source 为 null 时 skipped 是跳过原因 */
+export interface ImportCandidate {
+  origin: string;
+  name: string;
+  source: ToolSource | null;
+  skipped: string | null;
+}
+
 export interface ToolBrief {
   name: string;
   description: string;
@@ -230,6 +238,7 @@ export const api = {
   settingsSave: (patch: Pick<Settings, "roots" | "allowCommands" | "remotePort" | "device" | "builtinAlias">) => invoke<Settings>("settings_save", { patch }),
   settingsRegenToken: () => invoke<Settings>("settings_regen_token"),
   toolboxSave: (items: ToolboxItem[]) => invoke<ToolboxItem[]>("toolbox_save", { items }),
+  toolboxImportScan: () => invoke<ImportCandidate[]>("toolbox_import_scan"),
   /** 用表单里的配置试连一次（不必先保存） */
   toolboxTest: (item: ToolboxItem) => invoke<ToolboxTest>("toolbox_test", { item }),
   toolboxBuiltin: () => invoke<ToolBrief[]>("toolbox_builtin"),

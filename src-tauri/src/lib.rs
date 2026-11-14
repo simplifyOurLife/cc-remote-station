@@ -400,6 +400,12 @@ async fn toolbox_test(state: State<'_, AppState>, item: ToolboxItem) -> CmdResul
     Ok(state.toolbox.test(&item).await?)
 }
 
+/// 扫本机 Claude Code / Claude Desktop / Cursor 里已配的 MCP，供工具箱导入
+#[tauri::command]
+fn toolbox_import_scan() -> Vec<mcp::ImportCandidate> {
+    mcp::scan_imports()
+}
+
 /// 内置工具列表（name / description / inputSchema）
 #[tauri::command]
 fn toolbox_builtin() -> Value {
@@ -908,6 +914,7 @@ pub fn run() {
             toolbox_save,
             toolbox_test,
             toolbox_builtin,
+            toolbox_import_scan,
             mcp_local_port,
             ui_prefs_get,
             ui_prefs_set,

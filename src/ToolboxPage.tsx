@@ -6,6 +6,7 @@ import { useLocalPort } from "./HostTools";
 import { ask } from "./modal";
 import { NumberInput } from "./NumberInput";
 import { Select } from "./Select";
+import { ToolboxImport } from "./ToolboxImport";
 
 /** 测试结果只留在内存里：切换页面不丢，重启后重新测 */
 const testCache = new Map<string, ToolboxTest>();
@@ -100,6 +101,7 @@ export function ToolboxPage({
   /** 展开的行：名字 + 展开的内容 */
   const [open, setOpen] = useState<{ name: string; part: "tools" | "settings" } | null>(null);
   const [editing, setEditing] = useState<ToolboxItem | "new" | null>(null);
+  const [importing, setImporting] = useState(false);
   const [testing, setTesting] = useState<string | null>(null);
   const [rowError, setRowError] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
@@ -160,9 +162,14 @@ export function ToolboxPage({
           <h3>工具箱</h3>
           <p className="muted">每个工具一条端口映射：云主机上的 127.0.0.1:云端端口 转发到本机。哪台主机用哪些工具，在主机的「MCP 工具」里选。</p>
         </div>
-        <button className="primary" onClick={() => setEditing("new")}>
-          ＋ 添加 MCP
-        </button>
+        <div className="card-head-actions">
+          <button onClick={() => setImporting(true)} title="从本机 Claude Code / Claude Desktop / Cursor 的配置里批量导入">
+            ↓ 从本机导入
+          </button>
+          <button className="primary" onClick={() => setEditing("new")}>
+            ＋ 添加 MCP
+          </button>
+        </div>
       </div>
 
       <div className="tool-list">
@@ -272,6 +279,19 @@ export function ToolboxPage({
             device={device}
             onSubmit={(item) => submit(item, editing === "new" ? null : editing.name)}
             onCancel={() => setEditing(null)}
+          />,
+          document.body,
+        )}
+      {importing &&
+        createPortal(
+          <ToolboxImport
+            items={items}
+            builtinPort={builtinPort}
+            onImport={async (added) => {
+              await save([...items, ...added]);
+              setImporting(false);
+            }}
+            onCancel={() => setImporting(false)}
           />,
           document.body,
         )}

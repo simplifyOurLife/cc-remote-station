@@ -3616,6 +3616,79 @@ button.mcp-badge.warn:hover:not(:disabled) {
 .card-head > button {
   flex-shrink: 0;
 }
+.card-head-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+/* 从本机导入 MCP */
+.toolbox-import {
+  width: 640px;
+}
+.toolbox-import > p.muted {
+  margin: 0 0 12px;
+  line-height: 1.6;
+}
+.import-list {
+  max-height: 50vh;
+  overflow-y: auto;
+  border-top: 1px solid var(--wire);
+}
+.import-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 6px;
+  border-bottom: 1px solid var(--wire);
+}
+.import-row > input[type="checkbox"] {
+  margin-top: 6px;
+}
+.import-row.exists {
+  opacity: 0.5;
+}
+.import-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.import-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.host-form .import-head input.import-name {
+  width: 200px;
+  padding: 3px 8px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+}
+.import-desc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--dim);
+}
+.import-origin {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.import-empty {
+  padding: 24px 0;
+  text-align: center;
+}
+.import-skipped {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.toolbox-import .dialog-actions {
+  align-items: center;
+}
 .toolbox-kind {
   flex-shrink: 0;
   padding: 0 6px;
