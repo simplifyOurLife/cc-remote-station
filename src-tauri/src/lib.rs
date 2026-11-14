@@ -782,6 +782,61 @@ async fn chat_files(state: State<'_, AppState>, host_id: String, cwd: String) ->
     Ok(chat::list_files(&conn, &cwd).await?)
 }
 
+/// 把主窗口从托盘里叫出来
+fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// 系统托盘：左键显示主窗口，右键菜单「显示 / 退出」。只有「退出」会真正结束应用
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+    let show = MenuItem::with_id(app, "show", "显示 cc-workstation", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &PredefinedMenuItem::separator(app)?, &quit])?;
+    // 托盘用单独的透明底图标（icons/tray.png，由 tray-icon.svg 生成），比带底板的应用图标在 16px 下清爽
+    TrayIconBuilder::with_id("main")
+        .icon(tauri::include_image!("icons/tray.png"))
+        .tooltip("cc-workstation")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                show_main(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+/// 关闭窗口 = 缩到托盘；第一次这样做时弹一条通知告诉用户在哪里退出
+fn hide_to_tray(window: &tauri::Window) {
+    let _ = window.hide();
+    let app = window.app_handle();
+    let Ok(dir) = app.path().app_config_dir() else { return };
+    let marker = dir.join("tray-hint-shown");
+    if marker.exists() {
+        return;
+    }
+    let _ = std::fs::write(&marker, "");
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title("cc-workstation 已最小化到托盘")
+        .body("终端和对话仍在后台运行。点托盘图标打开，右键可以退出。")
+        .show();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
@@ -790,7 +845,15 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        // 点关闭（标题栏 ✕、Alt+F4、任务栏关闭）不退出，缩到托盘；真正退出走托盘菜单
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                hide_to_tray(window);
+            }
+        })
         .setup(|app| {
+            setup_tray(app)?;
             let dir = app.path().app_config_dir()?;
             std::fs::create_dir_all(&dir)?;
             let settings_path = dir.join("settings.json");

@@ -16,6 +16,8 @@ import { PaneControl, TerminalView } from "./TerminalView";
 import { TmuxDialog } from "./TmuxDialog";
 import { ToolboxPage } from "./ToolboxPage";
 import { TooltipLayer } from "./Tooltip";
+import { TitleBar } from "./TitleBar";
+import { PopupMenu } from "./PopupMenu";
 import "./App.css";
 
 interface Pane {
@@ -51,6 +53,7 @@ type Dialog =
 
 const newKey = () => crypto.randomUUID().replace(/-/g, "");
 const OPENED_KEY = "ccws.hasOpened";
+const RAIL_KEY = "ccws.railCollapsed";
 
 function loadOpened() {
   try {
@@ -72,6 +75,16 @@ export default function App() {
   const [hasOpened, setHasOpened] = useState(loadOpened);
   const [showSnippets, setShowSnippets] = useState(false);
   const [showNewTab, setShowNewTab] = useState(false);
+  const newTabBtn = useRef<HTMLButtonElement>(null);
+  const snippetsBtn = useRef<HTMLButtonElement>(null);
+  /** 左侧导航收起成只有图标的窄条（记在本机） */
+  const [railCollapsed, setRailCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(RAIL_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
   /** 各窗格的控制句柄，快捷命令发到当前窗格 */
   const controls = useRef(new Map<string, PaneControl>());
   /** 各主机 MCP 反向转发状态（只含已连接且开启的） */
@@ -198,10 +211,22 @@ export default function App() {
   const attention = tabs.some((t) => t.attention);
   const mcpError = [...mcpStatus.values()].some((s) => forwardState(s) === "error");
 
+  const toggleRail = () =>
+    setRailCollapsed((c) => {
+      try {
+        localStorage.setItem(RAIL_KEY, c ? "0" : "1");
+      } catch {
+        // 存不下只是下次打开恢复展开
+      }
+      return !c;
+    });
+
   const navItem = (key: Page, icon: string, label: string, extra?: React.ReactNode) => (
     <button
       className={`rail-item ${page === key ? "active" : ""}`}
       aria-current={page === key ? "page" : undefined}
+      aria-label={label}
+      title={railCollapsed ? label : undefined}
       onClick={() => {
         setPage(key);
         // 回到工作区就算看过当前标签了
@@ -214,10 +239,22 @@ export default function App() {
     </button>
   );
 
+  // 标题栏里的位置：页面，工作区再加上当前标签的主机和类型
+  const activeTab = tabs.find((t) => t.key === activeKey);
+  const crumbs = [
+    "cc-workstation",
+    { hosts: "主机", workspace: "工作区", toolbox: "MCP 工具箱", settings: "设置" }[page],
+    ...(page === "workspace" && activeTab
+      ? [`${activeTab.host.name} · ${activeTab.panes.find((p) => p.key === activeTab.activePane)?.kind === "chat" ? "对话" : "终端"}`]
+      : []),
+  ];
+
   return (
-    <div className="app">
-      <nav className="rail" aria-label="主导航">
-        <div className="rail-brand">
+    <div className="app-shell">
+      <TitleBar crumbs={crumbs} />
+      <div className="app">
+      <nav className={`rail ${railCollapsed ? "collapsed" : ""}`} aria-label="主导航">
+        <div className="rail-brand" title={railCollapsed ? "cc-workstation · 云端 Claude Code 工作台" : undefined}>
           <Logo />
           <div className="rail-brand-text">
             <span className="brand">cc-workstation</span>
@@ -240,8 +277,14 @@ export default function App() {
         <button
           className="rail-foot activity-line"
           onClick={() => setPage("toolbox")}
-          title="云端 Claude 最近一次使用工具箱，点击查看全部记录"
+          title={
+            railCollapsed && lastActivity
+              ? `工具箱动态：${lastActivity.ok ? "●" : "✕"} ${lastActivity.tool} ${summarize(lastActivity)}\n点击查看全部记录`
+              : "云端 Claude 最近一次使用工具箱，点击查看全部记录"
+          }
         >
+          {/* 收起时只留一个状态点 */}
+          <span className={`activity-dot ${lastActivity ? (lastActivity.ok ? "ok" : "failed") : ""}`}>›_</span>
           <span className="activity-head">
             ›_ 工具箱动态<span className="caret">▌</span>
           </span>
@@ -255,6 +298,9 @@ export default function App() {
               <span className="muted">云端还没有用过工具箱</span>
             )}
           </span>
+        </button>
+        <button className="rail-toggle" title={railCollapsed ? "展开导航" : "收起导航，给工作区让出空间"} onClick={toggleRail}>
+          {railCollapsed ? "»" : "« 收起"}
         </button>
       </nav>
 
@@ -393,12 +439,14 @@ export default function App() {
                   </button>
                 </div>
               ))}
-              <div className="menu-anchor new-tab">
-                <button className="icon" title="新建标签" onClick={() => setShowNewTab(!showNewTab)}>
+              <div className="new-tab">
+                <button ref={newTabBtn} className="icon" title="新建标签" onClick={() => setShowNewTab(!showNewTab)}>
                   ＋
                 </button>
+                {/* 挂到 body：标签栏是横向滚动区，菜单放里面会被裁成 36px 高 */}
                 {showNewTab && (
-                  <div className="menu new-tab-menu" onMouseLeave={() => setShowNewTab(false)}>
+                  <PopupMenu anchor={newTabBtn} onClose={() => setShowNewTab(false)}>
+                    <div className="new-tab-menu">
                     {hosts.map((h) => (
                       <div key={h.id} className="menu-item new-tab-row">
                         <span className="grow">{h.name}</span>
@@ -408,8 +456,16 @@ export default function App() {
                         <button onClick={() => openTab(h)}>终端</button>
                       </div>
                     ))}
-                    {hosts.length === 0 && <div className="menu-item muted">还没有主机，先到「主机」页添加</div>}
-                  </div>
+                    {hosts.length === 0 && (
+                      <div
+                        className="menu-item muted"
+                        onClick={() => setPage("hosts")}
+                      >
+                        还没有主机，先到「主机」页添加
+                      </div>
+                    )}
+                    </div>
+                  </PopupMenu>
                 )}
               </div>
             </div>
@@ -424,12 +480,12 @@ export default function App() {
                 <button className="icon" title="在右侧并排一个新对话" onClick={() => splitPane(activeKey, "row", "chat")}>
                   ＋对话
                 </button>
-                <div className="menu-anchor">
-                  <button className="icon" title="快捷命令" onClick={() => setShowSnippets((s) => !s)}>
+                <div>
+                  <button ref={snippetsBtn} className="icon" title="快捷命令" onClick={() => setShowSnippets((s) => !s)}>
                     ⚡
                   </button>
                   {showSnippets && (
-                    <div className="menu" onMouseLeave={() => setShowSnippets(false)}>
+                    <PopupMenu anchor={snippetsBtn} onClose={() => setShowSnippets(false)}>
                       {prefs.snippets.map((s) => (
                         <div key={s.id} className="menu-item" onClick={() => sendSnippet(s.command, s.run)}>
                           <span>{s.name}</span>
@@ -446,7 +502,7 @@ export default function App() {
                       >
                         管理快捷命令…
                       </div>
-                    </div>
+                    </PopupMenu>
                   )}
                 </div>
               </div>
@@ -462,8 +518,39 @@ export default function App() {
                   flexDirection: t.dir === "row" ? "row" : "column",
                 }}
               >
-                {t.panes.map((p) =>
-                  p.kind === "chat" ? (
+                {t.panes.map((p, idx) => (
+                  // 外层始终包一层：只在多窗格时显示标题栏，包装结构不变，终端不会因为出现标题栏而重建
+                  <div key={p.key} className={`pane-slot ${p.key === t.activePane ? "focused" : ""}`}>
+                    {t.panes.length > 1 && (
+                      <div
+                        className="pane-bar"
+                        onMouseDown={() => t.activePane !== p.key && patchTab(t.key, { activePane: p.key })}
+                        onAuxClick={(e) => e.button === 1 && closePane(t, p.key)}
+                        title="中键点击关闭这个窗格"
+                      >
+                        <span className="pane-bar-kind">{p.kind === "chat" ? "◆ 对话" : "▸ 终端"}</span>
+                        <span className="pane-bar-index">#{idx + 1}</span>
+                        <div className="grow" />
+                        {p.kind !== "chat" && (
+                          <>
+                            <button className="icon" title="向右分屏（Ctrl+Shift+D）" onClick={() => splitPane(t.key, "row")}>
+                              ‖
+                            </button>
+                            <button className="icon" title="向下分屏（Ctrl+Shift+E）" onClick={() => splitPane(t.key, "col")}>
+                              ═
+                            </button>
+                          </>
+                        )}
+                        <button
+                          className="icon pane-close"
+                          title={p.kind === "chat" ? "关闭这个对话窗格" : "关闭这个终端窗格（Ctrl+Shift+W）"}
+                          onClick={() => closePane(t, p.key)}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    )}
+                  {p.kind === "chat" ? (
                     <ChatView
                       key={p.key}
                       host={t.host}
@@ -489,8 +576,9 @@ export default function App() {
                       onClose={() => closePane(t, p.key)}
                       onControl={(ctl) => (ctl ? controls.current.set(p.key, ctl) : controls.current.delete(p.key))}
                     />
-                  ),
-                )}
+                  )}
+                  </div>
+                ))}
               </div>
             ))}
             {tabs.length === 0 && (
@@ -554,6 +642,7 @@ export default function App() {
           }}
         />
       )}
+      </div>
     </div>
   );
 }

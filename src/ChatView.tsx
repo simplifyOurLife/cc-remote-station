@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Loading } from "./Loading";
 import { ConnectScreen } from "./ConnectScreen";
+import { Logo } from "./Logo";
+import { UserAvatar } from "./UserAvatar";
 import { hostDateTime, tzLabel, useHostTz } from "./hostTime";
 import { Channel } from "@tauri-apps/api/core";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
@@ -36,6 +38,27 @@ import { Combo } from "./Select";
 import { ChatStatus, nextMode } from "./ChatStatus";
 import { PermissionCard, ToolCard } from "./ToolCard";
 const MODELS = ["", "opus", "sonnet", "haiku"];
+const SESSIONS_KEY = "ccws.chatSessionsOpen";
+
+/** Claude 回复上的角色标：小机器人 + CLAUDE */
+function ClaudeRole() {
+  return (
+    <div className="msg-role" aria-hidden="true">
+      <Logo size={18} className="logo-role" />
+      CLAUDE
+    </div>
+  );
+}
+
+/** 你的消息上的角色标：你 + 兜帽黑客头像 */
+function UserRole() {
+  return (
+    <div className="msg-role user-role" aria-hidden="true">
+      你
+      <UserAvatar size={18} />
+    </div>
+  );
+}
 
 /** 记在本机的用量快照（按主机）：额度只在回复后才报告，先显示上次的 */
 interface SavedUsage {
@@ -153,7 +176,22 @@ export function ChatView(props: Props) {
   const [sessions, setSessions] = useState<ChatSession[] | null>(null);
   /** 刚打开、云端 claude 还没响应时显示启动画面 */
   const [booting, setBooting] = useState(true);
-  const [showSessions, setShowSessions] = useState(true);
+  /** 左侧会话列表展开/收起（记在本机，所有对话共用） */
+  const [showSessions, setShowSessionsState] = useState(() => {
+    try {
+      return localStorage.getItem(SESSIONS_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const setShowSessions = (show: boolean) => {
+    setShowSessionsState(show);
+    try {
+      localStorage.setItem(SESSIONS_KEY, show ? "1" : "0");
+    } catch {
+      // 存不下只是下次打开恢复展开
+    }
+  };
   /** 左侧的工作目录：只列这个目录的历史会话，「新对话」也在这里开始；allDirs 时列全部目录 */
   const [listDir, setListDir] = useState(host.dir || "~");
   const [allDirs, setAllDirs] = useState(false);
@@ -731,6 +769,12 @@ export function ChatView(props: Props) {
       )}
       {showSessions && (
         <aside className="chat-sessions">
+          <div className="chat-sessions-head">
+            <span>历史会话</span>
+            <button className="icon" title="收起会话列表，给对话让出空间（工具栏的 ☰ 可再展开）" onClick={() => setShowSessions(false)}>
+              «
+            </button>
+          </div>
           <div className="chat-new">
             <Combo
               value={listDir}
@@ -854,7 +898,12 @@ export function ChatView(props: Props) {
           </div>
         )}
         <div className="chat-toolbar">
-          <button className="icon" title="显示/隐藏会话列表" onClick={() => setShowSessions(!showSessions)}>
+          <button
+            className={`icon sessions-toggle ${showSessions ? "" : "off"}`}
+            title={showSessions ? "收起会话列表" : "展开会话列表"}
+            aria-pressed={showSessions}
+            onClick={() => setShowSessions(!showSessions)}
+          >
             ☰
           </button>
           <span className="chat-cwd" title={cwd}>
@@ -966,12 +1015,15 @@ export function ChatView(props: Props) {
         >
           {state.items.length === 0 && !state.running && (
             <div className="placeholder chat-empty">
+              <Logo size={56} className="logo-idle" />
               在 {host.name} 的 <code>{cwd}</code> 中和 Claude Code 对话
               <div className="muted small-text">Enter 发送 · Shift+Enter 换行 · / 命令 · @ 引用文件 · 可粘贴截图 · Esc 中断</div>
             </div>
           )}
-          {state.items.map((item) => {
+          {state.items.map((item, idx) => {
             const hit = matches.includes(item.key) ? (item.key === currentMatch ? " search-current" : " search-hit") : "";
+            // 连续的多条回复（文字、工具调用…）只在第一条上显示角色标
+            const showRole = item.kind !== "system" && state.items[idx - 1]?.kind !== item.kind;
             if (item.kind === "system") {
               return (
                 <div key={item.key} data-key={item.key} className={`chat-system ${item.tone}${hit}`}>
@@ -980,7 +1032,8 @@ export function ChatView(props: Props) {
               );
             }
             return (
-              <div key={item.key} data-key={item.key} className={`chat-msg ${item.kind}${hit}`}>
+              <div key={item.key} data-key={item.key} className={`chat-msg ${item.kind}${showRole ? " first" : ""}${hit}`}>
+                {showRole && (item.kind === "assistant" ? <ClaudeRole /> : <UserRole />)}
                 <div className="msg-actions">
                   <button className="icon" title="复制这条消息" onClick={() => writeText(itemText(item))}>
                     ⧉
@@ -1002,7 +1055,8 @@ export function ChatView(props: Props) {
             );
           })}
           {state.streaming && (
-            <div className="chat-msg assistant streaming">
+            <div className={`chat-msg assistant streaming${state.items[state.items.length - 1]?.kind !== "assistant" ? " first" : ""}`}>
+              {state.items[state.items.length - 1]?.kind !== "assistant" && <ClaudeRole />}
               <Markdown text={state.streaming} />
             </div>
           )}

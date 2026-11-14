@@ -102,7 +102,9 @@ export function ToolCard({
         <b>{name}</b>
         <span className="tool-summary">{toolSummary(name, input)}</span>
         {steps && steps.length > 0 && <span className="muted">{steps.filter((s) => s.kind === "tool").length} 步</span>}
-        <span className="tool-status">{status === "pending" ? "…" : status === "error" ? "失败" : "✓"}</span>
+        <span className="tool-status" title={status === "pending" ? "执行中" : status === "error" ? "失败" : "完成"}>
+          {status === "pending" ? "RUN" : status === "error" ? "ERR" : "OK"}
+        </span>
       </div>
       {open && (
         <div className="tool-body">
