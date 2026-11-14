@@ -32,10 +32,40 @@ export interface PermissionRequest {
   suggestions: unknown[] | null;
 }
 
+export interface SlashCommand {
+  name: string;
+  description?: string;
+  argumentHint?: string;
+}
+
+/** init 只给命令名：补进列表，但不覆盖 initialize 已经拿到的说明 */
+function mergeCommands(cur: SlashCommand[], names: string[]): SlashCommand[] {
+  const known = new Set(cur.map((c) => c.name));
+  return [...cur, ...names.filter((n) => !known.has(n)).map((name) => ({ name }))];
+}
+
+/** 用量：各项拿不到时为 null（如还没回复过） */
 export interface Usage {
-  costUsd: number;
-  contextUsed: number;
-  contextWindow: number;
+  /** 本会话累计花费（来自每轮 result 的 total_cost_usd） */
+  costUsd: number | null;
+  /** 当前上下文大小：最近一次回复的 输入 + 缓存写入 + 缓存命中 + 输出 */
+  contextUsed: number | null;
+  /** 模型的上下文窗口（来自 result.modelUsage） */
+  contextWindow: number | null;
+}
+
+/** 订阅额度（速率限制）的一个窗口：CLI 以 rate_limit_event 上报，字段按宽松方式解析 */
+export interface RateLimit {
+  /** allowed / allowed_warning / rejected */
+  status: string;
+  /** 重置时间，Unix 秒 */
+  resetsAt: number | null;
+  /** five_hour / seven_day / seven_day_opus … */
+  window: string;
+  /** 已用百分比（0–100），没报告就是 null */
+  usedPct: number | null;
+  /** 收到这条数据的时间（毫秒），用于提示数据新旧 */
+  updatedAt: number;
 }
 
 export interface ChatState {
@@ -50,10 +80,17 @@ export interface ChatState {
   running: boolean;
   sessionId: string | null;
   model: string | null;
-  slashCommands: string[];
-  /** 云端 claude 加载的 MCP 服务器及状态（来自 init） */
-  mcpServers: { name: string; status: string }[];
-  usage: Usage | null;
+  /** 可用斜杠命令：initialize 回执带说明，init 事件只有名字 */
+  slashCommands: SlashCommand[];
+  /** initialize 回执里的可选模型 */
+  models: { value: string; label: string }[];
+  /** 云端 claude 加载的 MCP 服务器及状态（init 事件只有名字和状态，mcp_status 回执更详细） */
+  mcpServers: McpServer[];
+  /** 本轮可用的全部工具名（来自 init），MCP 工具形如 mcp__服务器__工具 */
+  tools: string[];
+  usage: Usage;
+  /** 各额度窗口的最新状态，按窗口名 */
+  rateLimits: Record<string, RateLimit>;
   /** 最近的 stderr，进程异常退出时展示 */
   stderr: string[];
 }
@@ -68,8 +105,11 @@ export const emptyState: ChatState = {
   sessionId: null,
   model: null,
   slashCommands: [],
+  models: [],
   mcpServers: [],
-  usage: null,
+  tools: [],
+  usage: { costUsd: null, contextUsed: null, contextWindow: null },
+  rateLimits: {},
   stderr: [],
 };
 
@@ -170,8 +210,9 @@ export function reduce(s: ChatState, e: Record<string, any>): ChatState {
           ...s,
           sessionId: e.session_id ?? s.sessionId,
           model: e.model ?? s.model,
-          slashCommands: e.slash_commands ?? s.slashCommands,
-          mcpServers: e.mcp_servers ?? s.mcpServers,
+          slashCommands: mergeCommands(s.slashCommands, e.slash_commands ?? []),
+          mcpServers: e.mcp_servers ? mergeServers(s.mcpServers, e.mcp_servers) : s.mcpServers,
+          tools: e.tools ?? s.tools,
         };
       }
       if (e.subtype === "compact_boundary") {
@@ -183,18 +224,28 @@ export function reduce(s: ChatState, e: Record<string, any>): ChatState {
       // 子代理的流式片段不显示在主对话里
       if (e.parent_tool_use_id) return s;
       const ev = e.event ?? {};
-      if (ev.type === "message_start") return { ...s, streaming: "" };
+      // 流式的 message_start / message_delta 带着本次回复的用量，上下文大小边回复边更新
+      if (ev.type === "message_start") return withContext({ ...s, streaming: "" }, ev.message?.usage);
+      if (ev.type === "message_delta") return withContext(s, ev.usage);
       if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
         return { ...s, streaming: s.streaming + ev.delta.text };
       }
       return s;
     }
     case "assistant":
-      return { ...s, streaming: "", items: addAssistant(s.items, e.message?.id ?? key(), toBlocks(e.message?.content)) };
+      return withContext(
+        { ...s, streaming: "", items: addAssistant(s.items, e.message?.id ?? key(), toBlocks(e.message?.content)) },
+        e.message?.usage,
+      );
     case "user":
       return addUser(s, e.message?.content);
+    case "rate_limit_event": {
+      const list = rateLimitsOf(e.rate_limit_info ?? {});
+      if (!list.length) return s;
+      return { ...s, rateLimits: { ...s.rateLimits, ...Object.fromEntries(list.map((r) => [r.window, r])) } };
+    }
     case "result": {
-      const usage = usageOf(e) ?? s.usage;
+      const usage = { ...s.usage, costUsd: e.total_cost_usd ?? s.usage.costUsd, contextWindow: contextWindowOf(e) ?? s.usage.contextWindow };
       const next = { ...s, running: false, streaming: "", usage };
       return e.is_error ? system(next, `本轮出错：${e.result ?? e.subtype}`, "error") : next;
     }
@@ -213,9 +264,30 @@ export function reduce(s: ChatState, e: Record<string, any>): ChatState {
       return s;
     case "control_cancel_request":
       return { ...s, permissions: s.permissions.filter((p) => p.requestId !== e.request_id) };
-    case "control_response":
-      if (e.response?.subtype === "error") return system(s, `操作未生效：${e.response.error}`, "error");
-      return s;
+    case "control_response": {
+      if (e.response?.subtype === "error") {
+        // 老版本 CLI 不认 initialize 时静默忽略，命令列表退回到第一轮 init 里取
+        const id = String(e.response.request_id ?? "");
+        // mcp_status 同理：不支持就只用 init 里的简要状态
+        if (id.startsWith(INIT_PREFIX) || id.startsWith(MCP_STATUS_PREFIX)) return s;
+        return system(s, `操作未生效：${e.response.error}`, "error");
+      }
+      // initialize 回执：还没发消息就能拿到完整命令列表（带说明）和可选模型
+      const r = e.response?.response ?? {};
+      const next = { ...s };
+      if (Array.isArray(r.mcpServers)) next.mcpServers = r.mcpServers.map(parseServer);
+      if (Array.isArray(r.commands)) {
+        next.slashCommands = r.commands.map((c: any) =>
+          typeof c === "string" ? { name: c } : { name: c.name, description: c.description, argumentHint: c.argumentHint },
+        );
+      }
+      if (Array.isArray(r.models)) {
+        next.models = r.models.map((m: any) =>
+          typeof m === "string" ? { value: m, label: m } : { value: m.value, label: m.displayName ?? m.value },
+        );
+      }
+      return next;
+    }
     case "stderr":
       return { ...s, stderr: [...s.stderr, e.text].slice(-30) };
     case "stdout":
@@ -231,16 +303,54 @@ export function reduce(s: ChatState, e: Record<string, any>): ChatState {
   }
 }
 
-/** 用量：花费取本会话累计；上下文取 modelUsage 里输入 token 最多的那个模型 */
-function usageOf(e: Record<string, any>): Usage | null {
+function oneLimit(window: string, w: Record<string, any>, now: number): RateLimit | null {
+  if (!w?.status) return null;
+  const resets = w.resetsAt ?? null;
+  const used = w.utilization ?? null;
+  return {
+    status: String(w.status),
+    resetsAt: typeof resets === "number" ? (resets > 1e12 ? Math.round(resets / 1000) : resets) : null,
+    window,
+    // utilization 是 0–1 的比例
+    usedPct: typeof used === "number" ? Math.round(used <= 1 ? used * 100 : used) : null,
+    updatedAt: now,
+  };
+}
+
+/**
+ * 额度事件（rate_limit_event.rate_limit_info）：unifiedWindows 里是各窗口（five_hour / seven_day…）的已用比例、
+ * 重置时间和状态；外层只有当前最关键的那个窗口。没有 unifiedWindows 的旧版本就用外层
+ */
+function rateLimitsOf(info: Record<string, any>): RateLimit[] {
+  const now = Date.now();
+  const windows = info.unifiedWindows && typeof info.unifiedWindows === "object" ? info.unifiedWindows : null;
+  if (windows) {
+    return Object.entries(windows)
+      .map(([name, w]) => oneLimit(name, w as Record<string, any>, now))
+      .filter((r): r is RateLimit => !!r);
+  }
+  const one = oneLimit(String(info.rateLimitType ?? "default"), info, now);
+  return one ? [one] : [];
+}
+
+/** 一次回复的上下文大小：输入 + 缓存写入 + 缓存命中 + 输出 */
+function contextOf(u: Record<string, any> | undefined): number | null {
+  if (!u || typeof u.input_tokens !== "number") return null;
+  return (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.output_tokens ?? 0);
+}
+
+function withContext(s: ChatState, u: Record<string, any> | undefined): ChatState {
+  const used = contextOf(u);
+  return used === null ? s : { ...s, usage: { ...s.usage, contextUsed: used } };
+}
+
+/** 主模型的上下文窗口：modelUsage 里 token 最多的那个（子代理可能用了小模型） */
+function contextWindowOf(e: Record<string, any>): number | null {
   const models = Object.values(e.modelUsage ?? {}) as any[];
   if (!models.length) return null;
-  const main = models.reduce((a, b) => ((b.inputTokens ?? 0) > (a.inputTokens ?? 0) ? b : a));
-  return {
-    costUsd: e.total_cost_usd ?? 0,
-    contextUsed: (main.inputTokens ?? 0) + (main.cacheReadInputTokens ?? 0) + (main.outputTokens ?? 0),
-    contextWindow: main.contextWindow ?? 0,
-  };
+  const size = (m: any) => (m.inputTokens ?? 0) + (m.cacheReadInputTokens ?? 0) + (m.cacheCreationInputTokens ?? 0);
+  const main = models.reduce((a, b) => (size(b) > size(a) ? b : a));
+  return typeof main.contextWindow === "number" ? main.contextWindow : null;
 }
 
 /** 把会话 jsonl 的历史行转成初始状态（用于继续历史会话时回显） */
@@ -249,7 +359,9 @@ export function fromHistory(lines: Record<string, any>[]): ChatState {
   for (const l of lines) {
     if (l.isMeta || l.isSidechain) continue;
     if (l.type === "user") s = addUser(s, l.message?.content);
-    else if (l.type === "assistant") s = { ...s, items: addAssistant(s.items, l.message?.id ?? key(), toBlocks(l.message?.content)) };
+    // 历史里的 assistant 记录带着当时的用量，取最后一条就是继续会话时的上下文大小
+    else if (l.type === "assistant")
+      s = withContext({ ...s, items: addAssistant(s.items, l.message?.id ?? key(), toBlocks(l.message?.content)) }, l.message?.usage);
   }
   return s;
 }
@@ -324,4 +436,58 @@ export function permissionDeny(req: PermissionRequest, message: string) {
 
 export function controlRequest(request: Record<string, any>) {
   return { type: "control_request", request_id: crypto.randomUUID(), request };
+}
+
+const INIT_PREFIX = "init-";
+const MCP_STATUS_PREFIX = "mcp-status-";
+export const MCP_ACTION_PREFIX = "mcp-act-";
+
+export interface McpServer {
+  name: string;
+  /** connected / failed / needs-auth / pending / disabled */
+  status: string;
+  error?: string;
+  /** 配置来源：user / project / local 等 */
+  scope?: string;
+  version?: string;
+  tools?: string[];
+}
+
+function parseServer(m: any): McpServer {
+  return {
+    name: m.name,
+    status: m.status,
+    error: m.error || undefined,
+    scope: m.scope ?? m.config?.scope,
+    version: m.serverInfo?.version,
+    tools: Array.isArray(m.tools) ? m.tools.map((t: any) => (typeof t === "string" ? t : t.name)) : undefined,
+  };
+}
+
+/** init 只带名字和状态，保留 mcp_status 拿到的其余字段 */
+function mergeServers(prev: McpServer[], list: any[]): McpServer[] {
+  return list.map((m) => ({ ...prev.find((p) => p.name === m.name), ...parseServer(m) }));
+}
+
+/** 查询 MCP 服务器详细状态（对应 Agent SDK 的 mcpServerStatus） */
+export function mcpStatusRequest() {
+  return { type: "control_request", request_id: MCP_STATUS_PREFIX + crypto.randomUUID(), request: { subtype: "mcp_status" } };
+}
+
+/** 重连 / 启停某个 MCP 服务器；成功后调用方再查一次状态 */
+export function mcpActionRequest(serverName: string, enabled?: boolean) {
+  const request = enabled === undefined ? { subtype: "mcp_reconnect", serverName } : { subtype: "mcp_toggle", serverName, enabled };
+  return { type: "control_request", request_id: MCP_ACTION_PREFIX + crypto.randomUUID(), request };
+}
+
+/** 某个服务器提供的工具：优先用 mcp_status 的列表，否则按工具名前缀 mcp__服务器__ 从 init 里筛 */
+export function serverTools(server: McpServer, tools: string[]): string[] {
+  if (server.tools) return server.tools;
+  const prefix = `mcp__${server.name.replace(/[^a-zA-Z0-9_-]/g, "_")}__`;
+  return tools.filter((t) => t.startsWith(prefix)).map((t) => t.slice(prefix.length));
+}
+
+/** 启动后的 initialize 请求：id 带固定前缀，失败时能认出来并忽略 */
+export function initializeRequest() {
+  return { type: "control_request", request_id: INIT_PREFIX + crypto.randomUUID(), request: { subtype: "initialize" } };
 }

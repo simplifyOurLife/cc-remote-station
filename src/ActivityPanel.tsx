@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { ask, message } from "@tauri-apps/plugin-dialog";
+import { ask, message } from "./modal";
+import { Select } from "./Select";
 import { api, AuditEntry, BackupEntry, errorText } from "./api";
 
 /** 云端 Claude Code 经 MCP 对本机做过的操作（审计），以及改动前的备份（可恢复） */
-export function ActivityDialog({ onClose }: { onClose: () => void }) {
+export function ActivityPanel({ refreshKey }: { refreshKey?: unknown }) {
   const [view, setView] = useState<"audit" | "backup">("audit");
   const [days, setDays] = useState<string[]>([]);
   const [day, setDay] = useState("");
@@ -12,20 +13,21 @@ export function ActivityDialog({ onClose }: { onClose: () => void }) {
   const [onlyErrors, setOnlyErrors] = useState(false);
   const [error, setError] = useState("");
 
+  // refreshKey 变化（云端又调用了一次）就重新加载，页面常开时也是最新的
   useEffect(() => {
     api.auditDays().then((d) => {
       setDays(d);
-      if (d[0]) setDay(d[0]);
+      setDay((cur) => cur || d[0] || "");
     });
     api.backupsList().then(setBackups);
-  }, []);
+  }, [refreshKey]);
 
   useEffect(() => {
     if (day) api.auditEntries(day).then(setEntries);
-  }, [day]);
+  }, [day, refreshKey]);
 
   const restore = async (b: BackupEntry) => {
-    const ok = await ask(`把备份恢复到：\n${b.original}\n\n当前文件会先备份，恢复可以撤销。`, { title: "恢复备份", kind: "warning" });
+    const ok = await ask(`把备份恢复到：\n${b.original}\n\n当前文件会先备份，恢复可以撤销。`, { title: "恢复备份", kind: "warning", okLabel: "恢复" });
     if (!ok) return;
     try {
       const path = await api.backupRestore(b.id);
@@ -39,8 +41,7 @@ export function ActivityDialog({ onClose }: { onClose: () => void }) {
   const shown = onlyErrors ? entries.filter((e) => !e.ok) : entries;
 
   return (
-    <div className="terminal-overlay">
-      <div className="dialog activity">
+    <section className="page-card activity">
         <div className="row activity-head">
           <h3 className="grow">云端操作记录</h3>
           <div className="segmented">
@@ -59,11 +60,7 @@ export function ActivityDialog({ onClose }: { onClose: () => void }) {
             <div className="row activity-filter">
               <label>
                 日期：
-                <select value={day} onChange={(e) => setDay(e.target.value)}>
-                  {days.map((d) => (
-                    <option key={d}>{d}</option>
-                  ))}
-                </select>
+                <Select value={day} onChange={setDay} options={days.map((d) => ({ value: d }))} />
               </label>
               <label className="checkbox">
                 <input type="checkbox" checked={onlyErrors} onChange={(e) => setOnlyErrors(e.target.checked)} />
@@ -103,11 +100,7 @@ export function ActivityDialog({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
-        <div className="dialog-actions">
-          <button onClick={onClose}>关闭</button>
-        </div>
-      </div>
-    </div>
+    </section>
   );
 }
 

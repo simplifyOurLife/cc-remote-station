@@ -149,7 +149,7 @@ async fn pump<R: AsyncRead + Unpin>(mut reader: R, task: &Task) {
 }
 
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(super) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(windows)]
 fn shell_command(command: &str) -> tokio::process::Command {
@@ -168,7 +168,7 @@ fn shell_command(command: &str) -> tokio::process::Command {
 
 /// 结束进程及其所有子进程
 #[cfg(windows)]
-fn kill_tree(pid: u32) {
+pub(super) fn kill_tree(pid: u32) {
     use std::os::windows::process::CommandExt;
     let _ = std::process::Command::new("taskkill")
         .args(["/T", "/F", "/PID", &pid.to_string()])
@@ -177,7 +177,7 @@ fn kill_tree(pid: u32) {
 }
 
 #[cfg(not(windows))]
-fn kill_tree(pid: u32) {
+pub(super) fn kill_tree(pid: u32) {
     // TODO: macOS 版改用进程组（spawn 时 setpgid）结束整棵进程树
     let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).output();
 }

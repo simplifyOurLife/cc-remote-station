@@ -139,20 +139,39 @@ pub struct SessionInfo {
     pub mtime: u64,
 }
 
-/// 列出云端最近的 Claude Code 会话：取每个 jsonl 的开头一段解析 cwd 和标题
-pub async fn list_sessions(conn: &Conn) -> Result<Vec<SessionInfo>> {
-    let script = "cd ~/.claude/projects 2>/dev/null || exit 0; \
-        ls -t */*.jsonl 2>/dev/null | head -n 150 | while IFS= read -r f; do \
-          printf '\\036%s\\t%s\\n' \"$f\" \"$(stat -c %Y \"$f\")\"; head -c 24000 \"$f\"; echo; \
-        done";
-    let out = conn.exec(&format!("bash -c {}", shell_quote(script)), None).await?;
+/// 列出云端最近的 Claude Code 会话。每个 jsonl 取两部分：
+/// - 开头 24KB：解析 cwd 和第一条用户消息；
+/// - 行首锚定 grep 出的标题记录（custom-title / ai-title / summary / last-prompt）。
+///   新版会话开头是一串元数据和几十 KB 的大行，第一条用户消息往往不在开头，标题记录才可靠。
+/// 目录名以 - 开头（如 -home-ubuntu-xxx），ls / stat / head 都要加 --，否则会被当成选项。
+///
+/// dir 有值时只读这个工作目录的会话：Claude Code 把每个目录的会话放在 ~/.claude/projects/<编码后的绝对路径>，
+/// 编码规则是把非字母数字字符都换成 -。路径先用 pwd -P 解析（claude 看到的是解开符号链接后的真实路径）。
+/// dir 为 None 时扫全部目录最近的 150 个。
+pub async fn list_sessions(conn: &Conn, dir: Option<&str>) -> Result<Vec<SessionInfo>> {
+    let pick = match dir {
+        Some(d) => format!(
+            "d=$(cd {} 2>/dev/null && pwd -P) || exit 0; cd ~/.claude/projects 2>/dev/null || exit 0; \
+             p=$(printf %s \"$d\" | sed 's/[^a-zA-Z0-9]/-/g'); ls -t -- \"$p\"/*.jsonl 2>/dev/null | head -n 150",
+            cd_target(d)
+        ),
+        None => "cd ~/.claude/projects 2>/dev/null || exit 0; ls -t -- */*.jsonl 2>/dev/null | head -n 150".to_string(),
+    };
+    let script = format!(
+        "{pick} | while IFS= read -r f; do \
+          printf '\\036%s\\t%s\\n' \"$f\" \"$(stat -c %Y -- \"$f\")\"; head -c 24000 -- \"$f\"; echo; \
+          grep -h '^{{\"type\":\"\\(custom-title\\|ai-title\\|summary\\|last-prompt\\)\"' -- \"$f\" | tail -n 8; \
+        done"
+    );
+    let out = conn.exec(&format!("bash -c {}", shell_quote(&script)), None).await?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut sessions = Vec::new();
     for record in text.split('\x1e').filter(|r| !r.is_empty()) {
         let Some((head, body)) = record.split_once('\n') else { continue };
         let Some((file, mtime)) = head.split_once('\t') else { continue };
         let session_id = file.rsplit('/').next().unwrap_or(file).trim_end_matches(".jsonl").to_string();
-        let (mut cwd, mut title) = (String::new(), String::new());
+        let (mut cwd, mut first_user) = (String::new(), String::new());
+        let (mut custom, mut ai, mut summary, mut last_prompt) = (String::new(), String::new(), String::new(), String::new());
         for line in body.lines() {
             let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
             if cwd.is_empty() {
@@ -160,18 +179,25 @@ pub async fn list_sessions(conn: &Conn) -> Result<Vec<SessionInfo>> {
                     cwd = c.to_string();
                 }
             }
-            if title.is_empty() {
-                title = match v["type"].as_str() {
-                    Some("summary") => v["summary"].as_str().unwrap_or_default().to_string(),
-                    Some("user") if v["isMeta"] != json!(true) => user_text(&v["message"]["content"]),
-                    _ => String::new(),
-                };
-            }
-            if !cwd.is_empty() && !title.is_empty() {
-                break;
+            let field = |key: &str| v[key].as_str().unwrap_or_default().trim().to_string();
+            // 标题记录可能出现多次（重命名、重新生成），取最后一条非空的
+            match v["type"].as_str() {
+                Some("custom-title") if !field("customTitle").is_empty() => custom = field("customTitle"),
+                Some("ai-title") if !field("aiTitle").is_empty() => ai = field("aiTitle"),
+                Some("summary") if !field("summary").is_empty() => summary = field("summary"),
+                Some("last-prompt") if !field("lastPrompt").is_empty() => last_prompt = field("lastPrompt"),
+                Some("user") if first_user.is_empty() && v["isMeta"] != json!(true) => {
+                    first_user = readable_title(&user_text(&v["message"]["content"]));
+                }
+                _ => {}
             }
         }
-        // 只有工具输出、没有真正用户输入的会话（如子代理）不列
+        // 优先用户自己起的名字，其次 AI 标题、摘要、第一条消息、最后一次输入
+        let title = [custom, ai, summary, first_user, last_prompt]
+            .into_iter()
+            .find(|t| !t.is_empty())
+            .unwrap_or_default();
+        // 什么都取不到的是打开就关掉的空会话（终端里的 /resume 同样不列）
         if title.is_empty() {
             continue;
         }
@@ -184,6 +210,36 @@ pub async fn list_sessions(conn: &Conn) -> Result<Vec<SessionInfo>> {
         });
     }
     Ok(sessions)
+}
+
+/// 最近用过的工作目录（新的在前）：取每个项目文件夹里最新会话开头的 cwd。
+/// 文件夹名是有损编码（- 分不清是 / 还是 .），所以从会话内容里取真实路径
+pub async fn recent_dirs(conn: &Conn) -> Result<Vec<String>> {
+    let script = "cd ~/.claude/projects 2>/dev/null || exit 0; \
+        ls -td -- */ 2>/dev/null | head -n 40 | while IFS= read -r d; do \
+          f=$(ls -t -- \"$d\"*.jsonl 2>/dev/null | head -n 1); \
+          [ -n \"$f\" ] && head -c 24000 -- \"$f\" | grep -o '\"cwd\":\"[^\"]*\"' | head -n 1; \
+        done";
+    let out = conn.exec(&format!("bash -c {}", shell_quote(script)), None).await?;
+    let mut dirs: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        // 每行是 "cwd":"..."，包成 JSON 对象解析，顺便处理转义
+        let Ok(v) = serde_json::from_str::<Value>(&format!("{{{line}}}")) else { continue };
+        if let Some(cwd) = v["cwd"].as_str().filter(|c| !c.is_empty()) {
+            if !dirs.iter().any(|d| d == cwd) {
+                dirs.push(cwd.to_string());
+            }
+        }
+    }
+    Ok(dirs)
+}
+
+/// 斜杠命令在会话里存成 <command-name>/model</command-name>…，做标题时只留命令名
+fn readable_title(text: &str) -> String {
+    text.strip_prefix("<command-name>")
+        .and_then(|rest| rest.split_once("</command-name>"))
+        .map(|(name, _)| name.trim().to_string())
+        .unwrap_or_else(|| text.to_string())
 }
 
 /// 取用户消息里的纯文本；只含 tool_result 的（工具回传）返回空

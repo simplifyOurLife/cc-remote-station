@@ -1,20 +1,29 @@
 import { FormEvent, useState } from "react";
-import { api, Auth, errorText, Host } from "./api";
+import { api, Auth, BUILTIN_NAME, errorText, Host, McpHostStatus, Settings } from "./api";
+import { HostToolsTable, initRows, rowProblems, rowsToTools } from "./HostTools";
+import { NumberInput } from "./NumberInput";
+import { Combo, Select } from "./Select";
 
-const emptyHost: Host = { id: "", name: "", host: "", port: 22, user: "root", auth: { kind: "password" }, jump: null, tmux: false, mcp: true, group: null, dir: null };
+const emptyHost: Host = { id: "", name: "", host: "", port: 22, user: "root", auth: { kind: "password" }, jump: null, tmux: false, mcp: true, tools: [{ name: BUILTIN_NAME, alias: "", remotePort: null }], group: null, dir: null };
 
 export function HostForm({
   initial,
   hosts,
+  settings,
+  status,
   onSaved,
   onCancel,
 }: {
   initial: Host | null;
   hosts: Host[];
+  /** 工具箱设置：列出工具及其默认云端名字/端口 */
+  settings: Settings;
+  status?: McpHostStatus;
   onSaved: (h: Host) => void;
   onCancel: () => void;
 }) {
   const [host, setHost] = useState<Host>(initial ?? emptyHost);
+  const [rows, setRows] = useState(() => initRows(initial ?? emptyHost, settings));
   const [secret, setSecret] = useState("");
   const [error, setError] = useState("");
   const isNew = !initial;
@@ -30,7 +39,7 @@ export function HostForm({
       const secretArg = host.auth.kind === "agent" ? "" : secret || undefined;
       const group = host.group?.trim() || null;
       const dir = host.dir?.trim() || null;
-      onSaved(await api.hostSave({ ...host, name, group, dir }, secretArg));
+      onSaved(await api.hostSave({ ...host, name, group, dir, tools: rowsToTools(rows, settings) }, secretArg));
     } catch (e) {
       setError(errorText(e));
     }
@@ -40,7 +49,7 @@ export function HostForm({
 
   return (
     <div className="terminal-overlay">
-      <form className="dialog host-form" onSubmit={submit}>
+      <form className={`dialog host-form ${host.mcp ? "with-tools" : ""}`} onSubmit={submit}>
         <h3>{isNew ? "新建主机" : `编辑 ${initial.name}`}</h3>
         <label>
           名称：
@@ -48,17 +57,12 @@ export function HostForm({
         </label>
         <label>
           分组：
-          <input
-            list="host-groups"
+          <Combo
             value={host.group ?? ""}
-            onChange={(e) => set({ group: e.target.value || null })}
+            onChange={(v) => set({ group: v || null })}
+            options={[...new Set(hosts.map((h) => h.group).filter((g): g is string => !!g))].map((g) => ({ value: g }))}
             placeholder="可选，如：生产 / 测试"
           />
-          <datalist id="host-groups">
-            {[...new Set(hosts.map((h) => h.group).filter(Boolean))].map((g) => (
-              <option key={g} value={g!} />
-            ))}
-          </datalist>
         </label>
         <div className="row">
           <label className="grow">
@@ -67,7 +71,7 @@ export function HostForm({
           </label>
           <label className="port">
             端口：
-            <input type="number" required min={1} max={65535} value={host.port} onChange={(e) => set({ port: Number(e.target.value) })} />
+            <NumberInput required min={1} max={65535} value={host.port} onChange={(port) => set({ port })} />
           </label>
         </div>
         <label>
@@ -84,11 +88,15 @@ export function HostForm({
         </label>
         <label>
           认证方式：
-          <select value={host.auth.kind} onChange={(e) => setAuthKind(e.target.value as Auth["kind"])}>
-            <option value="password">密码</option>
-            <option value="key">私钥文件</option>
-            <option value="agent">ssh-agent / Pageant</option>
-          </select>
+          <Select
+            value={host.auth.kind}
+            onChange={setAuthKind}
+            options={[
+              { value: "password", label: "密码" },
+              { value: "key", label: "私钥文件" },
+              { value: "agent", label: "ssh-agent / Pageant", hint: "用本机已加载的密钥" },
+            ]}
+          />
         </label>
         {host.auth.kind === "key" && (
           <label>
@@ -109,16 +117,14 @@ export function HostForm({
         )}
         <label>
           跳板机：
-          <select value={host.jump ?? ""} onChange={(e) => set({ jump: e.target.value || null })}>
-            <option value="">无</option>
-            {hosts
-              .filter((h) => h.id !== host.id)
-              .map((h) => (
-                <option key={h.id} value={h.id}>
-                  {h.name}
-                </option>
-              ))}
-          </select>
+          <Select
+            value={host.jump ?? ""}
+            onChange={(v) => set({ jump: v || null })}
+            options={[
+              { value: "", label: "无，直接连接" },
+              ...hosts.filter((h) => h.id !== host.id).map((h) => ({ value: h.id, label: h.name, hint: h.host })),
+            ]}
+          />
         </label>
         <label className="checkbox">
           <input type="checkbox" checked={host.tmux} onChange={(e) => set({ tmux: e.target.checked })} />
@@ -126,14 +132,15 @@ export function HostForm({
         </label>
         <label className="checkbox">
           <input type="checkbox" checked={host.mcp} onChange={(e) => set({ mcp: e.target.checked })} />
-          允许访问本机：这台主机上的 Claude Code 可经 SSH 隧道操作本机白名单目录（MCP）
+          使用 MCP 工具箱：连接时为下面勾选的工具建立端口映射，这台主机上的 Claude Code 就能用
         </label>
+        {host.mcp && <HostToolsTable rows={rows} onChange={setRows} settings={settings} status={status} />}
         {error && <p className="form-error">{error}</p>}
         <div className="dialog-actions">
           <button type="button" onClick={onCancel}>
             取消
           </button>
-          <button type="submit" className="primary">
+          <button type="submit" className="primary" disabled={host.mcp && rowProblems(rows, settings).size > 0}>
             保存
           </button>
         </div>

@@ -16,9 +16,20 @@ use crate::hosts::{Auth, Host, HostStore, secret_get, secret_set};
 /// 一条已认证的 SSH 连接。经跳板机时必须持有跳板机连接，否则隧道会被一起关掉。
 pub struct Conn {
     pub handle: Handle<Client>,
-    /// MCP 反向转发状态：None 未请求；Ok(云端端口)；Err(失败原因)
-    pub mcp_forward: Option<std::result::Result<u16, String>>,
+    /// 工具箱的反向转发（每个勾选的工具一条）及其建立结果
+    pub forwards: Vec<ForwardState>,
     _jump: Option<Box<Conn>>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardState {
+    pub name: String,
+    pub remote_port: u16,
+    /// 本机一侧的目标 host:port
+    pub target: String,
+    /// None 表示已建立
+    pub error: Option<String>,
 }
 
 pub struct ExecOutput {
@@ -51,11 +62,14 @@ impl Conn {
     }
 }
 
-/// 把云主机 127.0.0.1:remote_port 反向转发到本机 127.0.0.1:local_port（内置 MCP 服务）
-#[derive(Clone, Copy)]
-pub struct McpForward {
-    pub local_port: u16,
+/// 把云主机 127.0.0.1:remote_port 反向转发到本机能访问的 target_host:target_port
+/// （内置服务、本机 HTTP MCP，或局域网里的服务）
+#[derive(Clone)]
+pub struct Forward {
+    pub name: String,
     pub remote_port: u16,
+    pub target_host: String,
+    pub target_port: u16,
 }
 
 /// 用户在弹窗里确认过的主机密钥；只对 host:port + 指纹完全一致的那台生效
@@ -116,8 +130,8 @@ pub struct Client {
     known_hosts: PathBuf,
     trust: Option<TrustedKey>,
     unknown: Arc<Mutex<Option<String>>>,
-    /// 本机 MCP 服务端口；云端经反向转发进来的连接都接到这里
-    mcp_local_port: Option<u16>,
+    /// 云端端口 → 本机目标；云端经反向转发进来的连接按端口接到对应目标
+    targets: HashMap<u32, (String, u16)>,
 }
 
 impl client::Handler for Client {
@@ -127,23 +141,23 @@ impl client::Handler for Client {
         &mut self,
         channel: russh::Channel<client::Msg>,
         _connected_address: &str,
-        _connected_port: u32,
+        connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
         reply: ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<()> {
-        let Some(port) = self.mcp_local_port else {
+        let Some((host, port)) = self.targets.get(&connected_port).cloned() else {
             return Ok(()); // 丢弃 reply 即拒绝
         };
         reply.accept().await;
         tokio::spawn(async move {
-            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            match tokio::net::TcpStream::connect((host.as_str(), port)).await {
                 Ok(mut tcp) => {
                     let mut stream = channel.into_stream();
                     let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
                 }
-                Err(e) => log::warn!("连接本机 MCP 服务失败: {e}"),
+                Err(e) => log::warn!("连接本机 {host}:{port} 失败: {e}"),
             }
         });
         Ok(())
@@ -201,14 +215,14 @@ fn config() -> Arc<client::Config> {
 }
 
 /// 连接并认证一台主机；配了跳板机就先递归连跳板机，再通过 direct-tcpip 隧道连目标。
-/// mcp 为 Some 时在目标主机上建立反向转发；转发失败不影响登录，只记在 mcp_forward 里。
+/// forwards 在目标主机上逐条建立反向转发；转发失败不影响登录，只记在 Conn::forwards 里。
 pub async fn connect(
     store: &HostStore,
     known_hosts: &Path,
     host: &Host,
     trust: Option<&TrustedKey>,
     creds: &Credentials,
-    mcp: Option<McpForward>,
+    forwards: Vec<Forward>,
 ) -> Result<Conn> {
     let unknown = Arc::new(Mutex::new(None));
     let handler = Client {
@@ -217,7 +231,7 @@ pub async fn connect(
         known_hosts: known_hosts.to_path_buf(),
         trust: trust.cloned(),
         unknown: unknown.clone(),
-        mcp_local_port: mcp.map(|m| m.local_port),
+        targets: forwards.iter().map(|f| (f.remote_port.into(), (f.target_host.clone(), f.target_port))).collect(),
     };
 
     let (result, jump) = match &host.jump {
@@ -229,7 +243,7 @@ pub async fn connect(
             let jump_host = store.get(jump_id)?;
             // NeedSecret / UnknownHostKey 要原样传给前端弹窗，不能被 context 包住后丢掉类型——
             // anyhow 的 downcast 能穿透 context，这里照常加提示
-            let jump = Box::pin(connect(store, known_hosts, &jump_host, trust, creds, None))
+            let jump = Box::pin(connect(store, known_hosts, &jump_host, trust, creds, vec![]))
                 .await
                 .with_context(|| format!("跳板机 {} 连接失败", jump_host.name))?;
             let channel = jump
@@ -253,14 +267,23 @@ pub async fn connect(
     };
 
     authenticate(&mut handle, host, creds).await?;
-    let mcp_forward = match mcp {
-        None => None,
-        Some(m) => Some(match handle.tcpip_forward("127.0.0.1", m.remote_port.into()).await {
-            Ok(_) => Ok(m.remote_port),
-            Err(e) => Err(format!("云端端口 {} 反向转发失败（可能被占用或服务器禁止转发）：{e}", m.remote_port)),
-        }),
-    };
-    Ok(Conn { handle, mcp_forward, _jump: jump })
+    let mut states = Vec::new();
+    for f in forwards {
+        let error = match handle.tcpip_forward("127.0.0.1", f.remote_port.into()).await {
+            Ok(_) => None,
+            Err(e) => Some(format!(
+                "云端端口 {} 反向转发失败：{e}。可能被占用（比如另一台电脑正连着这台主机、用了同一个端口，可在「MCP 工具箱 → 这台电脑」里换端口），或服务器禁止转发",
+                f.remote_port
+            )),
+        };
+        states.push(ForwardState {
+            name: f.name,
+            remote_port: f.remote_port,
+            target: format!("{}:{}", f.target_host, f.target_port),
+            error,
+        });
+    }
+    Ok(Conn { handle, forwards: states, _jump: jump })
 }
 
 /// 密码/口令优先用弹窗里刚输入的，其次是凭据管理器里保存的；都没有或不对就返回 NeedSecret

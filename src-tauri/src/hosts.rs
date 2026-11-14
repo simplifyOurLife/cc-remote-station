@@ -21,6 +21,9 @@ pub struct Host {
     /// 允许该主机上的 Claude Code 经反向转发使用本机 MCP 服务
     #[serde(default)]
     pub mcp: bool,
+    /// 这台主机用的工具箱条目（含内置的 ccws）及在这台主机上改过的云端名字/端口；None 表示只用内置工具
+    #[serde(default)]
+    pub tools: Option<Vec<HostTool>>,
     /// 侧栏分组名，空表示未分组
     #[serde(default)]
     pub group: Option<String>,
@@ -28,6 +31,19 @@ pub struct Host {
     /// 主机配置存在本机，所以家里和公司的电脑可以对同一台云主机设不同目录
     #[serde(default)]
     pub dir: Option<String>,
+}
+
+/// 主机上的一个工具：名字指向工具箱条目，云端名字和端口可在这台主机上单独改
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostTool {
+    pub name: String,
+    /// 空表示用工具箱里的云端名字
+    #[serde(default)]
+    pub alias: String,
+    /// None 表示用工具箱里的云端端口
+    #[serde(default)]
+    pub remote_port: Option<u16>,
 }
 
 /// 密码 / 私钥口令不在这里，存在系统凭据管理器（见 secret_*）

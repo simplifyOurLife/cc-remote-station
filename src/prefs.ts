@@ -3,7 +3,7 @@ import type { ITheme } from "@xterm/xterm";
 export interface TerminalPrefs {
   fontFamily: string;
   fontSize: number;
-  theme: "dark" | "light";
+  theme: "neon" | "dark" | "light";
   scrollback: number;
 }
 
@@ -23,9 +23,9 @@ export interface UiPrefs {
 
 export const defaultPrefs: UiPrefs = {
   terminal: {
-    fontFamily: '"Cascadia Mono", "JetBrains Mono", Consolas, monospace',
+    fontFamily: '"JetBrains Mono", "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace',
     fontSize: 14,
-    theme: "dark",
+    theme: "neon",
     scrollback: 10000,
   },
   snippets: [
@@ -45,6 +45,30 @@ export function mergePrefs(raw: Record<string, unknown>): UiPrefs {
 }
 
 export const themes: Record<TerminalPrefs["theme"], ITheme> = {
+  // 与界面同一套夜间配色：紫黑底、青电光标、洋红选区，ANSI 色调成霓虹但保证在深底上可读
+  neon: {
+    background: "#0a0817",
+    foreground: "#e6e3ff",
+    cursor: "#2de2ff",
+    cursorAccent: "#0a0817",
+    selectionBackground: "#ff3d9a55",
+    black: "#1b1736",
+    red: "#ff5470",
+    green: "#5cf2b0",
+    yellow: "#ffc14d",
+    blue: "#6e8bff",
+    magenta: "#ff3d9a",
+    cyan: "#2de2ff",
+    white: "#c9c4f0",
+    brightBlack: "#5a5390",
+    brightRed: "#ff8095",
+    brightGreen: "#8affcb",
+    brightYellow: "#ffd88a",
+    brightBlue: "#9aafff",
+    brightMagenta: "#ff7ab8",
+    brightCyan: "#8cf0ff",
+    brightWhite: "#ffffff",
+  },
   dark: {
     background: "#14161b",
     foreground: "#d8dee9",

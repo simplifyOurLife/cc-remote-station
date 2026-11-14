@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Loading } from "./Loading";
 import { api, errorText, Host } from "./api";
 
 interface Entry {
@@ -97,7 +98,7 @@ export function ImportDialog({ hosts, onDone, onClose }: { hosts: Host[]; onDone
     <div className="terminal-overlay">
       <div className="dialog settings">
         <h3>从 ~/.ssh/config 导入</h3>
-        {entries === null && <p className="muted">正在读取…</p>}
+        {entries === null && <Loading text="正在读取 ~/.ssh/config" />}
         {entries?.length === 0 && <p className="muted">没有找到 ~/.ssh/config，或里面没有具体的主机配置</p>}
         <ul className="root-list import-list">
           {entries?.map((e) => (

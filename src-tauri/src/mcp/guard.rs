@@ -191,7 +191,7 @@ fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
 
 pub fn describe(roots: &[PathBuf]) -> String {
     if roots.is_empty() {
-        return "（未配置，请用户在 cc-workstation 「本机访问设置」里添加）".into();
+        return "（未配置，请用户在 cc-workstation 「MCP 工具箱 → 本机 Windows → 访问范围」里添加）".into();
     }
     roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join("；")
 }

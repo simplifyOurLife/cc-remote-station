@@ -13,6 +13,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import { api, CmdError, errorText, Host, NeedSecret, TrustedKey } from "./api";
 import { TerminalPrefs, themes } from "./prefs";
+import { ConnectScreen } from "./ConnectScreen";
 
 type Status =
   | { kind: "connecting" }
@@ -350,7 +351,7 @@ export function TerminalView(props: Props) {
           </button>
         </div>
       )}
-      {status.kind === "connecting" && <div className="terminal-banner">正在连接 {host.name}…</div>}
+      {status.kind === "connecting" && <ConnectScreen host={host} />}
       {status.kind === "lost" && (
         <div className="terminal-banner error">
           <span>连接已断开，{status.retryIn} 秒后自动重连</span>

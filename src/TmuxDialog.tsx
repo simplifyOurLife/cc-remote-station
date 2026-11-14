@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { Loading } from "./Loading";
+import { hostDateTime, tzLabel, useHostTz } from "./hostTime";
 import { api, errorText, Host, TmuxSession } from "./api";
 
 /** 列出主机上 cc-workstation 建的 tmux 会话，可接回或结束 */
@@ -13,6 +15,8 @@ export function TmuxDialog({
 }) {
   const [sessions, setSessions] = useState<TmuxSession[] | null>(null);
   const [error, setError] = useState("");
+  /** 会话跑在云主机上，最后活动时间按主机时区显示 */
+  const tz = useHostTz(host.id);
 
   const load = () =>
     api
@@ -34,7 +38,7 @@ export function TmuxDialog({
         <h3>{host.name} 上的保持会话</h3>
         <p className="muted">关掉应用或断网后仍在云主机上运行的会话，可以接回继续用。</p>
         {error && <p className="form-error">{error}</p>}
-        {sessions === null && !error && <p className="muted">正在读取…</p>}
+        {sessions === null && !error && <Loading text="正在读取保持的会话" />}
         {sessions?.length === 0 && <p className="muted">没有保持中的会话</p>}
         <ul className="root-list">
           {sessions?.map((s) => (
@@ -43,7 +47,7 @@ export function TmuxDialog({
                 <code>{s.name}</code>
                 <span className="muted">
                   {" "}
-                  {s.attached ? "已有终端连着" : "未连接"} · 最后活动 {new Date(s.activity * 1000).toLocaleString()}
+                  {s.attached ? "已有终端连着" : "未连接"} · 最后活动 <span title={tzLabel(tz)}>{hostDateTime(s.activity, tz)}</span>
                 </span>
               </span>
               <span className="row">

@@ -1,16 +1,21 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ask, message } from "@tauri-apps/plugin-dialog";
+import { useEffect, useRef, useState } from "react";
+import { ask, ModalHost } from "./modal";
 import { listen } from "@tauri-apps/api/event";
-import { ActivityDialog, summarize } from "./ActivityDialog";
+import { DeviceSettings } from "./AccessSettings";
+import { ActivityPanel, summarize } from "./ActivityPanel";
 import { ChatView } from "./ChatView";
-import { api, AuditEntry, errorText, Host, McpHostStatus } from "./api";
+import { api, AuditEntry, errorText, forwardState, Host, hostToolbox, McpHostStatus, Settings } from "./api";
 import { HostForm } from "./HostForm";
+import { HostsPage } from "./HostsPage";
+import { HostMcpDialog, McpStep } from "./HostMcpDialog";
 import { ImportDialog } from "./ImportDialog";
-import { PrefsDialog } from "./PrefsDialog";
+import { Logo } from "./Logo";
+import { PrefsPanel } from "./PrefsPanel";
 import { defaultPrefs, mergePrefs, UiPrefs } from "./prefs";
-import { SettingsDialog } from "./SettingsDialog";
 import { PaneControl, TerminalView } from "./TerminalView";
 import { TmuxDialog } from "./TmuxDialog";
+import { ToolboxPage } from "./ToolboxPage";
+import { TooltipLayer } from "./Tooltip";
 import "./App.css";
 
 interface Pane {
@@ -34,29 +39,39 @@ interface Tab {
   activePane: string;
 }
 
+/** 左侧导航的四个页面：每页只放一类事 */
+type Page = "hosts" | "workspace" | "toolbox" | "settings";
+
 type Dialog =
   | { kind: "host"; host: Host | null }
-  | { kind: "settings" }
-  | { kind: "prefs" }
   | { kind: "import" }
-  | { kind: "activity" }
-  | { kind: "tmux"; host: Host };
+  | { kind: "tmux"; host: Host }
+  /** 主机的 MCP 配置：① 选工具 → ② 写入 Claude */
+  | { kind: "mcp"; host: Host; step: McpStep };
 
 const newKey = () => crypto.randomUUID().replace(/-/g, "");
-const UNGROUPED = "未分组";
+const OPENED_KEY = "ccws.hasOpened";
+
+function loadOpened() {
+  try {
+    return localStorage.getItem(OPENED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 export default function App() {
+  const [page, setPage] = useState<Page>("hosts");
   const [hosts, setHosts] = useState<Host[]>([]);
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [error, setError] = useState("");
-  const [filter, setFilter] = useState("");
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [prefs, setPrefs] = useState<UiPrefs>(defaultPrefs);
+  const [access, setAccess] = useState<Settings | null>(null);
+  const [hasOpened, setHasOpened] = useState(loadOpened);
   const [showSnippets, setShowSnippets] = useState(false);
-  /** 正在配置 Claude 的主机 id，用于按钮 loading */
-  const [settingUp, setSettingUp] = useState<string | null>(null);
+  const [showNewTab, setShowNewTab] = useState(false);
   /** 各窗格的控制句柄，快捷命令发到当前窗格 */
   const controls = useRef(new Map<string, PaneControl>());
   /** 各主机 MCP 反向转发状态（只含已连接且开启的） */
@@ -64,11 +79,22 @@ export default function App() {
   /** 云端最近一次调用本机 MCP */
   const [lastActivity, setLastActivity] = useState<AuditEntry | null>(null);
 
-  const reload = () => api.hostsList().then(setHosts).catch((e) => setError(errorText(e)));
+  const reload = () =>
+    api
+      .hostsList()
+      .then(setHosts)
+      .catch((e) => setError(errorText(e)));
   useEffect(() => {
     reload();
     api.uiPrefsGet().then((raw) => setPrefs(mergePrefs(raw)));
+    api.settingsGet().then(setAccess);
     const unlisten = listen<AuditEntry>("mcp-activity", (e) => setLastActivity(e.payload));
+    // 启动时从审计日志取最近一条，重启后也能显示真实的最后一次调用；已收到新事件就不覆盖
+    api
+      .auditDays()
+      .then((days) => (days[0] ? api.auditEntries(days[0]) : []))
+      .then((entries) => entries[0] && setLastActivity((cur) => cur ?? entries[0]))
+      .catch(() => {});
     // 连接建立/断开没有事件，轮询一下转发状态即可（本地调用，开销可忽略）
     const poll = () => api.mcpStatus().then((list) => setMcpStatus(new Map(list.map((s) => [s.hostId, s]))));
     poll();
@@ -92,11 +118,30 @@ export default function App() {
     patchTab(key, { attention: false });
   };
 
+  /** 新开标签并切到工作区；第一次打开时记下，引导第 2 步打勾 */
   const openTab = (host: Host, session?: string, kind?: "chat") => {
     const pane: Pane = { key: newKey(), session, kind };
-    const tab: Tab = { key: newKey(), host, title: "", attention: false, dir: "row", panes: [pane], activePane: pane.key };
+    const tab: Tab = {
+      key: newKey(),
+      host,
+      title: "",
+      attention: false,
+      dir: "row",
+      panes: [pane],
+      activePane: pane.key,
+    };
     setTabs((t) => [...t, tab]);
     setActiveKey(tab.key);
+    setPage("workspace");
+    setShowNewTab(false);
+    if (!hasOpened) {
+      setHasOpened(true);
+      try {
+        localStorage.setItem(OPENED_KEY, "1");
+      } catch {
+        // 存不下只是引导下次还显示这一步
+      }
+    }
   };
 
   const closeTab = (key: string) => {
@@ -109,7 +154,11 @@ export default function App() {
 
   const splitPane = (tabKey: string, dir: "row" | "col", kind?: "chat") => {
     const pane: Pane = { key: newKey(), kind };
-    patchTab(tabKey, (t) => ({ dir, panes: [...t.panes, pane], activePane: pane.key }));
+    patchTab(tabKey, (t) => ({
+      dir,
+      panes: [...t.panes, pane],
+      activePane: pane.key,
+    }));
   };
 
   const closePane = (tab: Tab, paneKey: string) => {
@@ -127,247 +176,337 @@ export default function App() {
     ctl.focus();
   };
 
-  const setupClaude = async (host: Host) => {
-    setSettingUp(host.id);
-    try {
-      const out = await api.hostSetupClaude(host.id);
-      await message(
-        `已为 ${host.name} 上的 Claude Code 配好本机 MCP（ccws）。\n在该主机上新启动 claude 即可使用，输入 /mcp 可查看状态。\n\n${out}`,
-        { title: "配置成功", kind: "info" },
-      );
-    } catch (e) {
-      await message(errorText(e), { title: "配置失败", kind: "error" });
-    } finally {
-      setSettingUp(null);
-    }
-  };
+  /** 打开主机的 MCP 弹窗：已选好工具就直接到「写入 Claude」，否则从「选择工具」开始 */
+  const setupClaude = (host: Host) =>
+    setDialog({ kind: "mcp", host, step: host.mcp && hostToolbox(host).length > 0 ? 2 : 1 });
 
   const remove = async (host: Host) => {
-    if (!(await ask(`删除主机 ${host.name}？`, { title: "确认删除", kind: "warning" }))) return;
+    if (
+      !(await ask(`删除主机 ${host.name}？`, {
+        title: "确认删除",
+        kind: "warning",
+        okLabel: "删除",
+      }))
+    )
+      return;
     await api.hostDelete(host.id).catch((e) => setError(errorText(e)));
     reload();
   };
 
-  // 按分组归类并按搜索词过滤（匹配名称/地址/用户名/分组）
-  const grouped = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    const groups = new Map<string, Host[]>();
-    for (const h of hosts) {
-      const g = h.group || UNGROUPED;
-      const text = `${h.name} ${h.host} ${h.user} ${g}`.toLowerCase();
-      if (q && !text.includes(q)) continue;
-      groups.set(g, [...(groups.get(g) ?? []), h]);
-    }
-    // 未分组放最后，其余按名称排序
-    return [...groups.entries()].sort(([a], [b]) => (a === UNGROUPED ? 1 : b === UNGROUPED ? -1 : a.localeCompare(b)));
-  }, [hosts, filter]);
-  const hasGroups = grouped.some(([g]) => g !== UNGROUPED);
+  const toolbox = access?.toolbox ?? [];
+  const accessReady = !!access && (access.roots.length > 0 || toolbox.some((i) => i.enabled)) && hosts.some((h) => h.mcp);
+  const attention = tabs.some((t) => t.attention);
+  const mcpError = [...mcpStatus.values()].some((s) => forwardState(s) === "error");
 
-  const toggleGroup = (g: string) =>
-    setCollapsed((c) => {
-      const next = new Set(c);
-      if (next.has(g)) next.delete(g);
-      else next.add(g);
-      return next;
-    });
-
-  const hostItem = (h: Host) => (
-    <li key={h.id} onDoubleClick={() => openTab(h)} title="双击连接">
-      <div className="host-name">
-        {h.name}
-        {mcpStatus.has(h.id) && (
-          <span
-            className={`mcp-dot ${mcpStatus.get(h.id)!.state}`}
-            title={
-              mcpStatus.get(h.id)!.state === "ok"
-                ? `本机 MCP 已转发到云端 127.0.0.1:${mcpStatus.get(h.id)!.detail}`
-                : mcpStatus.get(h.id)!.detail
-            }
-          />
-        )}
-      </div>
-      <div className="host-addr">
-        {h.user}@{h.host}
-        {h.port !== 22 && `:${h.port}`}
-      </div>
-      <div className="host-actions">
-        <button onClick={() => openTab(h)}>连接</button>
-        <button onClick={() => openTab(h, undefined, "chat")} title="图形界面和云端 Claude Code 对话">
-          对话
-        </button>
-        {h.tmux && <button onClick={() => setDialog({ kind: "tmux", host: h })}>会话</button>}
-        {h.mcp && (
-          <button disabled={settingUp === h.id} onClick={() => setupClaude(h)} title="在云端执行 claude mcp add，需先连接">
-            {settingUp === h.id ? "配置中…" : "配置 Claude"}
-          </button>
-        )}
-        <button onClick={() => setDialog({ kind: "host", host: h })}>编辑</button>
-        <button onClick={() => remove(h)}>删除</button>
-      </div>
-    </li>
+  const navItem = (key: Page, icon: string, label: string, extra?: React.ReactNode) => (
+    <button
+      className={`rail-item ${page === key ? "active" : ""}`}
+      aria-current={page === key ? "page" : undefined}
+      onClick={() => {
+        setPage(key);
+        // 回到工作区就算看过当前标签了
+        if (key === "workspace" && activeKey) patchTab(activeKey, { attention: false });
+      }}
+    >
+      <span className="rail-icon">{icon}</span>
+      <span className="rail-label">{label}</span>
+      {extra}
+    </button>
   );
 
   return (
     <div className="app">
-      <aside className="sidebar">
-        <div className="sidebar-head">
-          <span>主机</span>
-          <span>
-            <button className="icon" title="从 ~/.ssh/config 导入" onClick={() => setDialog({ kind: "import" })}>
-              ⇩
-            </button>
-            <button className="icon" title="新建主机" onClick={() => setDialog({ kind: "host", host: null })}>
-              ＋
-            </button>
+      <nav className="rail" aria-label="主导航">
+        <div className="rail-brand">
+          <Logo />
+          <div className="rail-brand-text">
+            <span className="brand">cc-workstation</span>
+            <span className="muted rail-tagline">云端 Claude Code 工作台</span>
+          </div>
+        </div>
+        {navItem("hosts", "▣", "主机")}
+        {navItem(
+          "workspace",
+          "▤",
+          "工作区",
+          <>
+            {tabs.length > 0 && <span className="rail-count">{tabs.length}</span>}
+            {attention && <span className="tab-dot" title="有后台标签在等你" />}
+          </>,
+        )}
+        {navItem("toolbox", "▦", "MCP 工具箱", mcpError && <span className="mcp-dot error" title="有主机的端口映射建立失败" />)}
+        {navItem("settings", "⚙", "设置")}
+        <div className="grow" />
+        <button
+          className="rail-foot activity-line"
+          onClick={() => setPage("toolbox")}
+          title="云端 Claude 最近一次使用工具箱，点击查看全部记录"
+        >
+          <span className="activity-head">
+            ›_ 工具箱动态<span className="caret">▌</span>
           </span>
-        </div>
-        <div className="sidebar-search">
-          <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="搜索主机" />
-        </div>
-        {error && <p className="form-error">{error}</p>}
-        <ul className="host-list">
-          {grouped.map(([g, list]) =>
-            hasGroups ? (
-              <li key={g} className="group">
-                <div className="group-head" onClick={() => toggleGroup(g)}>
-                  {collapsed.has(g) && !filter ? "▸" : "▾"} {g} <span className="muted">{list.length}</span>
-                </div>
-                {(!collapsed.has(g) || filter) && <ul className="host-list nested">{list.map(hostItem)}</ul>}
-              </li>
-            ) : (
-              list.map(hostItem)
-            ),
-          )}
-          {hosts.length === 0 && <li className="empty">还没有主机，点右上角 ＋ 添加，或 ⇩ 从 ~/.ssh/config 导入</li>}
-        </ul>
-        <div className="sidebar-foot">
-          <div className="activity-line" onClick={() => setDialog({ kind: "activity" })} title="查看云端操作记录与文件备份">
+          <span className="activity-body">
             {lastActivity ? (
               <>
-                <span className={lastActivity.ok ? "ok" : "failed"}>{lastActivity.ok ? "●" : "✕"}</span>{" "}
-                <code>{lastActivity.tool}</code> <span className="muted">{summarize(lastActivity)}</span>
+                <span className={lastActivity.ok ? "ok" : "failed"}>{lastActivity.ok ? "●" : "✕"}</span> <code>{lastActivity.tool}</code>{" "}
+                <span className="muted">{summarize(lastActivity)}</span>
               </>
             ) : (
-              <span className="muted">云端操作记录</span>
+              <span className="muted">云端还没有用过工具箱</span>
             )}
-          </div>
-          <button onClick={() => setDialog({ kind: "prefs" })}>终端与快捷命令</button>
-          <button onClick={() => setDialog({ kind: "settings" })}>本机访问设置</button>
-        </div>
-      </aside>
+          </span>
+        </button>
+      </nav>
 
-      <main className="workspace">
-        <nav className="tabs">
-          <div className="tab-strip">
-            {tabs.map((t) => (
-              <div
-                key={t.key}
-                className={`tab ${t.key === activeKey ? "active" : ""}`}
-                title={t.title || t.host.name}
-                onClick={() => activate(t.key)}
-              >
-                {t.attention && <span className="tab-dot" />}
-                <span className="tab-title">
-                  {t.host.name}
-                  {t.panes.length > 1 && <span className="muted"> [{t.panes.length}]</span>}
-                  {t.title && <span className="muted"> ▸ {t.title}</span>}
-                </span>
-                <button
-                  className="icon"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    closeTab(t.key);
-                  }}
-                >
-                  ×
-                </button>
-              </div>
-            ))}
+      <main className="main">
+        {error && (
+          <div className="app-error">
+            {error}
+            <button className="icon" onClick={() => setError("")}>
+              ×
+            </button>
           </div>
-          {activeKey && (
-            <div className="tab-tools">
-              <button className="icon" title="向右分屏（Ctrl+Shift+D）" onClick={() => splitPane(activeKey, "row")}>
-                ‖
-              </button>
-              <button className="icon" title="向下分屏（Ctrl+Shift+E）" onClick={() => splitPane(activeKey, "col")}>
-                ═
-              </button>
-              <button className="icon" title="在右侧并排一个新对话" onClick={() => splitPane(activeKey, "row", "chat")}>
-                ＋对话
-              </button>
-              <div className="menu-anchor">
-                <button className="icon" title="快捷命令" onClick={() => setShowSnippets((s) => !s)}>
-                  ⚡
+        )}
+
+        {page === "hosts" && (
+          <HostsPage
+            hosts={hosts}
+            mcpStatus={mcpStatus}
+            hasOpened={hasOpened}
+            accessReady={accessReady}
+            onAdd={() => setDialog({ kind: "host", host: null })}
+            onImport={() => setDialog({ kind: "import" })}
+            onEdit={(h) => setDialog({ kind: "host", host: h })}
+            onDelete={remove}
+            onTerminal={(h) => openTab(h)}
+            onChat={(h) => openTab(h, undefined, "chat")}
+            onSessions={(h) => setDialog({ kind: "tmux", host: h })}
+            onSetupClaude={setupClaude}
+            onTools={(h) => setDialog({ kind: "mcp", host: h, step: 1 })}
+            onGoAccess={() => setPage("toolbox")}
+          />
+        )}
+
+        {page === "toolbox" && (
+          <div className="page">
+            <header className="page-head">
+              <div>
+                <h1>MCP 工具箱</h1>
+                <p className="muted">把本机的 MCP 服务经 SSH 端口映射共享给云端 Claude Code，每个工具一条映射（本机 → 云端端口）。</p>
+                <p className="muted">步骤：在这里添加工具 → 编辑主机勾选要用的工具 → 对主机点「配置 Claude」。</p>
+              </div>
+            </header>
+
+            <div className="page-columns">
+              <div>
+                <ToolboxPage
+                  builtinPort={access?.remotePort ?? 0}
+                  device={access?.device ?? ""}
+                  builtinAlias={access?.builtinAlias ?? ""}
+                  items={toolbox}
+                  onItemsChange={(items) => setAccess((a) => a && { ...a, toolbox: items })}
+                  onAccessSaved={setAccess}
+                />
+                <ActivityPanel refreshKey={lastActivity?.ts} />
+              </div>
+
+              <div>
+                <section className="page-card">
+                  <h3>主机</h3>
+                  <p className="muted">开启了工具箱的主机和当前的端口映射。点「MCP 工具」选工具并写入 Claude。</p>
+                  {hosts.filter((h) => h.mcp).length === 0 && (
+                    <p className="muted empty-note">还没有主机开启工具箱。在主机卡片上点「工具箱」标签即可开启。</p>
+                  )}
+                  <ul className="root-list access-hosts">
+                    {hosts
+                      .filter((h) => h.mcp)
+                      .map((h) => {
+                        const st = mcpStatus.get(h.id);
+                        return (
+                          <li key={h.id} className="access-host">
+                            <span className="grow">
+                              <b>{h.name}</b> {!st && <span className="muted">未连接：打开它的对话或终端后建立映射</span>}
+                              {st && (
+                                <span className="forward-list">
+                                  {st.forwards.map((f) => (
+                                    <span key={f.name} className={f.error ? "form-error inline" : ""} title={f.error ?? undefined}>
+                                      {f.error ? "✕" : "●"} {f.name}{" "}
+                                      <span className="muted">
+                                        {f.target} → 云端 :{f.remotePort}
+                                      </span>
+                                    </span>
+                                  ))}
+                                </span>
+                              )}
+                            </span>
+                            <button onClick={() => setupClaude(h)}>MCP 工具</button>
+                          </li>
+                        );
+                      })}
+                  </ul>
+                </section>
+                <DeviceSettings onSaved={setAccess} />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {page === "settings" && (
+          <div className="page">
+            <header className="page-head">
+              <div>
+                <h1>设置</h1>
+                <p className="muted">终端的外观和快捷命令，保存后立即作用到所有已打开的终端。</p>
+              </div>
+            </header>
+            <PrefsPanel prefs={prefs} onSave={savePrefs} />
+          </div>
+        )}
+
+        {/* 工作区始终挂着，只是切到其他页时隐藏：卸载会断开所有终端和对话 */}
+        <div className="workspace" style={{ display: page === "workspace" ? "flex" : "none" }}>
+          <nav className="tabs">
+            <div className="tab-strip">
+              {tabs.map((t) => (
+                <div
+                  key={t.key}
+                  className={`tab ${t.key === activeKey ? "active" : ""}`}
+                  title={t.title || t.host.name}
+                  onClick={() => activate(t.key)}
+                >
+                  {t.attention && <span className="tab-dot" />}
+                  <span className="tab-kind">{t.panes[0].kind === "chat" ? "对话" : "终端"}</span>
+                  <span className="tab-title">
+                    {t.host.name}
+                    {t.panes.length > 1 && <span className="muted"> [{t.panes.length}]</span>}
+                    {t.title && <span className="muted"> ▸ {t.title}</span>}
+                  </span>
+                  <button
+                    className="icon"
+                    title="关闭标签"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeTab(t.key);
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+              <div className="menu-anchor new-tab">
+                <button className="icon" title="新建标签" onClick={() => setShowNewTab(!showNewTab)}>
+                  ＋
                 </button>
-                {showSnippets && (
-                  <div className="menu" onMouseLeave={() => setShowSnippets(false)}>
-                    {prefs.snippets.map((s) => (
-                      <div key={s.id} className="menu-item" onClick={() => sendSnippet(s.command, s.run)}>
-                        <span>{s.name}</span>
-                        <code className="muted">{s.command}</code>
+                {showNewTab && (
+                  <div className="menu new-tab-menu" onMouseLeave={() => setShowNewTab(false)}>
+                    {hosts.map((h) => (
+                      <div key={h.id} className="menu-item new-tab-row">
+                        <span className="grow">{h.name}</span>
+                        <button className="primary" onClick={() => openTab(h, undefined, "chat")}>
+                          对话
+                        </button>
+                        <button onClick={() => openTab(h)}>终端</button>
                       </div>
                     ))}
-                    {prefs.snippets.length === 0 && <div className="menu-item muted">还没有快捷命令</div>}
-                    <div
-                      className="menu-item menu-foot"
-                      onClick={() => {
-                        setShowSnippets(false);
-                        setDialog({ kind: "prefs" });
-                      }}
-                    >
-                      管理快捷命令…
-                    </div>
+                    {hosts.length === 0 && <div className="menu-item muted">还没有主机，先到「主机」页添加</div>}
                   </div>
                 )}
               </div>
             </div>
-          )}
-        </nav>
-        <div className="panes">
-          {tabs.map((t) => (
-            <div
-              key={t.key}
-              className={`tab-body ${t.dir}`}
-              style={{ display: t.key === activeKey ? "flex" : "none", flexDirection: t.dir === "row" ? "row" : "column" }}
-            >
-              {t.panes.map((p) =>
-                p.kind === "chat" ? (
-                  <ChatView
-                    key={p.key}
-                    host={t.host}
-                    visible={t.key === activeKey}
-                    focused={p.key === t.activePane}
-                    onFocus={() => t.activePane !== p.key && patchTab(t.key, { activePane: p.key })}
-                    onTitle={(title) => patchTab(t.key, { title })}
-                    onAttention={() => t.key !== activeKey && patchTab(t.key, { attention: true })}
-                  />
-                ) : (
-                <TerminalView
-                  key={p.key}
-                  host={t.host}
-                  paneKey={p.key}
-                  session={p.session}
-                  visible={t.key === activeKey}
-                  focused={p.key === t.activePane}
-                  prefs={prefs.terminal}
-                  onTitle={(title) => p.key === t.activePane && patchTab(t.key, { title })}
-                  onAttention={() => t.key !== activeKey && patchTab(t.key, { attention: true })}
-                  onFocus={() => t.activePane !== p.key && patchTab(t.key, { activePane: p.key })}
-                  onSplit={(dir) => splitPane(t.key, dir)}
-                  onClose={() => closePane(t, p.key)}
-                  onControl={(ctl) => (ctl ? controls.current.set(p.key, ctl) : controls.current.delete(p.key))}
-                />
-                ),
-              )}
-            </div>
-          ))}
-          {tabs.length === 0 && <div className="placeholder">从左侧选择主机开始连接</div>}
+            {activeKey && (
+              <div className="tab-tools">
+                <button className="icon" title="向右分屏一个终端（Ctrl+Shift+D）" onClick={() => splitPane(activeKey, "row")}>
+                  ‖
+                </button>
+                <button className="icon" title="向下分屏一个终端（Ctrl+Shift+E）" onClick={() => splitPane(activeKey, "col")}>
+                  ═
+                </button>
+                <button className="icon" title="在右侧并排一个新对话" onClick={() => splitPane(activeKey, "row", "chat")}>
+                  ＋对话
+                </button>
+                <div className="menu-anchor">
+                  <button className="icon" title="快捷命令" onClick={() => setShowSnippets((s) => !s)}>
+                    ⚡
+                  </button>
+                  {showSnippets && (
+                    <div className="menu" onMouseLeave={() => setShowSnippets(false)}>
+                      {prefs.snippets.map((s) => (
+                        <div key={s.id} className="menu-item" onClick={() => sendSnippet(s.command, s.run)}>
+                          <span>{s.name}</span>
+                          <code className="muted">{s.command}</code>
+                        </div>
+                      ))}
+                      {prefs.snippets.length === 0 && <div className="menu-item muted">还没有快捷命令</div>}
+                      <div
+                        className="menu-item menu-foot"
+                        onClick={() => {
+                          setShowSnippets(false);
+                          setPage("settings");
+                        }}
+                      >
+                        管理快捷命令…
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </nav>
+          <div className="panes">
+            {tabs.map((t) => (
+              <div
+                key={t.key}
+                className={`tab-body ${t.dir}`}
+                style={{
+                  display: t.key === activeKey ? "flex" : "none",
+                  flexDirection: t.dir === "row" ? "row" : "column",
+                }}
+              >
+                {t.panes.map((p) =>
+                  p.kind === "chat" ? (
+                    <ChatView
+                      key={p.key}
+                      host={t.host}
+                      visible={page === "workspace" && t.key === activeKey}
+                      focused={p.key === t.activePane}
+                      onFocus={() => t.activePane !== p.key && patchTab(t.key, { activePane: p.key })}
+                      onTitle={(title) => patchTab(t.key, { title })}
+                      onAttention={() => (t.key !== activeKey || page !== "workspace") && patchTab(t.key, { attention: true })}
+                    />
+                  ) : (
+                    <TerminalView
+                      key={p.key}
+                      host={t.host}
+                      paneKey={p.key}
+                      session={p.session}
+                      visible={page === "workspace" && t.key === activeKey}
+                      focused={p.key === t.activePane}
+                      prefs={prefs.terminal}
+                      onTitle={(title) => p.key === t.activePane && patchTab(t.key, { title })}
+                      onAttention={() => (t.key !== activeKey || page !== "workspace") && patchTab(t.key, { attention: true })}
+                      onFocus={() => t.activePane !== p.key && patchTab(t.key, { activePane: p.key })}
+                      onSplit={(dir) => splitPane(t.key, dir)}
+                      onClose={() => closePane(t, p.key)}
+                      onControl={(ctl) => (ctl ? controls.current.set(p.key, ctl) : controls.current.delete(p.key))}
+                    />
+                  ),
+                )}
+              </div>
+            ))}
+            {tabs.length === 0 && (
+              <div className="placeholder workspace-empty">
+                <div>这里会显示你打开的对话和终端</div>
+                <button className="primary" onClick={() => setPage("hosts")}>
+                  去选一台主机
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </main>
 
-      {dialog?.kind === "settings" && <SettingsDialog onClose={() => setDialog(null)} />}
-      {dialog?.kind === "activity" && <ActivityDialog onClose={() => setDialog(null)} />}
-      {dialog?.kind === "prefs" && <PrefsDialog prefs={prefs} onSave={savePrefs} onClose={() => setDialog(null)} />}
+      <ModalHost />
+      <TooltipLayer />
       {dialog?.kind === "tmux" && (
         <TmuxDialog
           host={dialog.host}
@@ -376,6 +515,20 @@ export default function App() {
             setDialog(null);
           }}
           onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog?.kind === "mcp" && access && (
+        <HostMcpDialog
+          host={dialog.host}
+          settings={access}
+          status={mcpStatus.get(dialog.host.id)}
+          initialStep={dialog.step}
+          onHostSaved={() => reload()}
+          onClose={() => setDialog(null)}
+          onManage={() => {
+            setDialog(null);
+            setPage("toolbox");
+          }}
         />
       )}
       {dialog?.kind === "import" && (
@@ -388,10 +541,12 @@ export default function App() {
           onClose={() => setDialog(null)}
         />
       )}
-      {dialog?.kind === "host" && (
+      {dialog?.kind === "host" && access && (
         <HostForm
           initial={dialog.host}
           hosts={hosts}
+          settings={access}
+          status={dialog.host ? mcpStatus.get(dialog.host.id) : undefined}
           onCancel={() => setDialog(null)}
           onSaved={() => {
             setDialog(null);
