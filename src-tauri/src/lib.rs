@@ -35,6 +35,8 @@ pub struct AppState {
     toolbox: Arc<mcp::Toolbox>,
     /// 按主机复用连接：同一台主机的多个终端和 MCP 转发走同一条 SSH 连接
     conns: tokio::sync::Mutex<HashMap<String, Arc<Conn>>>,
+    /// 每台主机一把「正在建连接」的锁：同一台不重复连，不同主机互不阻塞
+    connecting: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 登录中途的验证码等输入：弹窗问用户
     prompter: ssh::Prompter,
     terminals: Mutex<HashMap<String, TermHandle>>,
@@ -72,21 +74,31 @@ impl<E: Into<anyhow::Error>> From<E> for CmdError {
 
 type CmdResult<T> = Result<T, CmdError>;
 
-/// 取该主机已有的连接，没有（或已断）就新建；返回的 bool 表示是否新建
+async fn alive_conn(state: &AppState, host_id: &str) -> Option<Arc<Conn>> {
+    state.conns.lock().await.get(host_id).filter(|c| !c.handle.is_closed()).cloned()
+}
+
+/// 取该主机已有的连接，没有（或已断）就新建；返回的 bool 表示是否新建。
+/// 建连接（含等用户输验证码）只锁这一台主机：同主机的其他标签排队复用同一条连接，别的主机不受影响
 async fn get_or_connect(
     state: &AppState,
     host_id: &str,
     trust: Option<&TrustedKey>,
     creds: &Credentials,
 ) -> anyhow::Result<(Arc<Conn>, bool)> {
-    let mut conns = state.conns.lock().await;
-    if let Some(c) = conns.get(host_id).filter(|c| !c.handle.is_closed()) {
-        return Ok((c.clone(), false));
+    if let Some(c) = alive_conn(state, host_id).await {
+        return Ok((c, false));
+    }
+    let gate = state.connecting.lock().unwrap().entry(host_id.to_string()).or_default().clone();
+    let _connecting = gate.lock().await;
+    // 排队期间可能已经有人连上了
+    if let Some(c) = alive_conn(state, host_id).await {
+        return Ok((c, false));
     }
     let host = state.hosts.get(host_id)?;
     let forwards = host_forwards(state, &host);
     let conn = Arc::new(ssh::connect(&state.hosts, &state.known_hosts, &host, trust, creds, &state.prompter, forwards).await?);
-    conns.insert(host_id.to_string(), conn.clone());
+    state.conns.lock().await.insert(host_id.to_string(), conn.clone());
     Ok((conn, true))
 }
 
@@ -935,6 +947,7 @@ pub fn run() {
                 guard,
                 toolbox,
                 conns: Default::default(),
+                connecting: Default::default(),
                 prompter: ssh::Prompter::new(app.handle().clone()),
                 terminals: Default::default(),
                 chats: Default::default(),
