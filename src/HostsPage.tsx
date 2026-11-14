@@ -79,7 +79,12 @@ export function HostsPage(p: Props) {
     const st = p.mcpStatus.get(h.id);
     const state = forwardState(st);
     return (
-      <article key={h.id} className={`host-card ${state === "ok" ? "live" : ""}`} onDoubleClick={() => p.onChat(h)}>
+      <article
+        key={h.id}
+        className={`host-card ${state === "ok" ? "live" : ""}`}
+        // 双击卡片空白处开对话；双击在按钮上（如快速点两下「打开终端」）不算
+        onDoubleClick={(e) => !(e.target as HTMLElement).closest("button") && p.onChat(h)}
+      >
         <header className="host-card-head">
           <span className="host-card-name">{h.name}</span>
           {st && (
@@ -121,7 +126,7 @@ export function HostsPage(p: Props) {
             )}
           </div>
         </header>
-        <div className="host-card-addr">
+        <div className="host-card-addr" title={`${h.user}@${h.host}${h.port !== 22 ? `:${h.port}` : ""}`}>
           {h.user}@{h.host}
           {h.port !== 22 && `:${h.port}`}
         </div>
@@ -190,7 +195,19 @@ export function HostsPage(p: Props) {
 
       {p.hosts.length > 0 && (
         <div className="page-toolbar">
-          <input className="page-search" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="按名称、地址、分组搜索" />
+          <div className="search-box page-search">
+            <input
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              onKeyDown={(e) => e.key === "Escape" && setFilter("")}
+              placeholder="按名称、地址、分组搜索"
+            />
+            {filter && (
+              <button className="icon" title="清空（Esc）" aria-label="清空搜索" onClick={() => setFilter("")}>
+                ✕
+              </button>
+            )}
+          </div>
           <button onClick={p.onImport}>从 ssh config 导入</button>
           <button className="primary" onClick={p.onAdd}>
             添加主机
@@ -209,6 +226,19 @@ export function HostsPage(p: Props) {
         </section>
       ))}
       {p.hosts.length > 0 && grouped.length === 0 && <p className="muted">没有匹配「{filter}」的主机</p>}
+      {/* 引导被关掉、又没有主机时，也要有地方添加 */}
+      {p.hosts.length === 0 && !showGuide && (
+        <section className="hosts-empty">
+          <h3>还没有主机</h3>
+          <p className="muted">添加一台云主机，或从 ~/.ssh/config 导入已有的主机。</p>
+          <div className="row">
+            <button onClick={p.onImport}>从 ssh config 导入</button>
+            <button className="primary" onClick={p.onAdd}>
+              添加主机
+            </button>
+          </div>
+        </section>
+      )}
     </div>
   );
 }

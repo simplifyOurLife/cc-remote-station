@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Loading } from "./Loading";
 import { ConnectScreen } from "./ConnectScreen";
 import { Logo } from "./Logo";
@@ -224,6 +224,14 @@ export function ChatView(props: Props) {
   }, [state.sessionId, mode, model]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // 输入框按内容实际高度自动长高（长段文字折行也算），最多约 10 行，再多就滚动
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const line = parseFloat(getComputedStyle(el).lineHeight) || 20;
+    el.style.height = `${Math.min(el.scrollHeight + 2, line * 10 + 20)}px`;
+  }, [input]);
 
   // 打开即预热：后台启动云端 claude 并拿命令列表；关标签时结束它
   useEffect(() => {
@@ -1122,8 +1130,10 @@ export function ChatView(props: Props) {
           <textarea
             ref={inputRef}
             value={input}
-            rows={Math.min(10, Math.max(2, input.split("\n").length))}
-            placeholder={state.running ? "Claude 正在工作，可以继续输入（会排队）" : "给 Claude 发消息"}
+            rows={2}
+            placeholder={
+              state.running ? "Claude 正在工作，可以继续输入（会排队）" : "给 Claude 发消息（Enter 发送，Shift+Enter 换行，/ 命令，@ 文件）"
+            }
             onChange={(e) => {
               setInput(e.target.value);
               updateCompletion(e.target.value, e.target.selectionStart);
@@ -1133,7 +1143,7 @@ export function ChatView(props: Props) {
           />
           <div className="chat-input-actions">
             <button title="从本机选择文件，上传到云主机后把路径插入输入框" disabled={uploading} onClick={attachFiles}>
-              {uploading ? "上传中…" : "📎 附件"}
+              {uploading ? "上传中…" : "⊕ 附件"}
             </button>
             <button className="primary" disabled={!input.trim() && !images.length} onClick={send}>
               发送

@@ -78,6 +78,7 @@ export default function App() {
   const [showSnippets, setShowSnippets] = useState(false);
   const [showNewTab, setShowNewTab] = useState(false);
   const newTabBtn = useRef<HTMLButtonElement>(null);
+  const tabStrip = useRef<HTMLDivElement>(null);
   const snippetsBtn = useRef<HTMLButtonElement>(null);
   /** 左侧导航收起成只有图标的窄条（记在本机） */
   const [railCollapsed, setRailCollapsed] = useState(() => {
@@ -242,6 +243,11 @@ export default function App() {
   );
 
   // 标题栏里的位置：页面，工作区再加上当前标签的主机和类型
+  // 当前标签滚到可见位置（新开的标签可能在标签栏右边看不到的地方）
+  useEffect(() => {
+    tabStrip.current?.querySelector(".tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeKey, tabs.length, page]);
+
   const activeTab = tabs.find((t) => t.key === activeKey);
   const crumbs = [
     "cc-workstation",
@@ -414,13 +420,23 @@ export default function App() {
         {/* 工作区始终挂着，只是切到其他页时隐藏：卸载会断开所有终端和对话 */}
         <div className="workspace" style={{ display: page === "workspace" ? "flex" : "none" }}>
           <nav className="tabs">
-            <div className="tab-strip">
+            <div
+              className="tab-strip"
+              ref={tabStrip}
+              // 标签多到溢出时，竖向滚轮转成横向滚动
+              onWheel={(e) => {
+                if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY;
+              }}
+            >
               {tabs.map((t) => (
                 <div
                   key={t.key}
                   className={`tab ${t.key === activeKey ? "active" : ""}`}
-                  title={t.title || t.host.name}
+                  title={`${t.title || t.host.name}\n中键点击关闭`}
                   onClick={() => activate(t.key)}
+                  // 中键关闭（和浏览器一致）；mousedown 拦掉中键自动滚动
+                  onMouseDown={(e) => e.button === 1 && e.preventDefault()}
+                  onAuxClick={(e) => e.button === 1 && closeTab(t.key)}
                 >
                   {t.attention && <span className="tab-dot" />}
                   <span className="tab-kind">{t.panes[0].kind === "chat" ? "对话" : "终端"}</span>

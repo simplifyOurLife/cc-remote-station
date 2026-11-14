@@ -95,7 +95,7 @@ export function ImportDialog({ hosts, onDone, onClose }: { hosts: Host[]; onDone
   };
 
   return (
-    <div className="terminal-overlay">
+    <div className="terminal-overlay" onKeyDown={(e) => e.key === "Escape" && onClose()}>
       <div className="dialog settings">
         <h3>从 ~/.ssh/config 导入</h3>
         {entries === null && <Loading text="正在读取 ~/.ssh/config" />}

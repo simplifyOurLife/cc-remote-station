@@ -48,7 +48,7 @@ export function HostForm({
   const secretLabel = host.auth.kind === "password" ? "密码" : "私钥口令";
 
   return (
-    <div className="terminal-overlay">
+    <div className="terminal-overlay" onKeyDown={(e) => e.key === "Escape" && onCancel()}>
       <form className={`dialog host-form ${host.mcp ? "with-tools" : ""}`} onSubmit={submit}>
         <h3>{isNew ? "新建主机" : `编辑 ${initial.name}`}</h3>
         <label>

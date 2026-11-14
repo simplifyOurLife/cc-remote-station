@@ -122,7 +122,7 @@ export function ToolboxImport({
   };
 
   return (
-    <div className="terminal-overlay">
+    <div className="terminal-overlay" onKeyDown={(e) => e.key === "Escape" && !busy && onCancel()}>
       <div className="dialog host-form toolbox-import">
         <h3>从本机导入 MCP</h3>
         <p className="muted">读取本机 Claude Code（全局和各项目）、Claude Desktop、Cursor 里已配的 MCP。只读取，不会改动这些配置。</p>

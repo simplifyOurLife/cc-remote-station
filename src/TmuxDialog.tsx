@@ -33,7 +33,7 @@ export function TmuxDialog({
   };
 
   return (
-    <div className="terminal-overlay">
+    <div className="terminal-overlay" onKeyDown={(e) => e.key === "Escape" && onClose()}>
       <div className="dialog settings">
         <h3>{host.name} 上的保持会话</h3>
         <p className="muted">关掉应用或断网后仍在云主机上运行的会话，可以接回继续用。</p>

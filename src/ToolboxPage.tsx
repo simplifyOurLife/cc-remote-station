@@ -389,7 +389,7 @@ function ToolboxForm({
   };
 
   return (
-    <div className="terminal-overlay">
+    <div className="terminal-overlay" onKeyDown={(e) => e.key === "Escape" && onCancel()}>
       <form className="dialog host-form toolbox-form" onSubmit={submit}>
         <h3>{initial ? `编辑 ${initial.name}` : "添加 MCP"}</h3>
         <div className="row">
