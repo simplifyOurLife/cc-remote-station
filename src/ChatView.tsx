@@ -37,6 +37,7 @@ import { McpPanel } from "./McpPanel";
 import { Combo } from "./Select";
 import { ChatStatus, nextMode } from "./ChatStatus";
 import { PermissionCard, ToolCard } from "./ToolCard";
+import { kbd, modKey } from "./platform";
 const MODELS = ["", "opus", "sonnet", "haiku"];
 const SESSIONS_KEY = "ccws.chatSessionsOpen";
 
@@ -600,7 +601,7 @@ export function ChatView(props: Props) {
   }, [currentMatch]);
 
   const onPaneKeyDown = (e: React.KeyboardEvent) => {
-    if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === "f") {
+    if (modKey(e) && !e.shiftKey && e.key.toLowerCase() === "f") {
       e.preventDefault();
       setSearch((s) => s ?? { q: "", index: 0 });
     }
@@ -971,7 +972,7 @@ export function ChatView(props: Props) {
               </div>
             )}
           </div>
-          <button className="icon" title="搜索对话（Ctrl+F）" onClick={() => setSearch((s) => s ?? { q: "", index: 0 })}>
+          <button className="icon" title={kbd("搜索对话（Ctrl+F）")} onClick={() => setSearch((s) => s ?? { q: "", index: 0 })}>
             ⌕
           </button>
           <button className="icon" title="导出为 Markdown" disabled={!state.items.length} onClick={exportMarkdown}>

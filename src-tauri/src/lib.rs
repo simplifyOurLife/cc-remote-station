@@ -812,18 +812,28 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示 cc-workstation", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &PredefinedMenuItem::separator(app)?, &quit])?;
-    // 托盘用单独的透明底图标（icons/tray.png，由 tray-icon.svg 生成），比带底板的应用图标在 16px 下清爽
-    TrayIconBuilder::with_id("main")
+    // 托盘用单独的透明底图标（icons/tray.png，由 tray-icon.svg 生成），比带底板的应用图标在 16px 下清爽。
+    // macOS 菜单栏用单色模板图（只看透明度，系统按深浅色菜单栏自动着色），并按习惯左键弹菜单
+    #[cfg(target_os = "macos")]
+    let tray = TrayIconBuilder::with_id("main")
+        .icon(tauri::include_image!("icons/tray-template.png"))
+        .icon_as_template(true)
+        .show_menu_on_left_click(true);
+    #[cfg(not(target_os = "macos"))]
+    let tray = TrayIconBuilder::with_id("main")
         .icon(tauri::include_image!("icons/tray.png"))
-        .tooltip("cc-workstation")
+        .show_menu_on_left_click(false);
+    tray.tooltip("cc-workstation")
         .menu(&menu)
-        .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main(app),
             "quit" => app.exit(0),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
+            if cfg!(target_os = "macos") {
+                return; // macOS 左键已经弹菜单
+            }
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
                 show_main(tray.app_handle());
             }
@@ -843,23 +853,61 @@ fn hide_to_tray(window: &tauri::Window) {
     }
     let _ = std::fs::write(&marker, "");
     use tauri_plugin_notification::NotificationExt;
-    let _ = app
-        .notification()
-        .builder()
-        .title("cc-workstation 已最小化到托盘")
-        .body("终端和对话仍在后台运行。点托盘图标打开，右键可以退出。")
-        .show();
+    let (title, body) = if cfg!(target_os = "macos") {
+        ("cc-workstation 仍在后台运行", "点 Dock 图标或菜单栏图标可以重新打开，⌘Q 或菜单栏图标 → 退出。")
+    } else {
+        ("cc-workstation 已最小化到托盘", "终端和对话仍在后台运行。点托盘图标打开，右键可以退出。")
+    };
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// 从 Dock / Finder 启动的 macOS 应用只拿到 /usr/bin:/bin 这样的最小 PATH，
+/// Homebrew、nvm 装的 node/npx 都找不到。启动时从用户的登录 shell 读一次完整 PATH（5 秒超时）
+#[cfg(target_os = "macos")]
+fn load_login_path() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    const MARK: &str = "__CCWS_PATH__";
+    let Ok(mut child) = Command::new(&shell)
+        .args(["-ilc", &format!("printf '{MARK}%s{MARK}' \"$PATH\"")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                return;
+            }
+        }
+    }
+    let mut out = String::new();
+    let _ = child.stdout.take().map(|mut s| s.read_to_string(&mut out));
+    if let Some(path) = out.split(MARK).nth(1).filter(|p| !p.is_empty()) {
+        // SAFETY: 启动时还没有其他线程读写环境变量
+        unsafe { std::env::set_var("PATH", path) };
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
+    #[cfg(target_os = "macos")]
+    load_login_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        // 点关闭（标题栏 ✕、Alt+F4、任务栏关闭）不退出，缩到托盘；真正退出走托盘菜单
+        // 点关闭（标题栏 ✕、Alt+F4、任务栏关闭、macOS 红灯）不退出，缩到托盘；真正退出走托盘菜单（macOS 还有 ⌘Q）
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -938,10 +986,12 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
-        .run(|app, event| {
+        .run(|app, event| match event {
             // 工具箱启动的本机命令不会随应用退出自动结束
-            if let tauri::RunEvent::Exit = event {
-                app.state::<AppState>().toolbox.shutdown();
-            }
+            tauri::RunEvent::Exit => app.state::<AppState>().toolbox.shutdown(),
+            // macOS：窗口藏起来后点 Dock 图标重新打开
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => show_main(app),
+            _ => {}
         });
 }

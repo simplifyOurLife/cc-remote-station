@@ -23,10 +23,19 @@ pub enum ToolOut {
     Image { data: String, mime: &'static str },
 }
 
+#[cfg(windows)]
+const PATH_HINT: &str = "Windows 绝对路径，如 D:\\project\\src\\main.rs";
+#[cfg(not(windows))]
+const PATH_HINT: &str = "本机绝对路径，如 /Users/me/project/src/main.rs";
+#[cfg(windows)]
+const RUN_HINT: &str = "在本机 Windows 上用 cmd 执行命令";
+#[cfg(not(windows))]
+const RUN_HINT: &str = "在本机 Mac 上用用户的登录 shell（一般是 zsh）执行命令";
+
 /// tools/list 返回的工具定义。run_command 始终列出，关闭时调用会返回明确提示
 ///（Claude Code 只在连接时拉一次工具列表，按开关动态增减反而会让它看不到）
 pub fn list() -> Value {
-    let path = json!({ "type": "string", "description": "Windows 绝对路径，如 D:\\project\\src\\main.rs" });
+    let path = json!({ "type": "string", "description": PATH_HINT });
     json!([
         {
             "name": "list_allowed_roots",
@@ -104,8 +113,8 @@ pub fn list() -> Value {
         },
         {
             "name": "run_command",
-            "description": "在本机 Windows 上用 cmd 执行命令（需用户在 cc-workstation 中开启）。工作目录必须在允许的目录内。\
-构建、跑测试等长任务请传 background=true，立即返回任务 id，再用 command_output 取输出。前台命令超时会结束整个进程树。",
+            "description": format!("{RUN_HINT}（需用户在 cc-workstation 中开启）。工作目录必须在允许的目录内。\
+构建、跑测试等长任务请传 background=true，立即返回任务 id，再用 command_output 取输出。前台命令超时会结束整个进程树。"),
             "inputSchema": { "type": "object", "required": ["command"], "properties": {
                 "command": { "type": "string" },
                 "cwd": { "type": "string", "description": "工作目录，默认第一个允许的目录" },

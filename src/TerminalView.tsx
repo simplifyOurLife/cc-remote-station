@@ -12,6 +12,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import { api, CmdError, errorText, Host, NeedSecret, TrustedKey } from "./api";
+import { isMac, keychainName, modKey } from "./platform";
 import { TerminalPrefs, themes } from "./prefs";
 import { ConnectScreen } from "./ConnectScreen";
 
@@ -135,21 +136,24 @@ export function TerminalView(props: Props) {
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
       const key = e.key.toLowerCase();
-      const ctrlShift = e.ctrlKey && e.shiftKey && !e.altKey;
+      // 快捷键主修饰键：Windows 是 Ctrl，macOS 是 ⌘（Mac 上 Ctrl 留给终端自己，如 ^C）
+      const mod = modKey(e);
+      const ctrlShift = mod && e.shiftKey && !e.altKey;
       // Shift+Enter 发 LF：Claude Code 视为换行而不是提交；bash 里 LF 等同回车，无副作用
       if (e.key === "Enter" && e.shiftKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
         send(encoder.encode("\n"));
         return false;
       }
-      // Ctrl+C：有选区就复制（同 Windows Terminal），否则照常发 ^C；Ctrl+Shift+C 始终复制
-      if (e.ctrlKey && !e.altKey && key === "c" && (e.shiftKey || term.hasSelection())) {
+      // Ctrl+C：有选区就复制（同 Windows Terminal），否则照常发 ^C；Ctrl+Shift+C 始终复制。
+      // macOS：⌘C 始终复制（和系统终端一致），Ctrl+C 始终是 ^C
+      if (mod && !e.altKey && key === "c" && (isMac || e.shiftKey || term.hasSelection())) {
         e.preventDefault();
         copySelection();
         return false;
       }
-      // Ctrl+V / Ctrl+Shift+V 粘贴（term.paste 自带 bracketed paste）
-      if (e.ctrlKey && !e.altKey && key === "v") {
+      // Ctrl+V / Ctrl+Shift+V（macOS ⌘V）粘贴（term.paste 自带 bracketed paste）
+      if (mod && !e.altKey && key === "v") {
         e.preventDefault();
         paste();
         return false;
@@ -395,7 +399,7 @@ export function TerminalView(props: Props) {
             </label>
             <label className="checkbox">
               <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
-              记住（保存到 Windows 凭据管理器）
+              记住（保存到{keychainName}）
             </label>
             <div className="dialog-actions">
               <button type="button" onClick={() => setStatus({ kind: "error", message: "已取消连接" })}>

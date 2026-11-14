@@ -23,7 +23,7 @@
   --cut-sm: 6px;
 
   --font-ui: "Chakra Petch", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, Menlo, "SF Mono", "Microsoft YaHei UI", "PingFang SC", monospace;
 
   color-scheme: dark;
   font-family: var(--font-ui);
@@ -134,7 +134,7 @@ button.icon:hover:not(:disabled) {
 button.link {
   position: relative;
   padding: 2px 4px;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12px;
   font-weight: 500;
   letter-spacing: 0.03em;
@@ -244,7 +244,7 @@ div.form-error:not(.inline):not(.small),
   margin: 8px 0;
   padding: 8px 14px 8px 12px;
   color: #ffc9d3;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12.5px;
   line-height: 1.6;
   text-shadow: 0 0 6px rgb(255 84 112 / 0.6);
@@ -367,6 +367,11 @@ div.form-error.mcp-error {
   opacity: 0.7;
   pointer-events: none;
 }
+/* macOS：红黄绿灯在左上角（trafficLightPosition 14,16），面包屑往右让 */
+.titlebar.mac {
+  height: 36px;
+  padding-left: 84px;
+}
 .titlebar-crumbs {
   flex: 1;
   min-width: 0;
@@ -375,7 +380,7 @@ div.form-error.mcp-error {
   gap: 8px;
   overflow: hidden;
   white-space: nowrap;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 11.5px;
   color: var(--dim);
   pointer-events: none;
@@ -552,7 +557,7 @@ div.form-error.mcp-error {
 .rail-toggle {
   margin-top: 8px;
   padding: 5px 0;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12px;
   color: var(--dim);
   background: none;
@@ -638,7 +643,7 @@ button.activity-line {
   margin-top: 10px;
   padding: 7px 22px 8px 10px;
   text-align: left;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 11.5px;
   font-weight: 400;
   letter-spacing: 0;
@@ -1125,7 +1130,7 @@ button.activity-line:hover:not(:disabled)::after {
   width: 100%;
   margin: 0;
   padding: 4px 8px;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12.5px;
 }
 .host-tools-table .number-input {
@@ -1177,7 +1182,7 @@ button.activity-line:hover:not(:disabled)::after {
   align-items: center;
   gap: 6px 18px;
   padding: 0 2px 2px;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 11.5px;
   color: var(--dim);
 }
@@ -1600,7 +1605,7 @@ button.activity-line:hover:not(:disabled)::after {
   height: 26px;
   flex-shrink: 0;
   padding: 0 4px 0 10px;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 11px;
   color: var(--dim);
   background:
@@ -1718,7 +1723,7 @@ button.activity-line:hover:not(:disabled)::after {
   word-break: break-all;
 }
 .connect-addr {
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12.5px;
   color: var(--dim);
 }
@@ -1735,7 +1740,7 @@ button.activity-line:hover:not(:disabled)::after {
   min-width: 0;
 }
 .connect-timer {
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12px;
   color: var(--amber);
   font-variant-numeric: tabular-nums;
@@ -1961,7 +1966,7 @@ button.activity-line:hover:not(:disabled)::after {
 /* 终端断线条：保留顶部居中的定位，换成警报面板的样子 */
 .terminal-banner.error {
   color: #ffc9d3;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12.5px;
   text-shadow: 0 0 6px rgb(255 84 112 / 0.6);
   border: none;
@@ -2313,7 +2318,7 @@ button.select:focus-visible {
   z-index: 100;
   max-width: min(420px, calc(100vw - 16px));
   padding: 8px 14px 9px 12px;
-  font-family: "JetBrains Mono", Consolas, "Microsoft YaHei UI", monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, "SF Mono", "Microsoft YaHei UI", "PingFang SC", monospace;
   font-size: 12px;
   line-height: 1.6;
   color: var(--ink);
@@ -2371,7 +2376,7 @@ button.select:focus-visible {
   text-shadow: 0 0 8px rgb(255 84 112 / 0.7);
 }
 .modal-error .modal-text {
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12.5px;
   color: #ffc9d3;
   padding: 8px 12px;
@@ -2394,14 +2399,14 @@ button.select:focus-visible {
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12px;
   color: var(--cyan);
   background: var(--void);
   border-left: 2px solid var(--cyan);
 }
 .ssh-prompt input {
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 16px;
   letter-spacing: 0.2em;
 }
@@ -2638,7 +2643,7 @@ button.select:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 11.5px;
   letter-spacing: 0.06em;
   color: var(--magenta);
@@ -2862,7 +2867,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
 }
 /* 角色标：你的消息右上「你 + 头像」品红，Claude 的左上「机器人 + CLAUDE」青色；连续同一方的消息只显示一次 */
 .msg-role {
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: 0.14em;
@@ -2981,7 +2986,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
   max-width: 900px;
   width: 100%;
   color: var(--dim);
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 11.5px;
   white-space: pre-wrap;
   padding-left: 14px;
@@ -3010,7 +3015,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
   border-left: 1px dashed rgb(167 139 250 / 0.6);
 }
 .thinking summary {
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 11.5px;
   color: #b9a6ff;
   cursor: pointer;
@@ -3037,7 +3042,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
   gap: 8px;
   padding: 4px 0 6px 18px;
   color: var(--cyan);
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12px;
   text-shadow: 0 0 6px rgb(45 226 255 / 0.55);
 }
@@ -3111,7 +3116,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
   gap: 10px;
   padding: 6px 0;
   color: var(--cyan);
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12.5px;
 }
 .cyber-bar {
@@ -3328,7 +3333,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
   gap: 9px;
   padding: 7px 10px;
   cursor: pointer;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
 }
 .tool-head:hover {
   background: rgb(45 226 255 / 0.05);
@@ -3662,7 +3667,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
 .host-form .import-head input.import-name {
   width: 200px;
   padding: 3px 8px;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
 }
 .import-desc {
   overflow: hidden;
@@ -3737,7 +3742,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
   width: 100%;
   margin-top: 5px;
   resize: vertical;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12.5px;
 }
 .toolbox-kind-field {
@@ -3761,7 +3766,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
 .cloud-name {
   flex-shrink: 0;
   padding: 0 6px;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 11.5px;
   color: var(--magenta);
   background: transparent;
@@ -3787,7 +3792,7 @@ button.cloud-name:hover {
   min-width: 0;
   font-size: 12px;
   color: var(--ink);
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
 }
 .toolbox-map .toolbox-desc {
   color: var(--dim);

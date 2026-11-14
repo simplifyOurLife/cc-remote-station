@@ -19,6 +19,7 @@ import { TooltipLayer } from "./Tooltip";
 import { TitleBar } from "./TitleBar";
 import { PopupMenu } from "./PopupMenu";
 import { SshPromptHost } from "./SshPrompt";
+import { kbd } from "./platform";
 import "./App.css";
 
 interface Pane {
@@ -472,10 +473,10 @@ export default function App() {
             </div>
             {activeKey && (
               <div className="tab-tools">
-                <button className="icon" title="向右分屏一个终端（Ctrl+Shift+D）" onClick={() => splitPane(activeKey, "row")}>
+                <button className="icon" title={kbd("向右分屏一个终端（Ctrl+Shift+D）")} onClick={() => splitPane(activeKey, "row")}>
                   ‖
                 </button>
-                <button className="icon" title="向下分屏一个终端（Ctrl+Shift+E）" onClick={() => splitPane(activeKey, "col")}>
+                <button className="icon" title={kbd("向下分屏一个终端（Ctrl+Shift+E）")} onClick={() => splitPane(activeKey, "col")}>
                   ═
                 </button>
                 <button className="icon" title="在右侧并排一个新对话" onClick={() => splitPane(activeKey, "row", "chat")}>
@@ -534,17 +535,17 @@ export default function App() {
                         <div className="grow" />
                         {p.kind !== "chat" && (
                           <>
-                            <button className="icon" title="向右分屏（Ctrl+Shift+D）" onClick={() => splitPane(t.key, "row")}>
+                            <button className="icon" title={kbd("向右分屏（Ctrl+Shift+D）")} onClick={() => splitPane(t.key, "row")}>
                               ‖
                             </button>
-                            <button className="icon" title="向下分屏（Ctrl+Shift+E）" onClick={() => splitPane(t.key, "col")}>
+                            <button className="icon" title={kbd("向下分屏（Ctrl+Shift+E）")} onClick={() => splitPane(t.key, "col")}>
                               ═
                             </button>
                           </>
                         )}
                         <button
                           className="icon pane-close"
-                          title={p.kind === "chat" ? "关闭这个对话窗格" : "关闭这个终端窗格（Ctrl+Shift+W）"}
+                          title={p.kind === "chat" ? "关闭这个对话窗格" : kbd("关闭这个终端窗格（Ctrl+Shift+W）")}
                           onClick={() => closePane(t, p.key)}
                         >
                           ✕

@@ -26,8 +26,13 @@ pub use toolbox::{TestResult, Toolbox, cloud_url, http_target, validate as valid
 use tasks::Tasks;
 use tools::ToolOut;
 
+#[cfg(windows)]
 const INSTRUCTIONS: &str = "这些工具操作的是用户本地的 Windows 电脑（经 cc-workstation 的 SSH 隧道提供），不是当前这台云主机。\
 路径一律用 Windows 绝对路径；先调用 list_allowed_roots 查看允许访问的目录。写入、修改、删除前会自动备份。\
+构建、测试等长命令用 run_command 的 background=true，再用 command_output 取输出。";
+#[cfg(not(windows))]
+const INSTRUCTIONS: &str = "这些工具操作的是用户本地的 Mac 电脑（经 cc-workstation 的 SSH 隧道提供），不是当前这台云主机。\
+路径一律用本机绝对路径（如 /Users/me/project）；先调用 list_allowed_roots 查看允许访问的目录。写入、修改、删除前会自动备份。\
 构建、测试等长命令用 run_command 的 background=true，再用 command_output 取输出。";
 
 pub struct McpState {

@@ -315,6 +315,9 @@ impl StdioProc {
         }
         #[cfg(windows)]
         cmd.creation_flags(super::tasks::CREATE_NO_WINDOW);
+        // 自成进程组：npx 会再起 node，结束时整组一起结束
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd.spawn().with_context(|| format!("启动「{command}」失败"))?;
         let stdin = child.stdin.take().context("没有 stdin")?;
         let stdout = child.stdout.take().context("没有 stdout")?;
@@ -426,7 +429,7 @@ impl StdioProc {
         }
     }
 
-    /// npx 等 .cmd 会先起 cmd.exe 再起 node，要按进程树结束
+    /// npx 会先起 cmd.exe（Windows）或 shell 再起 node，要按进程树/进程组结束
     fn kill(&self) {
         self.alive.store(false, Ordering::SeqCst);
         if let Some(pid) = self.pid {

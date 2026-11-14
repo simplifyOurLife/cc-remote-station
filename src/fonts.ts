@@ -11,6 +11,9 @@ const CANDIDATES: FontChoice[] = [
   { name: "Cascadia Code", hint: "Windows Terminal 默认，带连字" },
   { name: "Cascadia Mono", hint: "Windows Terminal 默认，无连字" },
   { name: "Consolas", hint: "Windows 自带" },
+  { name: "SF Mono", hint: "macOS 自带" },
+  { name: "Menlo", hint: "macOS 自带" },
+  { name: "Monaco", hint: "macOS 自带，经典" },
   { name: "Sarasa Mono SC", hint: "更纱黑体，中英文严格等宽" },
   { name: "Maple Mono NF CN", hint: "圆角，含中文和图标" },
   { name: "Maple Mono", hint: "圆角" },
@@ -28,8 +31,8 @@ const CANDIDATES: FontChoice[] = [
   { name: "NSimSun", hint: "新宋体，Windows 自带" },
 ];
 
-/** 选中字体后面跟的兜底：缺字时依次回退，中文走雅黑 */
-const FALLBACK = ['"JetBrains Mono"', "Consolas", '"Microsoft YaHei UI"', "monospace"];
+/** 选中字体后面跟的兜底：缺字时依次回退，中文走雅黑（Windows）/ 苹方（macOS） */
+const FALLBACK = ['"JetBrains Mono"', "Consolas", "Menlo", '"Microsoft YaHei UI"', '"PingFang SC"', "monospace"];
 
 /** 用 canvas 量宽度判断字体是否安装：和两种通用字体的宽度都一样，说明没生效 */
 function installed(name: string, ctx: CanvasRenderingContext2D) {

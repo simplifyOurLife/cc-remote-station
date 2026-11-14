@@ -23,7 +23,7 @@ export interface UiPrefs {
 
 export const defaultPrefs: UiPrefs = {
   terminal: {
-    fontFamily: '"JetBrains Mono", "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace',
+    fontFamily: '"JetBrains Mono", "Cascadia Mono", Consolas, Menlo, "SF Mono", "Microsoft YaHei UI", "PingFang SC", monospace',
     fontSize: 14,
     theme: "neon",
     scrollback: 10000,

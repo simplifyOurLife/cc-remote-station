@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isMac } from "./platform";
 
 const win = getCurrentWindow();
 
@@ -20,7 +21,8 @@ export function TitleBar({ crumbs }: { crumbs: string[] }) {
   }, []);
 
   return (
-    <header className="titlebar" data-tauri-drag-region>
+    // macOS 用系统的红黄绿灯（标题栏叠在网页上），左边让出位置、不再画自己的三个按钮
+    <header className={`titlebar ${isMac ? "mac" : ""}`} data-tauri-drag-region>
       <div className="titlebar-crumbs">
         <span className="titlebar-mark" aria-hidden="true" />
         {crumbs.map((c, i) => (
@@ -30,6 +32,7 @@ export function TitleBar({ crumbs }: { crumbs: string[] }) {
           </span>
         ))}
       </div>
+      {!isMac && (
       <div className="titlebar-controls">
         <button className="win-btn" title="最小化" aria-label="最小化" onClick={() => win.minimize()}>
           <svg viewBox="0 0 10 10" aria-hidden="true">
@@ -64,6 +67,7 @@ export function TitleBar({ crumbs }: { crumbs: string[] }) {
           </svg>
         </button>
       </div>
+      )}
     </header>
   );
 }

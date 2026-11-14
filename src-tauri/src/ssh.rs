@@ -517,10 +517,13 @@ async fn authenticate_agent(handle: &mut Handle<Client>, user: &str) -> Result<A
     }
 }
 
-#[cfg(not(windows))]
-async fn authenticate_agent(_handle: &mut Handle<Client>, _user: &str) -> Result<AuthResult> {
-    // TODO: macOS 版接 SSH_AUTH_SOCK
-    bail!("当前平台暂不支持 agent 认证")
+/// macOS / Linux：连 SSH_AUTH_SOCK 指向的 agent（macOS 由 launchd 自动提供，钥匙串里的密钥用 ssh-add --apple-use-keychain 加入）
+#[cfg(unix)]
+async fn authenticate_agent(handle: &mut Handle<Client>, user: &str) -> Result<AuthResult> {
+    let agent = AgentClient::connect_env()
+        .await
+        .context("未找到运行中的 ssh-agent（SSH_AUTH_SOCK 未设置或无法连接）")?;
+    try_agent_keys(handle, user, agent).await
 }
 
 /// 逐个试 agent 里的密钥；成功或 partial_success（还要二次验证）就停

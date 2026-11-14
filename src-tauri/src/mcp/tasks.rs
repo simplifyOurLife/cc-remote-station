@@ -159,10 +159,12 @@ fn shell_command(command: &str) -> tokio::process::Command {
     cmd
 }
 
+/// macOS / Linux：用用户的登录 shell（一般是 zsh），并放进独立进程组，结束时整组一起结束
 #[cfg(not(windows))]
 fn shell_command(command: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c").arg(command);
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into());
+    let mut cmd = tokio::process::Command::new(shell);
+    cmd.arg("-c").arg(command).process_group(0);
     cmd
 }
 
@@ -176,10 +178,11 @@ pub(super) fn kill_tree(pid: u32) {
         .output();
 }
 
+/// 子进程启动时用 process_group(0) 自成一组（组号 = pid），给负的组号发信号就是整组结束
 #[cfg(not(windows))]
 pub(super) fn kill_tree(pid: u32) {
-    // TODO: macOS 版改用进程组（spawn 时 setpgid）结束整棵进程树
-    let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).output();
+    let group = format!("-{pid}");
+    let _ = std::process::Command::new("kill").args(["-KILL", "--", &group]).output();
 }
 
 /// 中文 Windows 控制台程序多输出 GBK，先试 UTF-8 再退回 GB18030
