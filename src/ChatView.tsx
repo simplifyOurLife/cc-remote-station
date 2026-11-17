@@ -46,9 +46,9 @@ import { PermissionCard, ToolCard } from "./ToolCard";
 import { kbd, modKey } from "./platform";
 import { estimatePct, observeQuota, pctText } from "./quota";
 
-/** 缓存有效期：超过就按完整上下文重新计费 */
-const CACHE_TTL_MS = 60 * 60 * 1000;
-/** 继续历史会话时，上下文超过这个且缓存已过期就提醒 */
+/** 缓存有效期：超过就按完整上下文重新计费。实际 TTL 未公开，按最短的 5 分钟算，宁可多提醒 */
+const CACHE_TTL_MS = 5 * 60 * 1000;
+/** 缓存已过期且上下文超过这个时，发消息前先拦下确认 */
 const COLD_WARN_TOKENS = 50_000;
 /** 当前会话上下文超过这个、缓存还在时建议趁热压缩 */
 const HOT_COMPACT_TOKENS = 200_000;
@@ -65,6 +65,14 @@ function ClaudeRole() {
       CLAUDE
     </div>
   );
+}
+
+/** 闲置多久：8 分钟 / 3 小时 / 2 天 */
+function idleText(ms: number): string {
+  const m = Math.floor(ms / 60_000);
+  if (m < 60) return `${m} 分钟`;
+  const h = Math.floor(m / 60);
+  return h < 48 ? `${h} 小时` : `${Math.floor(h / 24)} 天`;
 }
 
 /** 耗时：23s / 1m23s / 1h02m */
@@ -575,10 +583,15 @@ export function ChatView(props: Props) {
       setCompletion(null);
       return;
     }
+    // 缓存冷了：第一次按发送只拦下提醒（消息留在输入框），再按一次才真发
+    if (coldTokens() !== null) {
+      if (!coldArmed) return setColdArmed(true);
+      setColdAck(state.lastActive);
+    }
+    setColdArmed(false);
     setInput("");
     setImages([]);
     setCompletion(null);
-    setColdWarn(null);
     nearBottom.current = true;
     if (!state.items.length) propsRef.current.onTitle(text.trim().slice(0, 30) || basename(cwd));
     setState((s) => addLocalUser(s, text, imgs));
@@ -618,7 +631,7 @@ export function ChatView(props: Props) {
     cwdRef.current = nextCwd;
     freshRef.current = !next.sessionId && !next.items.length;
     setShownFrom(0);
-    setColdWarn(null);
+    setColdArmed(false);
     // 额度是账号级的、窗口大小跟模型走，换会话都不清空
     setState((s) => withSavedUsage(next, { rateLimits: s.rateLimits, contextWindow: s.usage.contextWindow }));
     setCwd(nextCwd);
@@ -646,8 +659,23 @@ export function ChatView(props: Props) {
     if (el && heightBeforeLoad.current !== null) el.scrollTop += el.scrollHeight - heightBeforeLoad.current;
     heightBeforeLoad.current = null;
   }, [shownFrom]);
-  /** 刚继续的历史会话缓存已过期时的上下文大小：发第一条消息前提醒这一轮会很贵 */
-  const [coldWarn, setColdWarn] = useState<number | null>(null);
+  // 冷启动提醒：不管是刚载入的历史会话、还是开着的标签闲置了很久，只看「发送这一刻」缓存是否已过期。
+  // coldAck：用户已确认过的那次 lastActive（确认后不再拦）；coldArmed：已拦过一次，再按发送就放行
+  const [coldAck, setColdAck] = useState<number | null>(null);
+  const [coldArmed, setColdArmed] = useState(false);
+  // 闲置时没有任何重新渲染，定时刷一下，让提醒在缓存过期后自己出现
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick((n) => n + 1), 30_000);
+    return () => clearInterval(t);
+  }, []);
+  /** 现在发消息会冷启动计费时，返回会重新写入缓存的上下文大小；否则 null */
+  const coldTokens = (): number | null => {
+    const ctx = state.usage.contextUsed ?? 0;
+    const at = state.lastActive;
+    if (state.running || !at || coldAck === at || ctx <= COLD_WARN_TOKENS) return null;
+    return Date.now() - at > CACHE_TTL_MS ? ctx : null;
+  };
   const resumeSeq = useRef(0);
 
   const resume = async (s: ChatSession) => {
@@ -680,8 +708,6 @@ export function ChatView(props: Props) {
           ),
         ),
       );
-      const ctx = hist.usage.contextUsed ?? 0;
-      if (ctx > COLD_WARN_TOKENS && hist.lastActive && Date.now() - hist.lastActive > CACHE_TTL_MS) setColdWarn(ctx);
       propsRef.current.onTitle(s.title.slice(0, 30));
     } catch (e) {
       if (seq === resumeSeq.current) setState((st) => system(st, `读取会话失败：${errorText(e)}`, "error"));
@@ -718,7 +744,9 @@ export function ChatView(props: Props) {
   /** 直接发一条文字消息（常用命令按钮用，不动输入框） */
   const sendText = async (text: string) => {
     setShowCommands(false);
-    setColdWarn(null);
+    // 直接点的命令（如提醒卡上的 /compact）算用户已知情
+    if (coldTokens() !== null) setColdAck(state.lastActive);
+    setColdArmed(false);
     nearBottom.current = true;
     setState((s) => addLocalUser(s, text, []));
     try {
@@ -1514,22 +1542,29 @@ export function ChatView(props: Props) {
               ))}
             </div>
           )}
-          {coldWarn !== null && (
-            <div className="cold-notice">
+          {coldTokens() !== null && (
+            <div className={`cold-notice${coldArmed ? " armed" : ""}`}>
               <div className="cold-text">
-                此会话上下文约 <b>{Math.round(coldWarn / 1000)}k</b> tokens，缓存已过期
-                {estimatePct(coldWarn) !== null && (
+                此会话上下文约 <b>{Math.round(coldTokens()! / 1000)}k</b> tokens，已闲置 {idleText(Date.now() - state.lastActive!)}，缓存已过期
+                {estimatePct(coldTokens()!) !== null && (
                   <>
-                    （预计约消耗 5 小时额度的 <b>{pctText(estimatePct(coldWarn)!)}</b>）
+                    （预计约消耗 5 小时额度的 <b>{pctText(estimatePct(coldTokens()!)!)}</b>）
                   </>
                 )}
                 。发送消息或执行 /compact 都会按完整上下文重新计费一次。只是追问一两句就直接发；还要继续很多轮，先 /compact
                 更省；不需要旧上下文的话，新开会话不消耗额度。
+                {coldArmed && <div className="cold-armed">⚠ 消息还没发出。再按一次发送（Enter）就按冷启动计费发出去。</div>}
               </div>
               <div className="cold-actions">
                 <button onClick={() => sendText("/compact")}>/compact</button>
                 <button onClick={() => switchTo(emptyState, cwd)}>新开会话</button>
-                <button className="link" onClick={() => setColdWarn(null)}>
+                <button
+                  className="link"
+                  onClick={() => {
+                    setColdAck(state.lastActive);
+                    setColdArmed(false);
+                  }}
+                >
                   知道了
                 </button>
               </div>
@@ -1544,7 +1579,6 @@ export function ChatView(props: Props) {
             baseContext={baseContext}
             onHotCompact={
               !state.running &&
-              coldWarn === null &&
               (state.usage.contextUsed ?? 0) > HOT_COMPACT_TOKENS &&
               state.lastActive &&
               Date.now() - state.lastActive < CACHE_TTL_MS

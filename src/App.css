@@ -1600,6 +1600,16 @@ button.activity-line:hover:not(:disabled)::after {
 .cold-notice b {
   color: var(--amber);
 }
+/* 已拦下一次发送：卡片闪一下，底部一行确认提示 */
+.cold-notice.armed {
+  animation: err-flicker-in 0.38s steps(1);
+  background: linear-gradient(90deg, rgb(255 193 77 / 0.22), rgb(255 193 77 / 0.06));
+}
+.cold-armed {
+  margin-top: 4px;
+  font-weight: 600;
+  color: var(--amber);
+}
 .cold-text {
   flex: 1;
   min-width: 0;
