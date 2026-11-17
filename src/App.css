@@ -81,11 +81,205 @@ button {
   cursor: pointer;
   /* 按钮文字不被拖选/双击选中 */
   user-select: none;
-  transition: border-color 0.12s, color 0.12s, background 0.12s, box-shadow 0.15s;
+  transition: border-color 0.12s, color 0.12s, background 0.12s, box-shadow 0.15s, transform 0.08s, filter 0.12s;
 }
 button:hover:not(:disabled) {
   border-color: var(--cyan);
   color: #fff;
+}
+/* 按下：轻微下沉 + 青色电光边（切角按钮的外发光会被裁掉，改用提亮） */
+button:active:not(:disabled) {
+  transform: translateY(1px) scale(0.98);
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 1px var(--cyan), 0 0 14px rgb(45 226 255 / 0.55);
+}
+button.primary:active:not(:disabled),
+button.danger:active:not(:disabled) {
+  filter: brightness(1.25) saturate(1.2);
+  box-shadow: inset 0 0 0 1px #fff;
+}
+/* 主按钮点击后：一道扫描光带从左到右扫过（main.tsx 挂 .zap） */
+button.primary,
+button.danger {
+  position: relative;
+}
+button.primary.zap::after,
+button.danger.zap::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(100deg, transparent 30%, rgb(255 255 255 / 0.75) 48%, rgb(45 226 255 / 0.6) 52%, transparent 70%);
+  mix-blend-mode: screen;
+  animation: btn-sweep 0.4s ease-out;
+}
+@keyframes btn-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+/* 复制回执（copy.ts）：鼠标旁飘一行终端风字，上飘淡出；点到的按钮边框闪一下 */
+.hud-receipt {
+  position: fixed;
+  z-index: 200;
+  max-width: min(460px, calc(100vw - 16px));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.03em;
+  background: rgb(10 8 23 / 0.85);
+  border-left: 2px solid currentColor;
+  animation: hud-float 1.3s ease-out forwards;
+}
+.hud-receipt.ok {
+  color: var(--cyan);
+  text-shadow: 0 0 8px rgb(45 226 255 / 0.7);
+}
+.hud-receipt.fail {
+  color: var(--red);
+  text-shadow: 0 0 8px rgb(255 84 112 / 0.7);
+}
+button.copy-flash {
+  animation: copy-flash 0.5s ease-out;
+}
+button.copy-flash-fail {
+  animation: copy-flash-fail 0.5s ease-out;
+}
+@keyframes copy-flash {
+  0% {
+    color: var(--cyan);
+    border-color: var(--cyan);
+    box-shadow: 0 0 0 1px var(--cyan), 0 0 16px rgb(45 226 255 / 0.6);
+  }
+}
+@keyframes copy-flash-fail {
+  0% {
+    color: var(--red);
+    border-color: var(--red);
+    box-shadow: 0 0 0 1px var(--red), 0 0 16px rgb(255 84 112 / 0.6);
+  }
+}
+/* 保存按钮：乱码解码 + HUD 回执（SaveButton.tsx） */
+.save-wrap {
+  position: relative;
+  display: inline-flex;
+}
+button.save-btn {
+  display: inline-grid;
+  font-family: var(--font-mono);
+}
+/* 自己有解码动画，不再叠通用的扫光 */
+button.save-btn.zap::after {
+  content: none;
+}
+.save-btn > span {
+  grid-area: 1 / 1;
+  white-space: pre;
+}
+.save-sizer {
+  display: grid;
+  visibility: hidden;
+}
+.save-sizer > span {
+  grid-area: 1 / 1;
+}
+/* 乱码跳动期间：红青错位 + 轻微抖动 */
+.save-btn.busy .save-text,
+.save-btn.decoding .save-text {
+  animation: glitch-text 0.16s steps(2) infinite;
+}
+button.save-btn.busy:disabled {
+  opacity: 1;
+  cursor: progress;
+}
+/* 成功：锁定成暗底青字的「已写入」状态，解码完成后字不再抖 */
+button.save-btn.ok,
+button.save-btn.ok:hover:not(:disabled) {
+  color: var(--cyan);
+  background: var(--deck-2);
+  box-shadow: inset 0 0 0 1px var(--cyan), inset 0 0 14px rgb(45 226 255 / 0.25);
+  text-shadow: 0 0 8px rgb(45 226 255 / 0.8);
+}
+button.save-btn.fail,
+button.save-btn.fail:hover:not(:disabled) {
+  color: #fff;
+  background: var(--red);
+  animation: glitch-tear 0.45s steps(1);
+}
+@keyframes glitch-text {
+  0% {
+    text-shadow: -2px 0 rgb(255 61 154 / 0.9), 2px 0 rgb(45 226 255 / 0.9);
+    transform: translateX(0);
+  }
+  50% {
+    text-shadow: 2px 0 rgb(255 61 154 / 0.9), -2px 0 rgb(45 226 255 / 0.9);
+    transform: translateX(1px);
+  }
+}
+/* 失败：按钮被横向切成几条错开，像信号撕裂 */
+@keyframes glitch-tear {
+  0% {
+    transform: translateX(-5px) skewX(-8deg);
+    filter: hue-rotate(40deg);
+  }
+  20% {
+    transform: translateX(4px) skewX(6deg);
+  }
+  40% {
+    transform: translateX(-3px);
+    filter: none;
+  }
+  60% {
+    transform: translateX(2px) skewX(-3deg);
+  }
+  80%,
+  100% {
+    transform: none;
+  }
+}
+/* 回执：从按钮上方飘起、淡出，终端等宽字 */
+.save-hud {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  white-space: nowrap;
+  pointer-events: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  animation: hud-float 2.2s ease-out forwards;
+}
+.save-hud.ok {
+  color: var(--cyan);
+  text-shadow: 0 0 8px rgb(45 226 255 / 0.7);
+}
+.save-hud.fail {
+  color: var(--red);
+  text-shadow: 0 0 8px rgb(255 84 112 / 0.7);
+}
+@keyframes hud-float {
+  0% {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  12% {
+    opacity: 1;
+    transform: none;
+  }
+  70% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
 }
 button:focus-visible,
 input:focus-visible,
@@ -390,6 +584,9 @@ div.form-error.mcp-error {
   align-items: center;
   gap: 8px;
   overflow: hidden;
+  /* 留出左侧和上下的空间给旋转菱形的光晕（否则被 overflow 裁掉一块），负外边距抵消，位置不变 */
+  padding: 6px 0 6px 10px;
+  margin: -6px 0 -6px -10px;
   white-space: nowrap;
   font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 11.5px;
@@ -1293,58 +1490,76 @@ button.activity-line:hover:not(:disabled)::after {
   box-shadow: 0 0 6px var(--mode);
   vertical-align: 1px;
 }
-.ctx-meter {
+/* 和 CLI 状态栏一样的一行：5h 6% 4h44m · 7d 28% 4天14h · ctx 12% · $1.96 */
+.status-line {
   display: inline-flex;
   align-items: center;
   gap: 7px;
+  white-space: nowrap;
 }
-.ctx-bar {
+.status-quota {
   display: inline-flex;
-  gap: 2px;
+  gap: 7px;
 }
-.ctx-bar i {
-  width: 5px;
-  height: 9px;
-  transform: skewX(-20deg);
-  background: rgb(45 226 255 / 0.12);
+.status-line .sep {
+  color: var(--wire-hi);
 }
-.ctx-meter.ok .ctx-bar i.on {
-  background: var(--cyan);
-  box-shadow: 0 0 4px var(--cyan);
+.status-line .seg.est {
+  opacity: 0.6;
 }
-.ctx-meter.warn .ctx-bar i.on {
-  background: var(--amber);
-  box-shadow: 0 0 4px var(--amber);
-}
-.ctx-meter.bad .ctx-bar i.on {
-  background: var(--red);
-  box-shadow: 0 0 4px var(--red);
-}
-.ctx-meter.warn {
-  color: var(--amber);
-}
-.ctx-meter.bad {
-  color: var(--red);
-}
-.quota-chip {
-  padding: 1px 7px;
-  border: 1px solid var(--wire);
-}
-.quota-chip.ok {
+.status-line .seg.ok {
   color: var(--cyan);
-  border-color: rgb(45 226 255 / 0.4);
 }
-.quota-chip.warn {
+.status-line .seg.warn {
   color: var(--amber);
-  border-color: var(--amber);
-  box-shadow: 0 0 8px rgb(255 193 77 / 0.3);
+  text-shadow: 0 0 6px rgb(255 193 77 / 0.5);
 }
-.quota-chip.bad {
-  color: #ffc9d3;
-  background: rgb(255 84 112 / 0.15);
-  border-color: var(--red);
-  box-shadow: 0 0 10px rgb(255 84 112 / 0.45);
+.status-line .seg.bad {
+  color: var(--red);
+  text-shadow: 0 0 8px rgb(255 84 112 / 0.6);
   animation: lost-blink 1.2s steps(1) infinite;
+}
+/* 上下文很大、缓存还热：琥珀色小按钮轻轻呼吸 */
+.hot-compact {
+  padding: 1px 7px;
+  font-size: inherit;
+  color: var(--amber);
+  background: rgb(255 193 77 / 0.08);
+  border: 1px solid var(--amber);
+  animation: hot-breathe 2.4s ease-in-out infinite;
+}
+.hot-compact:hover {
+  background: rgb(255 193 77 / 0.2);
+}
+@keyframes hot-breathe {
+  50% {
+    box-shadow: 0 0 10px rgb(255 193 77 / 0.45);
+  }
+}
+/* 继续历史会话且缓存已过期：输入框上方的琥珀色提醒 */
+.cold-notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink);
+  background: linear-gradient(90deg, rgb(255 193 77 / 0.12), rgb(255 193 77 / 0.03));
+  border-left: 3px solid var(--amber);
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - var(--cut-sm)), calc(100% - var(--cut-sm)) 100%, 0 100%);
+}
+.cold-notice b {
+  color: var(--amber);
+}
+.cold-text {
+  flex: 1;
+  min-width: 0;
+}
+.cold-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 /* 写入 Claude：作用域选择 + 逐项现状 */
@@ -1586,6 +1801,57 @@ button.activity-line:hover:not(:disabled)::after {
   background: var(--deck-2);
   border-left-color: var(--cyan);
 }
+/* 右键菜单：左侧功能、右侧快捷键 */
+.menu.context-menu {
+  min-width: 200px;
+  z-index: 120;
+}
+.context-menu .menu-item {
+  align-items: center;
+  padding: 6px 10px;
+}
+.menu-kbd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+.menu-item.danger {
+  color: var(--red);
+}
+.menu-item.danger:hover {
+  border-left-color: var(--red);
+}
+.menu-item.disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.menu-item.disabled:hover {
+  background: none;
+  border-left-color: transparent;
+}
+.menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--wire);
+}
+/* 常用命令：命令名左列不压缩，说明左对齐、太长省略（悬停看全）；太多就在菜单内滚动 */
+.menu.commands-menu {
+  width: min(460px, calc(100vw - 16px));
+  max-width: none;
+  max-height: min(60vh, 520px);
+  overflow-y: auto;
+}
+.commands-menu .menu-item {
+  justify-content: flex-start;
+  gap: 12px;
+}
+.commands-menu .menu-item > :first-child {
+  flex-shrink: 0;
+}
+.commands-menu .menu-hint {
+  flex: 1;
+  text-align: left;
+}
 /* 菜单项右侧的说明：太长就截断 */
 .menu-hint {
   min-width: 0;
@@ -1703,6 +1969,8 @@ button.activity-line:hover:not(:disabled)::after {
 }
 .terminal-banner {
   position: absolute;
+  /* 压在 xterm 自己的层（无障碍层、装饰层带 z-index）上面，否则按钮点不到 */
+  z-index: 12;
   left: 50%;
   top: 14px;
   transform: translateX(-50%);
@@ -2019,6 +2287,61 @@ button.activity-line:hover:not(:disabled)::after {
     opacity: 0;
   }
 }
+/* 终端连不上 / 会话结束：窗格正中的警报卡片 */
+.terminal-pane > .pane-overlay {
+  z-index: 12;
+}
+.link-alert {
+  position: relative;
+  width: min(560px, 88%);
+  padding: 22px 24px 18px;
+  font-family: var(--font-mono);
+  color: #ffc9d3;
+  background:
+    repeating-linear-gradient(0deg, rgb(0 0 0 / 0.2) 0 1px, transparent 1px 3px),
+    linear-gradient(135deg, rgb(70 14 30 / 0.97), rgb(24 10 26 / 0.97));
+  border-left: 3px solid var(--red);
+  box-shadow: 0 0 36px rgb(255 84 112 / 0.35);
+  clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut));
+  animation: err-flicker-in 0.38s steps(1);
+}
+.link-alert.exited {
+  color: var(--ink);
+  border-left-color: var(--amber);
+  background: linear-gradient(135deg, rgb(48 36 14 / 0.97), rgb(24 18 26 / 0.97));
+  box-shadow: 0 0 30px rgb(255 193 77 / 0.25);
+}
+.link-alert-tag {
+  display: inline-block;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--void);
+  background: var(--red);
+  box-shadow: 0 0 10px rgb(255 84 112 / 0.8);
+  animation: lost-blink 1s steps(1) infinite;
+}
+.link-alert.exited .link-alert-tag {
+  background: var(--amber);
+  box-shadow: 0 0 10px rgb(255 193 77 / 0.6);
+  animation: none;
+}
+.link-alert h3 {
+  margin: 12px 0 8px;
+  font-size: 17px;
+  color: #fff;
+}
+.link-alert-msg {
+  margin: 0 0 8px;
+  max-height: 40vh;
+  overflow: auto;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
 /* 终端断线条：保留顶部居中的定位，换成警报面板的样子 */
 .terminal-banner.error {
   color: #ffc9d3;
@@ -2073,6 +2396,34 @@ button.activity-line:hover:not(:disabled)::after {
 }
 .search-bar input {
   width: 300px;
+}
+
+/* 快捷键一览（Ctrl+Shift+A / F1） */
+.dialog.shortcuts-panel {
+  width: min(620px, 92vw);
+}
+.shortcuts-panel > input {
+  width: 100%;
+  margin-bottom: 10px;
+}
+.shortcuts-list {
+  max-height: 62vh;
+  overflow-y: auto;
+}
+.shortcut-row {
+  display: grid;
+  grid-template-columns: 230px 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 4px;
+  border-bottom: 1px solid var(--wire);
+}
+.shortcut-row kbd {
+  justify-self: start;
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-shadow: 0 0 6px rgb(45 226 255 / 0.5);
 }
 
 /* ---------- 对话框（切角面板） ---------- */
@@ -2801,7 +3152,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
 
 /* 图形版 /mcp */
 .dialog.mcp-panel {
-  width: 620px;
+  width: min(760px, 92vw);
   outline: none;
 }
 .mcp-panel h3 .muted {
@@ -2809,9 +3160,11 @@ button.mcp-badge.warn:hover:not(:disabled) {
   font-weight: 400;
   margin-left: 6px;
 }
+/* 滚动容器会裁掉贴边的内容：留出左侧空间给旋转的状态菱形和它的光晕 */
 .mcp-list {
   max-height: 55vh;
   overflow-y: auto;
+  padding: 0 4px 0 8px;
 }
 .mcp-row {
   padding: 10px 0;
@@ -2821,6 +3174,19 @@ button.mcp-badge.warn:hover:not(:disabled) {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+}
+/* 一行放不下时只压缩名称和配置信息（省略号，悬停看全），状态和按钮不挤 */
+.mcp-row-head > * {
+  flex-shrink: 0;
+}
+.mcp-row-head > .mcp-name,
+.mcp-row-head > .mcp-meta {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .mcp-row-head button:not(.link) {
   padding: 2px 10px;
@@ -2879,14 +3245,150 @@ button.mcp-badge.warn:hover:not(:disabled) {
   padding: 1px 6px;
   border: 1px solid var(--wire);
 }
+.search-count {
+  flex-shrink: 0;
+  min-width: 4.5em;
+  text-align: center;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
 .chat-search {
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 8px;
   padding: 6px 12px;
   border-bottom: 1px solid var(--wire);
 }
+/* 对话列宽度可拖：--chat-width 由 ChatView 写在 .chat-stage 上 */
+.chat-stage {
+  position: relative;
+  /* 自成层叠上下文：里面的拖拽把手、导航轨、跳到最新按钮的 z-index 只在对话区内比较，
+     不会压到唤醒 / 载入会话的遮罩上面 */
+  isolation: isolate;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.chat-stage.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+.chat-resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 5;
+  width: 12px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.chat-resize.left {
+  left: max(0px, calc(50% - min(var(--chat-width), 100% - 60px) / 2 - 12px));
+}
+.chat-resize.right {
+  right: max(18px, calc(50% - min(var(--chat-width), 100% - 60px) / 2 - 12px));
+}
+.chat-resize::after {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: 5px;
+  width: 2px;
+  background: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan), 0 0 18px rgb(45 226 255 / 0.4);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.chat-resize:hover::after,
+.chat-stage.resizing .chat-resize::after {
+  opacity: 0.85;
+}
+/* 右侧缩略导航轨：贴在消息区右边的 padding 里，不占内容宽度 */
+.chat-minimap {
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  right: 3px;
+  z-index: 6;
+  width: 12px;
+  border-left: 1px solid var(--wire);
+}
+.minimap-view {
+  position: absolute;
+  left: 0;
+  right: 0;
+  min-height: 6px;
+  background: rgb(45 226 255 / 0.1);
+  border: 1px solid rgb(45 226 255 / 0.35);
+  pointer-events: none;
+}
+.minimap-hit {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--amber);
+  box-shadow: 0 0 4px var(--amber);
+  pointer-events: none;
+}
+button.minimap-ask {
+  position: absolute;
+  left: 2px;
+  right: 0;
+  height: 3px;
+  padding: 0;
+  margin-top: -1px;
+  background: var(--magenta);
+  border: none;
+  opacity: 0.75;
+  /* 点击区域比看到的线粗一些 */
+  outline: 3px solid transparent;
+}
+button.minimap-ask:hover {
+  opacity: 1;
+  left: -3px;
+  box-shadow: var(--glow-magenta);
+}
+button.minimap-ask:active:not(:disabled) {
+  transform: none;
+}
+/* 大会话只先渲染最近一批：顶部的加载更早按钮 */
+.load-earlier {
+  align-self: center;
+  padding: 3px 14px;
+  font-size: 12px;
+  color: var(--dim);
+  background: transparent;
+  border: 1px dashed var(--wire-hi);
+}
+.load-earlier:hover {
+  color: var(--cyan);
+  border-color: var(--cyan);
+}
+/* 翻到上面时有新内容：底部居中的青色切角按钮 */
+.jump-latest {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  z-index: 6;
+  transform: translateX(-50%);
+  padding: 4px 14px;
+  font-size: 12px;
+  color: var(--cyan);
+  background: rgb(18 15 38 / 0.92);
+  border: 1px solid var(--cyan);
+  box-shadow: var(--glow-cyan);
+  clip-path: polygon(var(--cut-sm) 0, 100% 0, 100% calc(100% - var(--cut-sm)), calc(100% - var(--cut-sm)) 100%, 0 100%, 0 var(--cut-sm));
+}
+.jump-latest:hover {
+  background: rgb(45 226 255 / 0.15);
+}
 .chat-messages {
+  /* 定位祖先：缩略导航用 offsetTop 量消息在滚动内容里的位置 */
+  position: relative;
   flex: 1;
   overflow-y: auto;
   padding: 18px 22px;
@@ -2910,7 +3412,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
 }
 .chat-msg {
   position: relative;
-  max-width: 900px;
+  max-width: min(var(--chat-width, 900px), 100% - 16px);
   width: 100%;
   align-self: center;
   display: flex;
@@ -2930,6 +3432,26 @@ button.mcp-badge.warn:hover:not(:disabled) {
   line-height: 1;
 }
 /* 你的角色标：你 + 兜帽黑客头像，靠右对齐在气泡发光边的上方 */
+/* 你的消息发送时间：暗色小字，不抢品红角色标的风头 */
+.msg-time {
+  margin-right: 4px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+  text-shadow: none;
+}
+/* 一轮结束：和 CLI 一样的「✻ 时间 · 耗时」 */
+.turn-done {
+  align-self: flex-start;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--dim);
+  opacity: 0.85;
+}
+.chat-working .elapsed {
+  font-family: var(--font-mono);
+  color: var(--dim);
+}
 .msg-role.user-role {
   justify-content: flex-end;
   margin-left: 0;
@@ -3039,7 +3561,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
 }
 .chat-system {
   align-self: center;
-  max-width: 900px;
+  max-width: min(var(--chat-width, 900px), 100% - 16px);
   width: 100%;
   color: var(--dim);
   font-family: "JetBrains Mono", Consolas, Menlo, monospace;
@@ -3056,9 +3578,14 @@ button.mcp-badge.warn:hover:not(:disabled) {
 .chat-system.error {
   padding-left: 12px;
 }
-.search-hit {
-  outline: 1px dashed var(--dim);
-  outline-offset: 4px;
+/* 命中的文字：暗琥珀底；当前那条消息里的用亮琥珀 */
+::highlight(chat-hit) {
+  background-color: rgb(255 193 77 / 0.28);
+  color: #fff;
+}
+::highlight(chat-current) {
+  background-color: var(--amber);
+  color: var(--void);
 }
 .search-current {
   outline: 1px solid var(--cyan);
@@ -3091,7 +3618,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
 .chat-working {
   position: relative;
   align-self: center;
-  max-width: 900px;
+  max-width: min(var(--chat-width, 900px), 100% - 16px);
   width: 100%;
   display: flex;
   align-items: center;
@@ -3476,7 +4003,7 @@ button.mcp-badge.warn:hover:not(:disabled) {
 /* 等你处理的卡片：琥珀色切角面板 */
 .permission-card {
   position: relative;
-  max-width: 900px;
+  max-width: min(var(--chat-width, 900px), 100% - 16px);
   width: 100%;
   align-self: center;
   padding: 14px 16px;

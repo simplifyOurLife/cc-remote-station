@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { DeviceSettings } from "./AccessSettings";
 import { ActivityPanel, summarize } from "./ActivityPanel";
 import { ChatView } from "./ChatView";
-import { api, AuditEntry, errorText, forwardState, Host, hostToolbox, McpHostStatus, Settings } from "./api";
+import { api, AuditEntry, ChatSession, errorText, forwardState, Host, hostToolbox, McpHostStatus, Settings } from "./api";
 import { HostForm } from "./HostForm";
 import { HostsPage } from "./HostsPage";
 import { HostMcpDialog, McpStep } from "./HostMcpDialog";
@@ -19,7 +19,9 @@ import { TooltipLayer } from "./Tooltip";
 import { TitleBar } from "./TitleBar";
 import { PopupMenu } from "./PopupMenu";
 import { SshPromptHost } from "./SshPrompt";
-import { kbd } from "./platform";
+import { kbd, modKey } from "./platform";
+import { ShortcutsPanel } from "./ShortcutsPanel";
+import { ContextMenuHost, openMenu } from "./ContextMenu";
 import "./App.css";
 
 interface Pane {
@@ -28,6 +30,10 @@ interface Pane {
   kind?: "chat";
   /** 接回已有 tmux 会话时的会话名 */
   session?: string;
+  /** 对话窗格：打开时要继续的历史会话 */
+  chatSession?: ChatSession;
+  /** 对话窗格当前的会话 id（同一会话只允许开一处） */
+  chatId?: string | null;
 }
 
 interface Tab {
@@ -70,6 +76,7 @@ export default function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
+  const [showKeys, setShowKeys] = useState(false);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const [error, setError] = useState("");
   const [prefs, setPrefs] = useState<UiPrefs>(defaultPrefs);
@@ -134,9 +141,27 @@ export default function App() {
     patchTab(key, { attention: false });
   };
 
+  const setPaneChatId = (tabKey: string, paneKey: string, chatId: string | null) =>
+    patchTab(tabKey, (t) => ({ panes: t.panes.map((p) => (p.key === paneKey ? { ...p, chatId } : p)) }));
+
+  /** 从对话的历史列表打开会话：同一主机上别的窗格已开着就切过去；newTab 时开新标签；否则交回原窗格自己继续 */
+  const openChatSession = (from: Tab, paneKey: string, s: ChatSession, newTab: boolean): boolean => {
+    for (const t of tabs) {
+      const p = t.host.id === from.host.id && t.panes.find((x) => x.kind === "chat" && x.chatId === s.sessionId && x.key !== paneKey);
+      if (p) {
+        activate(t.key);
+        patchTab(t.key, { activePane: p.key });
+        return true;
+      }
+    }
+    if (!newTab) return false;
+    openTab(from.host, undefined, "chat", s);
+    return true;
+  };
+
   /** 新开标签并切到工作区；第一次打开时记下，引导第 2 步打勾 */
-  const openTab = (host: Host, session?: string, kind?: "chat") => {
-    const pane: Pane = { key: newKey(), session, kind };
+  const openTab = (host: Host, session?: string, kind?: "chat", chatSession?: ChatSession) => {
+    const pane: Pane = { key: newKey(), session, kind, chatSession };
     const tab: Tab = {
       key: newKey(),
       host,
@@ -166,6 +191,30 @@ export default function App() {
       if (key === activeKey) setActiveKey(rest[rest.length - 1]?.key ?? null);
       return rest;
     });
+  };
+
+  /** 只留下 keep 里的标签；当前标签被关掉就切到 fallback */
+  const keepTabs = (keep: (t: Tab, i: number) => boolean, fallback: string) => {
+    setTabs((ts) => {
+      const rest = ts.filter(keep);
+      if (!rest.some((t) => t.key === activeKey)) setActiveKey(fallback);
+      return rest;
+    });
+  };
+
+  const tabMenu = (e: React.MouseEvent, t: Tab) => {
+    const idx = tabs.findIndex((x) => x.key === t.key);
+    openMenu(e, [
+      { label: "关闭", hint: kbd("Ctrl+F4"), onClick: () => closeTab(t.key) },
+      { label: "关闭其他标签", disabled: tabs.length < 2, onClick: () => keepTabs((x) => x.key === t.key, t.key) },
+      { label: "关闭右侧标签", disabled: idx === tabs.length - 1, onClick: () => keepTabs((_, i) => i <= idx, t.key) },
+      "sep",
+      {
+        label: t.panes[0].kind === "chat" ? "同主机再开一个对话" : "同主机再开一个终端",
+        hint: t.panes[0].kind === "chat" ? kbd("Ctrl+Alt+N") : kbd("Alt+F12"),
+        onClick: () => openTab(t.host, undefined, t.panes[0].kind),
+      },
+    ]);
   };
 
   const splitPane = (tabKey: string, dir: "row" | "col", kind?: "chat") => {
@@ -249,6 +298,41 @@ export default function App() {
   }, [activeKey, tabs.length, page]);
 
   const activeTab = tabs.find((t) => t.key === activeKey);
+
+  // 全局快捷键（捕获阶段，抢在 xterm 之前）：只用 F 键 / Ctrl+Alt / Ctrl+Shift / Alt+方向 这类不占 shell 的组合
+  const globalKeys = useRef<(e: KeyboardEvent) => boolean>(() => false);
+  globalKeys.current = (e) => {
+    const mod = modKey(e);
+    const k = e.key.toLowerCase();
+    const typing = e.target instanceof HTMLElement && /^(INPUT|TEXTAREA)$/.test(e.target.tagName) && !e.target.closest(".xterm");
+    const step = (d: number) => {
+      if (!tabs.length) return;
+      const i = tabs.findIndex((t) => t.key === activeKey);
+      activate(tabs[(i + d + tabs.length) % tabs.length].key);
+      setPage("workspace");
+    };
+    if ((mod && e.shiftKey && !e.altKey && k === "a") || e.key === "F1") setShowKeys(true);
+    else if (mod && e.altKey && k === "s") setPage("settings");
+    else if (e.ctrlKey && e.key === "Tab") step(e.shiftKey ? -1 : 1);
+    else if (e.altKey && !mod && !e.shiftKey && !typing && (e.key === "ArrowRight" || e.key === "ArrowLeft")) step(e.key === "ArrowRight" ? 1 : -1);
+    else if (mod && e.key === "F4" && activeKey) closeTab(activeKey);
+    else if (e.altKey && e.key === "F12" && activeTab) openTab(activeTab.host);
+    // 对话窗格里的 Ctrl+Alt+N 由对话自己处理（换新会话），这里只管其它地方：开新对话标签
+    else if (mod && e.altKey && k === "n" && activeTab && !(e.target instanceof Element && e.target.closest(".chat-pane")))
+      openTab(activeTab.host, undefined, "chat");
+    else return false;
+    return true;
+  };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (globalKeys.current(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
   const crumbs = [
     "cc-workstation",
     { hosts: "主机", workspace: "工作区", toolbox: "MCP 工具箱", settings: "设置" }[page],
@@ -437,6 +521,7 @@ export default function App() {
                   // 中键关闭（和浏览器一致）；mousedown 拦掉中键自动滚动
                   onMouseDown={(e) => e.button === 1 && e.preventDefault()}
                   onAuxClick={(e) => e.button === 1 && closeTab(t.key)}
+                  onContextMenu={(e) => tabMenu(e, t)}
                 >
                   {t.attention && <span className="tab-dot" />}
                   <span className="tab-kind">{t.panes[0].kind === "chat" ? "对话" : "终端"}</span>
@@ -577,6 +662,9 @@ export default function App() {
                       onFocus={() => t.activePane !== p.key && patchTab(t.key, { activePane: p.key })}
                       onTitle={(title) => patchTab(t.key, { title })}
                       onAttention={() => (t.key !== activeKey || page !== "workspace") && patchTab(t.key, { attention: true })}
+                      initialSession={p.chatSession}
+                      onSession={(chatId) => setPaneChatId(t.key, p.key, chatId)}
+                      onOpenSession={(s, newTab) => openChatSession(t, p.key, s, newTab)}
                     />
                   ) : (
                     <TerminalView
@@ -614,6 +702,8 @@ export default function App() {
       <ModalHost />
       <SshPromptHost />
       <TooltipLayer />
+      <ContextMenuHost />
+      {showKeys && <ShortcutsPanel onClose={() => setShowKeys(false)} />}
       {dialog?.kind === "tmux" && (
         <TmuxDialog
           host={dialog.host}

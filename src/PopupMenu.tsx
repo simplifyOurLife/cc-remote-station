@@ -11,10 +11,12 @@ const EDGE = 8;
 export function PopupMenu({
   anchor,
   onClose,
+  className = "",
   children,
 }: {
   anchor: RefObject<HTMLElement | null>;
   onClose: () => void;
+  className?: string;
   children: ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -56,7 +58,7 @@ export function PopupMenu({
 
   return createPortal(
     // 点任一项后关闭；各项自己的 onClick 先执行
-    <div ref={ref} className="menu popup-menu" role="menu" style={style} onClick={onClose}>
+    <div ref={ref} className={`menu popup-menu ${className}`} role="menu" style={style} onClick={onClose}>
       {children}
     </div>,
     document.body,

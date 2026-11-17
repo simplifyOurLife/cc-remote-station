@@ -12,7 +12,9 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import { api, CmdError, errorText, Host, NeedSecret, TrustedKey } from "./api";
-import { isMac, keychainName, modKey } from "./platform";
+import { isMac, kbd, keychainName, modKey } from "./platform";
+import { openMenu } from "./ContextMenu";
+import { copyText } from "./copy";
 import { TerminalPrefs, themes } from "./prefs";
 import { ConnectScreen } from "./ConnectScreen";
 
@@ -64,12 +66,18 @@ export function TerminalView(props: Props) {
   const searchRef = useRef<SearchAddon | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const idRef = useRef<string | null>(null);
+  const webglLost = useRef(false);
+  const reloadWebgl = useRef<() => void>(() => {});
+  /** 最近一次尚未收到输出的按键时间（诊断回显延迟用） */
+  const keyAt = useRef(0);
   // xterm 的回调只在初始化时注册一次，用 ref 读最新的 props
   const propsRef = useRef(props);
   propsRef.current = props;
   const retryRef = useRef({ count: 0, timer: 0 });
   const [status, setStatus] = useState<Status>({ kind: "connecting" });
   const [attempt, setAttempt] = useState(0);
+  /** 连续连接失败次数和最近一次的时间：同一个错误反复出现时，用户也能看出重连确实试过了 */
+  const [fails, setFails] = useState({ n: 0, at: 0 });
   const [trust, setTrust] = useState<TrustedKey | null>(null);
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [remember, setRemember] = useState(true);
@@ -95,21 +103,37 @@ export function TerminalView(props: Props) {
     term.unicode.activeVersion = "11";
     term.loadAddon(new WebLinksAddon((_e, uri) => openUrl(uri)));
     term.open(boxRef.current!);
-    try {
-      term.loadAddon(new WebglAddon());
-    } catch {
-      // WebGL 不可用时退回 DOM 渲染
-    }
+    // WebGL 上下文会被浏览器回收（长时间隐藏、GPU 重置、开太多画布）：不处理的话画面停住不动，按键没回显。
+    // 丢失时释放它退回 DOM 渲染，重新可见时再试着装回去
+    reloadWebgl.current = () => {
+      try {
+        const gl = new WebglAddon();
+        gl.onContextLoss(() => {
+          gl.dispose();
+          webglLost.current = true;
+          term.refresh(0, term.rows - 1);
+        });
+        term.loadAddon(gl);
+        webglLost.current = false;
+      } catch {
+        // WebGL 不可用时退回 DOM 渲染
+      }
+    };
+    reloadWebgl.current();
     fit.fit();
 
-    const send = (data: Uint8Array) => idRef.current && api.terminalWrite(idRef.current, data);
+    const send = (data: Uint8Array) => {
+      if (!idRef.current) return;
+      if (!keyAt.current) keyAt.current = performance.now();
+      api.terminalWrite(idRef.current, data);
+    };
 
     // 剪贴板走 Tauri 插件，WebView 原生 copy/paste 在这里不可靠
     const copySelection = () => {
       const sel = term.getSelection();
       if (!sel) return false;
       // 去掉每行行尾填充空格，粘贴到编辑器里不脏
-      writeText(sel.split("\n").map((l) => l.trimEnd()).join("\n"));
+      copyText(sel.split("\n").map((l) => l.trimEnd()).join("\n"));
       term.clearSelection();
       return true;
     };
@@ -173,10 +197,25 @@ export function TerminalView(props: Props) {
       }
       return true;
     });
-    // 右键：有选区复制，否则粘贴（PuTTY / Windows Terminal 习惯）
+    // 右键：有选区复制，否则粘贴（PuTTY / Windows Terminal 习惯）；Shift+右键弹完整菜单
     boxRef.current!.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      if (!copySelection()) paste();
+      if (!e.shiftKey) {
+        if (!copySelection()) paste();
+        return;
+      }
+      openMenu(e, [
+        { label: "复制", hint: kbd("Ctrl+Shift+C"), disabled: !term.hasSelection(), onClick: copySelection },
+        { label: "粘贴", hint: kbd("Ctrl+V"), onClick: paste },
+        { label: "全选", onClick: () => term.selectAll() },
+        { label: "清屏", onClick: () => term.clear() },
+        { label: "搜索", hint: kbd("Ctrl+Shift+F"), onClick: () => setSearch((s) => s ?? "") },
+        { label: "重绘", hint: kbd("Ctrl+Shift+R"), onClick: redraw },
+        "sep",
+        { label: "向右分屏", hint: kbd("Ctrl+Shift+D"), onClick: () => propsRef.current.onSplit("row") },
+        { label: "向下分屏", hint: kbd("Ctrl+Shift+E"), onClick: () => propsRef.current.onSplit("col") },
+        { label: "关闭窗格", hint: kbd("Ctrl+Shift+W"), danger: true, onClick: () => propsRef.current.onClose() },
+      ]);
     });
     term.textarea?.addEventListener("focus", () => propsRef.current.onFocus());
 
@@ -261,7 +300,15 @@ export function TerminalView(props: Props) {
     let cancelled = false;
     setStatus({ kind: "connecting" });
     const channel = new Channel<ArrayBuffer>();
-    channel.onmessage = (buf) => term.write(new Uint8Array(buf));
+    channel.onmessage = (buf) => {
+      // 诊断：按键后超过 1.5 秒才有输出，记下当时的渲染状态，分辨是本机画不出来还是云端没响应
+      if (keyAt.current) {
+        const ms = performance.now() - keyAt.current;
+        if (ms > 1500) console.warn(`[终端 ${host.name}] 按键后 ${Math.round(ms)}ms 才收到输出（WebGL ${webglLost.current ? "已丢失，用 DOM 渲染" : "正常"}）`);
+        keyAt.current = 0;
+      }
+      term.write(new Uint8Array(buf));
+    };
     api
       .terminalOpen(host.id, term.cols, term.rows, { trust, secrets, remember, session }, channel)
       .then(({ id, notice }) => {
@@ -269,6 +316,7 @@ export function TerminalView(props: Props) {
         idRef.current = id;
         if (notice) term.write(`\x1b[33m[${notice}]\x1b[0m\r\n`);
         retryRef.current.count = 0;
+        setFails({ n: 0, at: 0 });
         setStatus({ kind: "connected" });
         if (propsRef.current.focused) term.focus();
       })
@@ -279,7 +327,10 @@ export function TerminalView(props: Props) {
           setSecretInput("");
           setStatus({ kind: "secret", need: e });
         } else if (retryRef.current.count > 0) scheduleRetry(); // 自动重连中又失败：继续退避
-        else setStatus({ kind: "error", message: errorText(e) });
+        else {
+          setFails((f) => ({ n: f.n + 1, at: Date.now() }));
+          setStatus({ kind: "error", message: errorText(e) });
+        }
       });
     return () => {
       cancelled = true;
@@ -307,6 +358,14 @@ export function TerminalView(props: Props) {
   useEffect(() => {
     if (visible && focused) termRef.current?.focus();
   }, [visible, focused]);
+
+  // 切回前台：WebGL 在后台丢了就装回去，并整屏重画一次
+  useEffect(() => {
+    const term = termRef.current;
+    if (!visible || !term) return;
+    if (webglLost.current) reloadWebgl.current();
+    term.refresh(0, term.rows - 1);
+  }, [visible]);
 
   useEffect(() => {
     if (search !== null) searchInputRef.current?.focus();
@@ -413,9 +472,23 @@ export function TerminalView(props: Props) {
         </div>
       )}
       {(status.kind === "error" || status.kind === "exited") && (
-        <div className="terminal-banner error">
-          <span>{status.kind === "error" ? status.message : `会话已结束（退出码 ${status.code}）`}</span>
-          <button onClick={reconnectNow}>重新连接</button>
+        <div className="pane-overlay">
+          <div className={`link-alert ${status.kind}`} role="alert">
+            <div className="link-alert-tag">{status.kind === "error" ? "✕ LINK FAILED" : "■ SESSION ENDED"}</div>
+            <h3>{status.kind === "error" ? `连接 ${host.name} 失败` : "会话已结束"}</h3>
+            <pre className="link-alert-msg">{status.kind === "error" ? status.message : `远端程序已退出（退出码 ${status.code}）`}</pre>
+            {status.kind === "error" && fails.n > 0 && (
+              <p className="muted small-text">
+                第 {fails.n} 次失败 · {new Date(fails.at).toLocaleTimeString("zh-CN", { hour12: false })}
+              </p>
+            )}
+            <div className="dialog-actions">
+              {status.kind === "error" && <button onClick={() => copyText(status.message)}>复制错误</button>}
+              <button className="primary" autoFocus onClick={reconnectNow}>
+                重新连接
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -42,14 +42,19 @@ export function McpPanel(p: {
             const st = STATUS[s.status] ?? { label: s.status, cls: "idle" };
             const tools = serverTools(s, p.tools);
             const busy = p.pending === s.name;
+            const meta = [s.scope && `配置于 ${s.scope}`, s.version && `v${s.version}`].filter(Boolean).join("，");
             return (
               <div key={s.name} className="mcp-row">
                 <div className="mcp-row-head">
                   <span className={`mcp-state ${st.cls}`} />
-                  <span className="mcp-name">{s.name}</span>
+                  <span className="mcp-name" title={s.name}>
+                    {s.name}
+                  </span>
                   <span className={`mcp-status-text ${st.cls}`}>{busy ? "处理中…" : st.label}</span>
-                  {(s.scope || s.version) && (
-                    <span className="muted mcp-meta">{[s.scope && `配置于 ${s.scope}`, s.version && `v${s.version}`].filter(Boolean).join("，")}</span>
+                  {meta && (
+                    <span className="muted mcp-meta" title={meta}>
+                      {meta}
+                    </span>
                   )}
                   <div className="grow" />
                   {tools.length > 0 && (

@@ -18,9 +18,18 @@ export function TooltipLayer() {
   useEffect(() => {
     let target: HTMLElement | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // 悬停期间 React 重新渲染会把（变了的）title 写回去：系统提示就会叠上来。监视它，再挑走并更新提示文字
+    const watch = new MutationObserver(() => {
+      const text = target?.getAttribute("title");
+      if (!target || text == null) return;
+      target.dataset.tip = text;
+      target.removeAttribute("title");
+      setTip((t) => (t && text.trim() ? { ...t, text } : t));
+    });
 
     const restore = () => {
       clearTimeout(timer);
+      watch.disconnect();
       if (target) {
         // React 重新渲染时可能已经把新的 title 写回去了，那就以它为准
         if (!target.hasAttribute("title") && target.dataset.tip !== undefined) target.setAttribute("title", target.dataset.tip);
@@ -42,8 +51,9 @@ export function TooltipLayer() {
       target = el;
       el.dataset.tip = text;
       el.removeAttribute("title");
+      watch.observe(el, { attributes: true, attributeFilter: ["title"] });
       timer = setTimeout(() => {
-        if (target === el && el.isConnected) setTip({ text, rect: el.getBoundingClientRect() });
+        if (target === el && el.isConnected) setTip({ text: el.dataset.tip ?? text, rect: el.getBoundingClientRect() });
       }, DELAY);
     };
 

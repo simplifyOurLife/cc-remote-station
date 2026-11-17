@@ -48,11 +48,11 @@ export function hostDateTime(sec: number, tz: HostTz | null): string {
   return date.toLocaleString("zh-CN", { timeZone, hour12: false });
 }
 
-/** 主机时区的时:分；不是主机上的「今天」就带上月/日 */
-export function hostShortTime(sec: number, tz: HostTz | null): string {
+/** 主机时区的时:分（seconds 时带秒）；不是主机上的「今天」就带上月/日 */
+export function hostShortTime(sec: number, tz: HostTz | null, seconds = false): string {
   const { date, timeZone } = zoned(sec, tz);
   const day = (d: Date) => d.toLocaleDateString("en-CA", { timeZone });
-  const time = date.toLocaleTimeString("zh-CN", { timeZone, hour: "2-digit", minute: "2-digit", hour12: false });
+  const time = date.toLocaleTimeString("zh-CN", { timeZone, hour: "2-digit", minute: "2-digit", second: seconds ? "2-digit" : undefined, hour12: false });
   if (day(date) === day(zoned(Date.now() / 1000, tz).date)) return time;
   const md = date.toLocaleDateString("zh-CN", { timeZone, month: "numeric", day: "numeric" });
   return `${md} ${time}`;

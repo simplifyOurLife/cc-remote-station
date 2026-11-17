@@ -259,15 +259,77 @@ fn user_text(content: &Value) -> String {
         .to_string()
 }
 
-/// 读取某个会话的历史（只取最后 3MB，足够显示近期上下文），返回解析好的行
+/// 历史里每段工具输入/输出最多保留的字符数（卡片默认只显示前 3000 字）
+const HISTORY_KEEP_CHARS: usize = 20_000;
+
+/// 读取某个会话的历史（只取最后 3MB，足够显示近期上下文），返回瘦身后的用户/Claude 消息行。
+/// 会话文件大头是工具返回的全文和内部记录：云端 gzip 压缩传输，这里再丢掉界面用不上的部分
 pub async fn history(conn: &Conn, file: &str) -> Result<Vec<Value>> {
     ensure!(!file.contains("..") && file.ends_with(".jsonl"), "非法的会话文件");
-    let cmd = format!("tail -c 3000000 ~/.claude/projects/{}", shell_quote(file));
+    let cmd = format!(
+        "f=~/.claude/projects/{}; [ -r \"$f\" ] || {{ echo 会话文件不存在 >&2; exit 1; }}; tail -c 3000000 \"$f\" | gzip -1",
+        shell_quote(file)
+    );
     let out = conn.exec(&cmd, None).await?;
     ensure!(out.code == 0, "读取会话失败：{}", String::from_utf8_lossy(&out.stderr).trim());
-    let text = String::from_utf8_lossy(&out.stdout);
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&out.stdout[..]), &mut raw).context("解压会话历史失败")?;
+    let text = String::from_utf8_lossy(&raw);
     // tail 可能从半行开始，解析失败的行直接跳过
-    Ok(text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+    Ok(text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter_map(slim_line).collect())
+}
+
+/// 只留前端 fromHistory 用到的字段；工具输入/输出截短，工具结果里的图片只留占位
+fn slim_line(mut v: Value) -> Option<Value> {
+    if v["isMeta"] == true || v["isSidechain"] == true {
+        return None;
+    }
+    // 压缩点：界面在这里插一条「上下文已压缩」
+    if v["type"] == "system" && v["subtype"] == "compact_boundary" {
+        return Some(json!({ "type": "system", "subtype": "compact_boundary", "timestamp": v["timestamp"].take(), "preTokens": v["compactMetadata"]["preTokens"].take() }));
+    }
+    if !matches!(v["type"].as_str(), Some("user" | "assistant")) {
+        return None;
+    }
+    if let Some(content) = v.pointer_mut("/message/content").and_then(Value::as_array_mut) {
+        for b in content {
+            match b["type"].as_str() {
+                Some("tool_result") => match &mut b["content"] {
+                    Value::String(s) => clip(s),
+                    Value::Array(parts) => {
+                        for p in parts {
+                            if p["type"] == "image" {
+                                *p = json!({ "type": "image" });
+                            } else if let Some(Value::String(s)) = p.get_mut("text") {
+                                clip(s);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Some("tool_use") => {
+                    if let Some(Value::Object(input)) = b.get_mut("input") {
+                        input.values_mut().for_each(|x| if let Value::String(s) = x { clip(s) });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(json!({
+        "type": v["type"].take(),
+        "timestamp": v["timestamp"].take(),
+        "message": v["message"].take(),
+        "isCompactSummary": v["isCompactSummary"].take(),
+    }))
+}
+
+fn clip(s: &mut String) {
+    if let Some((cut, _)) = s.char_indices().nth(HISTORY_KEEP_CHARS) {
+        let kb = s.len() / 1024;
+        s.truncate(cut);
+        s.push_str(&format!("\n…（历史记录已截断，原文共 {kb} KB）"));
+    }
 }
 
 /// 删除云端会话文件（~/.claude/projects 下的某个 jsonl）

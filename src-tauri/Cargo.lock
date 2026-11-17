@@ -712,6 +712,7 @@ dependencies = [
  "dunce",
  "encoding_rs",
  "env_logger",
+ "flate2",
  "globset",
  "ignore",
  "keyring",

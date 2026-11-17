@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { availableFonts, fontStack, primaryFont } from "./fonts";
 import { Snippet, TerminalPrefs, themes, UiPrefs } from "./prefs";
 import { NumberInput } from "./NumberInput";
+import { SaveButton } from "./SaveButton";
 import { Select } from "./Select";
 
 const CUSTOM = "__custom__";
@@ -10,18 +11,15 @@ const CUSTOM = "__custom__";
 export function PrefsPanel({ prefs, onSave }: { prefs: UiPrefs; onSave: (p: UiPrefs) => void }) {
   const [term, setTerm] = useState<TerminalPrefs>(prefs.terminal);
   const [snippets, setSnippets] = useState<Snippet[]>(prefs.snippets);
-  const [saved, setSaved] = useState(false);
   const fonts = useMemo(availableFonts, []);
   const primary = primaryFont(term.fontFamily);
   // 当前字体不在列表里（手填过或已卸载）就停在自定义
   const [customFont, setCustomFont] = useState(() => !fonts.some((f) => f.name === primary));
   const patchTerm = (p: Partial<TerminalPrefs>) => {
     setTerm((t) => ({ ...t, ...p }));
-    setSaved(false);
   };
   const patchSnippet = (id: string, p: Partial<Snippet>) => {
     setSnippets((list) => list.map((s) => (s.id === id ? { ...s, ...p } : s)));
-    setSaved(false);
   };
 
   const save = () => {
@@ -29,7 +27,6 @@ export function PrefsPanel({ prefs, onSave }: { prefs: UiPrefs; onSave: (p: UiPr
     const clean = snippets.filter((s) => s.command.trim());
     setSnippets(clean);
     onSave({ terminal: term, snippets: clean });
-    setSaved(true);
   };
 
   return (
@@ -130,7 +127,6 @@ export function PrefsPanel({ prefs, onSave }: { prefs: UiPrefs; onSave: (p: UiPr
                 title="删除"
                 onClick={() => {
                   setSnippets((list) => list.filter((x) => x.id !== s.id));
-                  setSaved(false);
                 }}
               >
                 ×
@@ -144,10 +140,9 @@ export function PrefsPanel({ prefs, onSave }: { prefs: UiPrefs; onSave: (p: UiPr
       </section>
 
       <div className="page-actions">
-        {saved && <span className="muted">已保存，已作用到所有终端</span>}
-        <button className="primary" onClick={save}>
+        <SaveButton onSave={save} savedText="已作用到所有终端 ✓" receipt="PREFS APPLIED">
           保存设置
-        </button>
+        </SaveButton>
       </div>
     </>
   );

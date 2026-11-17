@@ -3,10 +3,9 @@ import { Loading } from "./Loading";
 import { ConnectScreen } from "./ConnectScreen";
 import { Logo } from "./Logo";
 import { UserAvatar } from "./UserAvatar";
-import { hostDateTime, tzLabel, useHostTz } from "./hostTime";
+import { hostDateTime, hostShortTime, HostTz, tzLabel, useHostTz } from "./hostTime";
 import { Channel } from "@tauri-apps/api/core";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
-import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { ask } from "./modal";
 import { PlanCard, QuestionCard } from "./InteractiveCards";
@@ -18,7 +17,9 @@ import {
   emptyState,
   fromHistory,
   initializeRequest,
+  Item,
   itemText,
+  lastUserAt,
   MCP_ACTION_PREFIX,
   mcpActionRequest,
   mcpStatusRequest,
@@ -35,9 +36,24 @@ import {
 import { Markdown } from "./Markdown";
 import { McpPanel } from "./McpPanel";
 import { Combo } from "./Select";
+import { PopupMenu } from "./PopupMenu";
+import { ChatMinimap } from "./ChatMinimap";
+import { openMenu, selectedText } from "./ContextMenu";
+import { copyText } from "./copy";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { ChatStatus, nextMode } from "./ChatStatus";
 import { PermissionCard, ToolCard } from "./ToolCard";
 import { kbd, modKey } from "./platform";
+import { estimatePct, observeQuota, pctText } from "./quota";
+
+/** 缓存有效期：超过就按完整上下文重新计费 */
+const CACHE_TTL_MS = 60 * 60 * 1000;
+/** 继续历史会话时，上下文超过这个且缓存已过期就提醒 */
+const COLD_WARN_TOKENS = 50_000;
+/** 当前会话上下文超过这个、缓存还在时建议趁热压缩 */
+const HOT_COMPACT_TOKENS = 200_000;
+/** 历史会话每批渲染的消息数 */
+const PAGE = 60;
 const MODELS = ["", "opus", "sonnet", "haiku"];
 const SESSIONS_KEY = "ccws.chatSessionsOpen";
 
@@ -51,10 +67,33 @@ function ClaudeRole() {
   );
 }
 
-/** 你的消息上的角色标：你 + 兜帽黑客头像 */
-function UserRole() {
+/** 耗时：23s / 1m23s / 1h02m */
+function duration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+}
+
+/** 正在工作时的实时计时，每秒走一次 */
+function Elapsed({ since }: { since: number }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  return <span className="elapsed">{duration(now - since)}</span>;
+}
+
+/** 你的消息上的角色标：发送时间 + 你 + 兜帽黑客头像 */
+function UserRole({ at, tz }: { at?: number; tz: HostTz | null }) {
   return (
-    <div className="msg-role user-role" aria-hidden="true">
+    <div className="msg-role user-role">
+      {at && (
+        <span className="msg-time" title={hostDateTime(at / 1000, tz)}>
+          {hostShortTime(at / 1000, tz)}
+        </span>
+      )}
       你
       <UserAvatar size={18} />
     </div>
@@ -65,16 +104,18 @@ function UserRole() {
 interface SavedUsage {
   rateLimits: ChatState["rateLimits"];
   contextWindow: number | null;
+  /** 上次新会话首轮的上下文大小（系统提示 + 工具 + CLAUDE.md），新会话还没回复时拿来预估 */
+  baseContext: number | null;
 }
 const usageKey = (hostId: string) => `ccws.usage.${hostId}`;
 function loadUsage(hostId: string): SavedUsage {
   try {
     const v = JSON.parse(localStorage.getItem(usageKey(hostId)) ?? "null");
-    if (v && typeof v === "object") return { rateLimits: v.rateLimits ?? {}, contextWindow: v.contextWindow ?? null };
+    if (v && typeof v === "object") return { rateLimits: v.rateLimits ?? {}, contextWindow: v.contextWindow ?? null, baseContext: v.baseContext ?? null };
   } catch {
     // 读不到就当没有
   }
-  return { rateLimits: {}, contextWindow: null };
+  return { rateLimits: {}, contextWindow: null, baseContext: null };
 }
 function saveUsage(hostId: string, u: SavedUsage) {
   try {
@@ -83,7 +124,7 @@ function saveUsage(hostId: string, u: SavedUsage) {
     // 存不下只是下次打开先显示空
   }
 }
-function withSavedUsage(s: ChatState, u: SavedUsage): ChatState {
+function withSavedUsage(s: ChatState, u: Omit<SavedUsage, "baseContext">): ChatState {
   return { ...s, rateLimits: u.rateLimits, usage: { ...s.usage, contextWindow: s.usage.contextWindow ?? u.contextWindow } };
 }
 
@@ -104,6 +145,12 @@ interface Props {
   onFocus: () => void;
   onTitle: (title: string) => void;
   onAttention: () => void;
+  /** 打开时直接继续的历史会话（「新标签打开」） */
+  initialSession?: ChatSession;
+  /** 当前会话 id 变了：上报给标签页，用来发现同一会话已在别处打开 */
+  onSession: (sessionId: string | null) => void;
+  /** 打开历史会话：已在别的窗格打开就切过去、newTab 时开新标签，这两种返回 true；返回 false 则在本窗格继续 */
+  onOpenSession: (s: ChatSession, newTab: boolean) => boolean;
 }
 
 interface Completion {
@@ -142,6 +189,32 @@ function rememberSessionPrefs(sessionId: string, prefs: SessionPrefs) {
   }
 }
 
+/** 各对话窗格的搜索高亮：CSS.highlights 是全局注册表，合并后统一写入两个名字 */
+const paneHighlights = new Map<string, { hits: Range[]; cur: Range[] }>();
+function setHighlights(id: string, hits: Range[], cur: Range[]) {
+  const reg = (CSS as any).highlights;
+  if (!reg) return;
+  if (hits.length || cur.length) paneHighlights.set(id, { hits, cur });
+  else paneHighlights.delete(id);
+  const all = [...paneHighlights.values()];
+  reg.set("chat-hit", new Highlight(...all.flatMap((h) => h.hits)));
+  reg.set("chat-current", new Highlight(...all.flatMap((h) => h.cur)));
+}
+
+const CHAT_WIDTH_KEY = "ccws.chatWidth";
+const CHAT_WIDTH_DEFAULT = 900;
+const CHAT_WIDTH_MIN = 600;
+
+/** 对话列宽度（px），0 表示铺满；所有会话共用 */
+function savedChatWidth(): number {
+  try {
+    const v = Number(localStorage.getItem(CHAT_WIDTH_KEY) ?? CHAT_WIDTH_DEFAULT);
+    return v === 0 || v >= CHAT_WIDTH_MIN ? v : CHAT_WIDTH_DEFAULT;
+  } catch {
+    return CHAT_WIDTH_DEFAULT;
+  }
+}
+
 /** 用户重命名过的会话标题（只存本机，不改云端会话文件） */
 function loadTitles(): Record<string, string> {
   try {
@@ -158,6 +231,9 @@ export function ChatView(props: Props) {
   propsRef.current = props;
   // 额度和上下文窗口先用上次在这台主机上记下的，新对话一打开就有数
   const [state, setState] = useState<ChatState>(() => withSavedUsage(emptyState, loadUsage(host.id)));
+  const [baseContext, setBaseContext] = useState(() => loadUsage(host.id).baseContext);
+  /** 当前是全新会话、还没拿到过上下文大小 */
+  const freshRef = useRef(true);
   /** 云主机时区：历史会话、额度重置等时间按 Claude 运行的地方显示 */
   const tz = useHostTz(host.id);
   const chatIdRef = useRef<string | null>(null);
@@ -223,6 +299,47 @@ export function ChatView(props: Props) {
     if (state.sessionId) rememberSessionPrefs(state.sessionId, { mode, model });
   }, [state.sessionId, mode, model]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [chatWidth, setChatWidth] = useState(savedChatWidth);
+  const [resizing, setResizing] = useState(false);
+
+  // 拖对话列两侧的把手改宽度：以列中心对称伸缩，拖到最宽即铺满
+  function startResize(e: React.PointerEvent<HTMLDivElement>) {
+    const stage = e.currentTarget.parentElement!;
+    const handle = e.currentTarget;
+    handle.setPointerCapture(e.pointerId);
+    setResizing(true);
+    let width = chatWidth;
+    const move = (ev: PointerEvent) => {
+      const rect = stage.getBoundingClientRect();
+      const avail = rect.width - 60; // .chat-messages 左右 padding 44 + 给角色标外伸留的 16
+      const w = Math.round(2 * Math.abs(ev.clientX - (rect.left + rect.width / 2)));
+      width = w >= avail - 4 ? 0 : Math.max(Math.min(CHAT_WIDTH_MIN, avail), w);
+      setChatWidth(width);
+    };
+    const up = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      handle.removeEventListener("pointercancel", up);
+      setResizing(false);
+      try {
+        localStorage.setItem(CHAT_WIDTH_KEY, String(width));
+      } catch {
+        // 存不下只是下次恢复默认
+      }
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+    handle.addEventListener("pointercancel", up);
+  }
+
+  function resetWidth() {
+    setChatWidth(CHAT_WIDTH_DEFAULT);
+    try {
+      localStorage.removeItem(CHAT_WIDTH_KEY);
+    } catch {
+      // 忽略
+    }
+  }
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // 输入框按内容实际高度自动长高（长段文字折行也算），最多约 10 行，再多就滚动
   useLayoutEffect(() => {
@@ -240,16 +357,27 @@ export function ChatView(props: Props) {
       .chatDirs(host.id)
       .then(setRecentDirs)
       .catch(() => setRecentDirs([]));
-    warm();
+    if (props.initialSession) resume(props.initialSession);
+    else warm();
     return () => {
       if (chatIdRef.current) api.chatStop(chatIdRef.current);
     };
   }, []);
 
+  useEffect(() => propsRef.current.onSession(state.sessionId), [state.sessionId]);
+
   // 额度和上下文窗口一有更新就记下来（按主机）
   useEffect(() => {
-    saveUsage(host.id, { rateLimits: state.rateLimits, contextWindow: state.usage.contextWindow });
-  }, [state.rateLimits, state.usage.contextWindow]);
+    saveUsage(host.id, { rateLimits: state.rateLimits, contextWindow: state.usage.contextWindow, baseContext });
+  }, [state.rateLimits, state.usage.contextWindow, baseContext]);
+
+  // 新会话第一次拿到上下文大小：记下来，以后新会话还没回复时用它预估
+  useEffect(() => {
+    if (freshRef.current && state.usage.contextUsed !== null) {
+      freshRef.current = false;
+      setBaseContext(state.usage.contextUsed);
+    }
+  }, [state.usage.contextUsed]);
 
   // 启动画面兜底：云端迟迟没有任何响应也不能一直挡着对话界面
   useEffect(() => {
@@ -275,10 +403,43 @@ export function ChatView(props: Props) {
 
   // 新内容到达时，若用户本来就在底部则跟随滚动
   const nearBottom = useRef(true);
-  useEffect(() => {
+  /** 用户翻到上面时又有了新内容：显示「跳到最新」 */
+  const [behind, setBehind] = useState(false);
+  const toBottom = () => {
     const el = scrollRef.current;
-    if (el && nearBottom.current) el.scrollTop = el.scrollHeight;
-  }, [state.items, state.streaming, state.permissions]);
+    if (!el) return;
+    nearBottom.current = true;
+    setBehind(false);
+    el.scrollTop = el.scrollHeight;
+  };
+  // 内容高度的任何变化都要跟：不只是新消息，还有工具结果、子代理步骤、Markdown/图片渲染完撑高。
+  // 只盯 React 状态会漏掉这些，落后超过阈值后就再也不跟了
+  useEffect(() => {
+    const el = scrollRef.current!;
+    const follow = () => {
+      if (earlierLoaded.current) earlierLoaded.current = false;
+      else if (nearBottom.current) el.scrollTop = el.scrollHeight;
+      else setBehind(true);
+    };
+    const mo = new MutationObserver(follow);
+    mo.observe(el, { childList: true, subtree: true, characterData: true });
+    el.addEventListener("load", follow, true);
+    return () => {
+      mo.disconnect();
+      el.removeEventListener("load", follow, true);
+    };
+  }, []);
+  // 等你审批/回答的卡片一定要看到，翻到上面了也拉回来
+  const permCount = state.permissions.length;
+  const prevPermCount = useRef(0);
+  useEffect(() => {
+    if (permCount > prevPermCount.current) toBottom();
+    prevPermCount.current = permCount;
+  }, [permCount]);
+  // 隐藏的标签页里滚不动，切回来时补一次
+  useEffect(() => {
+    if (visible && nearBottom.current) toBottom();
+  }, [visible]);
 
   useEffect(() => {
     if (visible && focused) inputRef.current?.focus();
@@ -327,6 +488,7 @@ export function ChatView(props: Props) {
       setMcpPending(null);
       if (e.response.subtype !== "error") write(mcpStatusRequest());
     }
+    observeQuota(e);
     setState((s) => reduce(s, e));
   };
 
@@ -377,7 +539,7 @@ export function ChatView(props: Props) {
     } else if (m[1] === "continue") {
       // 优先当前目录最近的会话，没有就取全部里最近的（列表已按时间倒序）
       const latest = sessions?.find((s) => s.cwd === cwd) ?? sessions?.[0];
-      if (latest) resume(latest);
+      if (latest) openSession(latest, false);
       else setState((s) => system(s, "没有可以继续的历史会话"));
     } else if (m[1] === "clear") {
       switchTo(emptyState, cwd);
@@ -416,6 +578,7 @@ export function ChatView(props: Props) {
     setInput("");
     setImages([]);
     setCompletion(null);
+    setColdWarn(null);
     nearBottom.current = true;
     if (!state.items.length) propsRef.current.onTitle(text.trim().slice(0, 30) || basename(cwd));
     setState((s) => addLocalUser(s, text, imgs));
@@ -453,6 +616,9 @@ export function ChatView(props: Props) {
     filesRef.current = null;
     sessionIdRef.current = next.sessionId;
     cwdRef.current = nextCwd;
+    freshRef.current = !next.sessionId && !next.items.length;
+    setShownFrom(0);
+    setColdWarn(null);
     // 额度是账号级的、窗口大小跟模型走，换会话都不清空
     setState((s) => withSavedUsage(next, { rateLimits: s.rateLimits, contextWindow: s.usage.contextWindow }));
     setCwd(nextCwd);
@@ -462,14 +628,36 @@ export function ChatView(props: Props) {
 
   /** 正在载入的历史会话（显示载入动画）；序号用来丢掉被后一次点击取代的结果 */
   const [loadingSession, setLoadingSession] = useState<ChatSession | null>(null);
+  const commandsBtn = useRef<HTMLButtonElement>(null);
+  /** 从第几条开始渲染：大会话先只画最近 PAGE 条，往上滚到顶或点按钮再加载更早的 */
+  const [shownFrom, setShownFrom] = useState(0);
+  /** 加载更早消息前的内容高度：渲染后按增量补上 scrollTop，画面不跳 */
+  const heightBeforeLoad = useRef<number | null>(null);
+  /** 刚在顶部补上了更早的消息：这次内容变化不算「有新内容」 */
+  const earlierLoaded = useRef(false);
+  const loadEarlier = () => {
+    if (shownFrom === 0 || heightBeforeLoad.current !== null) return;
+    heightBeforeLoad.current = scrollRef.current!.scrollHeight;
+    earlierLoaded.current = true;
+    setShownFrom((n) => Math.max(0, n - PAGE));
+  };
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el && heightBeforeLoad.current !== null) el.scrollTop += el.scrollHeight - heightBeforeLoad.current;
+    heightBeforeLoad.current = null;
+  }, [shownFrom]);
+  /** 刚继续的历史会话缓存已过期时的上下文大小：发第一条消息前提醒这一轮会很贵 */
+  const [coldWarn, setColdWarn] = useState<number | null>(null);
   const resumeSeq = useRef(0);
 
   const resume = async (s: ChatSession) => {
     const seq = ++resumeSeq.current;
     setLoadingSession(s);
     try {
+      const t0 = performance.now();
       const lines = await api.chatHistory(host.id, s.file);
       if (seq !== resumeSeq.current) return;
+      const t1 = performance.now();
       nearBottom.current = true;
       // 先恢复这个会话上次的权限模式和模型，再切换（预热时就按它们启动）
       const saved = sessionPrefs()[s.sessionId];
@@ -480,13 +668,31 @@ export function ChatView(props: Props) {
         modelRef.current = saved.model;
         lastModel.current = saved.model;
       }
-      switchTo({ ...fromHistory(lines), sessionId: s.sessionId }, s.cwd);
+      const hist = fromHistory(lines);
+      const t2 = performance.now();
+      switchTo({ ...hist, sessionId: s.sessionId }, s.cwd);
+      setShownFrom(Math.max(0, hist.items.length - PAGE));
+      // 耗时分段：读取 = SSH 传输 + 解压 + Rust 解析 + IPC；渲染等下一帧画完再记
+      requestAnimationFrame(() =>
+        setTimeout(() =>
+          console.info(
+            `[历史会话] ${s.title.slice(0, 20)}：读取 ${Math.round(t1 - t0)}ms（${lines.length} 行）· 解析 ${Math.round(t2 - t1)}ms · 渲染 ${Math.round(performance.now() - t2)}ms（${hist.items.length} 条，先渲染最近 ${Math.min(PAGE, hist.items.length)} 条）`,
+          ),
+        ),
+      );
+      const ctx = hist.usage.contextUsed ?? 0;
+      if (ctx > COLD_WARN_TOKENS && hist.lastActive && Date.now() - hist.lastActive > CACHE_TTL_MS) setColdWarn(ctx);
       propsRef.current.onTitle(s.title.slice(0, 30));
     } catch (e) {
       if (seq === resumeSeq.current) setState((st) => system(st, `读取会话失败：${errorText(e)}`, "error"));
     } finally {
       if (seq === resumeSeq.current) setLoadingSession(null);
     }
+  };
+
+  /** 同一会话不能两个进程同时写：已在别处打开就切过去，否则按 newTab 开新标签或在本窗格继续 */
+  const openSession = (s: ChatSession, newTab: boolean) => {
+    if (!propsRef.current.onOpenSession(s, newTab)) resume(s);
   };
 
   const removePermission = (req: PermissionRequest) =>
@@ -512,6 +718,7 @@ export function ChatView(props: Props) {
   /** 直接发一条文字消息（常用命令按钮用，不动输入框） */
   const sendText = async (text: string) => {
     setShowCommands(false);
+    setColdWarn(null);
     nearBottom.current = true;
     setState((s) => addLocalUser(s, text, []));
     try {
@@ -603,16 +810,139 @@ export function ChatView(props: Props) {
   useEffect(() => {
     if (search) searchInputRef.current?.focus();
   }, [search !== null]);
+  /** 要滚到的消息（搜索当前命中、缩略导航点击） */
+  const [reveal, setReveal] = useState<string | null>(null);
+  useEffect(() => setReveal(currentMatch), [currentMatch]);
   useEffect(() => {
-    if (!currentMatch) return;
-    scrollRef.current?.querySelector(`[data-key="${currentMatch}"]`)?.scrollIntoView({ block: "center" });
-  }, [currentMatch]);
-
-  const onPaneKeyDown = (e: React.KeyboardEvent) => {
-    if (modKey(e) && !e.shiftKey && e.key.toLowerCase() === "f") {
-      e.preventDefault();
-      setSearch((s) => s ?? { q: "", index: 0 });
+    if (!reveal) return;
+    // 在还没渲染的更早部分：先展开到那里，渲染后本效果会再跑一次
+    const idx = state.items.findIndex((it) => it.key === reveal);
+    if (idx >= 0 && idx < shownFrom) {
+      setShownFrom(Math.max(0, idx - 10));
+      return;
     }
+    scrollRef.current?.querySelector(`[data-key="${reveal}"]`)?.scrollIntoView({ block: "center" });
+    setReveal(null);
+  }, [reveal, shownFrom]);
+
+  const stepMatch = (back: boolean) => {
+    if (!search || !matches.length) return;
+    const n = matches.length;
+    setSearch({ ...search, index: (search.index + (back ? n - 1 : 1)) % n });
+  };
+
+  // 关键词高亮：用 CSS Custom Highlight 给命中的文字上色，不改 DOM（Markdown 是 innerHTML，插标签会被重渲染冲掉）
+  const hlId = useRef(`p${Math.random().toString(36).slice(2)}`).current;
+  useEffect(() => {
+    const q = search?.q.trim().toLowerCase();
+    const root = scrollRef.current;
+    const hits: Range[] = [];
+    const cur: Range[] = [];
+    if (q && root) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        const text = n.nodeValue!.toLowerCase();
+        let i = text.indexOf(q);
+        if (i < 0) continue;
+        const inCur = !!currentMatch && n.parentElement?.closest<HTMLElement>("[data-key]")?.dataset.key === currentMatch;
+        for (; i >= 0; i = text.indexOf(q, i + q.length)) {
+          const r = new Range();
+          r.setStart(n, i);
+          r.setEnd(n, i + q.length);
+          (inCur ? cur : hits).push(r);
+        }
+      }
+    }
+    setHighlights(hlId, hits, cur);
+  }, [search?.q, currentMatch, state.items, shownFrom]);
+  useEffect(() => () => setHighlights(hlId, [], []), []);
+
+  /** 把文字以 Markdown 引用插到输入框末尾 */
+  const quote = (text: string) => {
+    const q = text.split("\n").map((l) => `> ${l}`).join("\n");
+    setInput((cur) => `${cur.trimEnd() ? `${cur.trimEnd()}\n\n` : ""}${q}\n\n`);
+    inputRef.current?.focus();
+  };
+
+  /** 消息上的右键菜单：选中文字 > 链接 > 代码块 > 整条消息 */
+  const msgMenu = (e: React.MouseEvent<HTMLElement>, item: Item) => {
+    const t = e.target as HTMLElement;
+    const sel = selectedText(e.currentTarget);
+    if (sel) {
+      const short = sel.replace(/\s+/g, " ").slice(0, 16);
+      return openMenu(e, [
+        { label: "复制", hint: kbd("Ctrl+C"), onClick: () => copyText(sel) },
+        { label: "引用到输入框", onClick: () => quote(sel) },
+        { label: `在对话中搜索「${short}${sel.length > 16 ? "…" : ""}」`, hint: kbd("Ctrl+F"), onClick: () => setSearch({ q: sel, index: 0 }) },
+      ]);
+    }
+    const href = t.closest("a")?.getAttribute("href");
+    if (href && /^https?:\/\//.test(href)) {
+      return openMenu(e, [
+        { label: "在浏览器打开", onClick: () => openUrl(href) },
+        { label: "复制链接", onClick: () => copyText(href) },
+      ]);
+    }
+    const pre = t.closest("pre");
+    if (pre) return openMenu(e, [{ label: "复制代码", onClick: () => copyText(pre.innerText) }]);
+    const text = itemText(item);
+    openMenu(e, [
+      { label: "复制这条消息", onClick: () => copyText(text) },
+      { label: "引用回复", onClick: () => quote(text) },
+      ...(item.kind === "user"
+        ? [
+            {
+              label: "重新编辑",
+              onClick: () => {
+                setInput(text);
+                inputRef.current?.focus();
+              },
+            },
+          ]
+        : []),
+    ]);
+  };
+
+  /** 上一个 / 下一个提问：以当前滚动位置为准；往上找不到已渲染的就去更早未渲染的部分 */
+  const jumpAsk = (up: boolean) => {
+    const el = scrollRef.current!;
+    const top = (key: string) => el.querySelector<HTMLElement>(`[data-key="${key}"]`)?.offsetTop;
+    const asks = state.items.flatMap((it, i) => (it.kind === "user" ? [{ key: it.key, i }] : []));
+    const y = el.scrollTop;
+    const pick = up
+      ? [...asks].reverse().find((a) => {
+          const t = top(a.key);
+          return t === undefined ? a.i < shownFrom : t < y - 16;
+        })
+      : asks.find((a) => (top(a.key) ?? -1) > y + 16);
+    if (!pick) return;
+    const node = el.querySelector<HTMLElement>(`[data-key="${pick.key}"]`);
+    if (node) node.scrollIntoView({ block: "start" });
+    else setReveal(pick.key);
+  };
+
+  // 对话窗格里的快捷键（尽量和 IDEA 一致）；全局的在 App 里
+  const onPaneKeyDown = (e: React.KeyboardEvent) => {
+    const mod = modKey(e);
+    const k = e.key.toLowerCase();
+    const typing = e.target instanceof HTMLElement && /^(INPUT|TEXTAREA)$/.test(e.target.tagName);
+    const plain = mod && !e.shiftKey && !e.altKey;
+    let run: (() => void) | null = null;
+    if (plain && k === "f") run = () => setSearch((s) => s ?? { q: "", index: 0 });
+    else if (e.key === "F3" && search) run = () => stepMatch(e.shiftKey);
+    else if (plain && k === "e")
+      run = () => {
+        setPicker({ q: "", index: 0 });
+        if (sessions === null) loadSessions();
+      };
+    else if (e.altKey && !mod && e.key === "1") run = () => setShowSessions(!showSessions);
+    else if (mod && e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) run = () => jumpAsk(e.key === "ArrowUp");
+    else if (plain && !typing && e.key === "End") run = toBottom;
+    else if (plain && !typing && e.key === "Home" && state.items.length) run = () => setReveal(state.items[0].key);
+    else if (mod && e.altKey && k === "n") run = () => switchTo(emptyState, listDir.trim() || "~");
+    if (!run) return;
+    e.preventDefault();
+    run();
   };
 
   // ---- 输入框：/ 命令与 @ 文件补全 ----
@@ -717,7 +1047,7 @@ export function ChatView(props: Props) {
 
   const pickSession = (s: ChatSession) => {
     setPicker(null);
-    resume(s);
+    openSession(s, false);
     inputRef.current?.focus();
   };
 
@@ -819,8 +1149,20 @@ export function ChatView(props: Props) {
                     className={`chat-session ${(loadingSession ? s.sessionId === loadingSession.sessionId : s.sessionId === state.sessionId) ? "active" : ""} ${
                       s.sessionId === loadingSession?.sessionId ? "loading" : ""
                     }`}
-                    onClick={() => resume(s)}
-                    title={titles[s.sessionId] ?? s.title}
+                    onClick={(e) => openSession(s, e.ctrlKey || e.metaKey)}
+                    // 中键：新标签打开（按下时拦掉浏览器的自动滚动）
+                    onMouseDown={(e) => e.button === 1 && e.preventDefault()}
+                    onAuxClick={(e) => e.button === 1 && openSession(s, true)}
+                    onContextMenu={(e) =>
+                      openMenu(e, [
+                        { label: "打开", onClick: () => openSession(s, false) },
+                        { label: "在新标签打开", hint: kbd("Ctrl+点击"), onClick: () => openSession(s, true) },
+                        "sep",
+                        { label: "重命名", onClick: () => setRenaming({ id: s.sessionId, value: titles[s.sessionId] ?? s.title }) },
+                        { label: "删除", danger: true, onClick: () => deleteSession(s) },
+                      ])
+                    }
+                    title={`${titles[s.sessionId] ?? s.title}\n${kbd("中键或 Ctrl+点击")}：在新标签打开`}
                   >
                     {renaming?.id === s.sessionId ? (
                       <input
@@ -846,6 +1188,16 @@ export function ChatView(props: Props) {
                         {hostDateTime(s.mtime, tz)}
                       </span>
                       <span className="chat-session-actions">
+                        <button
+                          className="icon"
+                          title="在新标签打开"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openSession(s, true);
+                          }}
+                        >
+                          ⧉
+                        </button>
                         <button
                           className="icon"
                           title="重命名"
@@ -909,7 +1261,7 @@ export function ChatView(props: Props) {
         <div className="chat-toolbar">
           <button
             className={`icon sessions-toggle ${showSessions ? "" : "off"}`}
-            title={showSessions ? "收起会话列表" : "展开会话列表"}
+            title={kbd(showSessions ? "收起会话列表（Alt+1）" : "展开会话列表（Alt+1），Ctrl+E 快速打开最近会话")}
             aria-pressed={showSessions}
             onClick={() => setShowSessions(!showSessions)}
           >
@@ -940,11 +1292,12 @@ export function ChatView(props: Props) {
             </button>
           )}
           <div className="menu-anchor">
-            <button className="icon" title="常用命令" onClick={() => setShowCommands(!showCommands)}>
+            <button ref={commandsBtn} className="icon" title="常用命令" onClick={() => setShowCommands(!showCommands)}>
               ⌘
             </button>
             {showCommands && (
-              <div className="menu" onMouseLeave={() => setShowCommands(false)}>
+              // 挂到 body 上并按窗口边界定位：原来右对齐向左长，说明一长就把左半边顶出窗格被裁掉
+              <PopupMenu anchor={commandsBtn} onClose={() => setShowCommands(false)} className="commands-menu">
                 <div className="menu-item" onClick={() => sendText("/compact")}>
                   <span>压缩上下文</span>
                   <code className="muted">/compact</code>
@@ -977,10 +1330,10 @@ export function ChatView(props: Props) {
                     </div>
                   ))}
                 {!state.slashCommands.length && <div className="menu-item muted">正在从云端 claude 读取可用命令…</div>}
-              </div>
+              </PopupMenu>
             )}
           </div>
-          <button className="icon" title={kbd("搜索对话（Ctrl+F）")} onClick={() => setSearch((s) => s ?? { q: "", index: 0 })}>
+          <button className="icon" title={kbd("搜索对话（Ctrl+F，F3 / Shift+F3 下一个 / 上一个）")} onClick={() => setSearch((s) => s ?? { q: "", index: 0 })}>
             ⌕
           </button>
           <button className="icon" title="导出为 Markdown" disabled={!state.items.length} onClick={exportMarkdown}>
@@ -999,15 +1352,18 @@ export function ChatView(props: Props) {
               onChange={(e) => setSearch({ q: e.target.value, index: 0 })}
               onKeyDown={(e) => {
                 if (e.key === "Escape") setSearch(null);
-                if (e.key === "Enter" && matches.length) {
-                  const n = matches.length;
-                  setSearch({ ...search, index: (search.index + (e.shiftKey ? n - 1 : 1)) % n });
-                }
+                if (e.key === "Enter") stepMatch(e.shiftKey);
               }}
             />
-            <span className="muted small-text">
+            <span className="search-count muted small-text">
               {matches.length ? `${(search.index % matches.length) + 1} / ${matches.length}` : search.q ? "无结果" : ""}
             </span>
+            <button className="icon" title="上一个（Shift+Enter）" disabled={!matches.length} onClick={() => stepMatch(true)}>
+              ↑
+            </button>
+            <button className="icon" title="下一个（Enter）" disabled={!matches.length} onClick={() => stepMatch(false)}>
+              ↓
+            </button>
             <button className="icon" onClick={() => setSearch(null)}>
               ×
             </button>
@@ -1015,13 +1371,26 @@ export function ChatView(props: Props) {
         )}
 
         <div
+          className={"chat-stage" + (resizing ? " resizing" : "")}
+          style={{ "--chat-width": chatWidth ? `${chatWidth}px` : "100%" } as React.CSSProperties}
+        >
+        <div className="chat-resize left" title="拖动调整对话宽度 · 双击恢复默认" onPointerDown={startResize} onDoubleClick={resetWidth} />
+        <div className="chat-resize right" title="拖动调整对话宽度 · 双击恢复默认" onPointerDown={startResize} onDoubleClick={resetWidth} />
+        <div
           className="chat-messages"
           ref={scrollRef}
           onScroll={(e) => {
             const el = e.currentTarget;
             nearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+            if (nearBottom.current) setBehind(false);
+            if (el.scrollTop < 40) loadEarlier();
           }}
         >
+          {shownFrom > 0 && (
+            <button className="load-earlier" onClick={loadEarlier}>
+              ↑ 加载更早的消息（还有 {shownFrom} 条）
+            </button>
+          )}
           {state.items.length === 0 && !state.running && (
             <div className="placeholder chat-empty">
               <Logo size={56} className="logo-idle" />
@@ -1029,7 +1398,8 @@ export function ChatView(props: Props) {
               <div className="muted small-text">Enter 发送 · Shift+Enter 换行 · / 命令 · @ 引用文件 · 可粘贴截图 · Esc 中断</div>
             </div>
           )}
-          {state.items.map((item, idx) => {
+          {state.items.slice(shownFrom).map((item, i) => {
+            const idx = shownFrom + i;
             const hit = matches.includes(item.key) ? (item.key === currentMatch ? " search-current" : " search-hit") : "";
             // 连续的多条回复（文字、工具调用…）只在第一条上显示角色标
             const showRole = item.kind !== "system" && state.items[idx - 1]?.kind !== item.kind;
@@ -1041,10 +1411,15 @@ export function ChatView(props: Props) {
               );
             }
             return (
-              <div key={item.key} data-key={item.key} className={`chat-msg ${item.kind}${showRole ? " first" : ""}${hit}`}>
-                {showRole && (item.kind === "assistant" ? <ClaudeRole /> : <UserRole />)}
+              <div
+                key={item.key}
+                data-key={item.key}
+                className={`chat-msg ${item.kind}${showRole ? " first" : ""}${hit}`}
+                onContextMenu={(e) => msgMenu(e, item)}
+              >
+                {showRole && (item.kind === "assistant" ? <ClaudeRole /> : <UserRole at={item.at} tz={tz} />)}
                 <div className="msg-actions">
-                  <button className="icon" title="复制这条消息" onClick={() => writeText(itemText(item))}>
+                  <button className="icon" title="复制这条消息" onClick={() => copyText(itemText(item))}>
                     ⧉
                   </button>
                 </div>
@@ -1060,6 +1435,11 @@ export function ChatView(props: Props) {
                     );
                   return <ToolCard key={i} name={b.name} input={b.input} result={state.results[b.id]} steps={state.subs[b.id]} />;
                 })}
+                {item.kind === "assistant" && item.done && (
+                  <div className="turn-done" title={hostDateTime(item.done.at / 1000, tz)}>
+                    ✻ {hostShortTime(item.done.at / 1000, tz, true)} · 耗时 {duration(item.done.ms)}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -1086,11 +1466,19 @@ export function ChatView(props: Props) {
           {state.running && !state.permissions.length && (
             <div className="chat-working">
               <span className="spinner" /> Claude 正在工作…
+              {lastUserAt(state.items) && <Elapsed since={lastUserAt(state.items)!} />}
               <button className="link" onClick={() => write(controlRequest({ subtype: "interrupt" }))}>
                 中断（Esc）
               </button>
             </div>
           )}
+        </div>
+        <ChatMinimap scrollRef={scrollRef} items={state.items} shownFrom={shownFrom} matches={matches} onJump={setReveal} />
+        {behind && (
+          <button className="jump-latest" onClick={toBottom}>
+            ↓ 有新内容，跳到最新
+          </button>
+        )}
         </div>
 
         <div className="chat-input">
@@ -1126,7 +1514,44 @@ export function ChatView(props: Props) {
               ))}
             </div>
           )}
-          <ChatStatus mode={mode} onMode={changeMode} usage={state.usage} rateLimits={state.rateLimits} tz={tz} />
+          {coldWarn !== null && (
+            <div className="cold-notice">
+              <div className="cold-text">
+                此会话上下文约 <b>{Math.round(coldWarn / 1000)}k</b> tokens，缓存已过期
+                {estimatePct(coldWarn) !== null && (
+                  <>
+                    （预计约消耗 5 小时额度的 <b>{pctText(estimatePct(coldWarn)!)}</b>）
+                  </>
+                )}
+                。发送消息或执行 /compact 都会按完整上下文重新计费一次。只是追问一两句就直接发；还要继续很多轮，先 /compact
+                更省；不需要旧上下文的话，新开会话不消耗额度。
+              </div>
+              <div className="cold-actions">
+                <button onClick={() => sendText("/compact")}>/compact</button>
+                <button onClick={() => switchTo(emptyState, cwd)}>新开会话</button>
+                <button className="link" onClick={() => setColdWarn(null)}>
+                  知道了
+                </button>
+              </div>
+            </div>
+          )}
+          <ChatStatus
+            mode={mode}
+            onMode={changeMode}
+            usage={state.usage}
+            rateLimits={state.rateLimits}
+            tz={tz}
+            baseContext={baseContext}
+            onHotCompact={
+              !state.running &&
+              coldWarn === null &&
+              (state.usage.contextUsed ?? 0) > HOT_COMPACT_TOKENS &&
+              state.lastActive &&
+              Date.now() - state.lastActive < CACHE_TTL_MS
+                ? () => sendText("/compact")
+                : undefined
+            }
+          />
           <textarea
             ref={inputRef}
             value={input}

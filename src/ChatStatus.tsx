@@ -1,8 +1,9 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PermissionMode } from "./api";
 import { RateLimit, Usage } from "./chatModel";
 import { hostShortTime, HostTz, tzLabel } from "./hostTime";
 import { PopupMenu } from "./PopupMenu";
+import { estimatePct, pctText } from "./quota";
 
 export const MODES: { value: PermissionMode; label: string; hint: string }[] = [
   { value: "default", label: "逐条审批", hint: "改文件、跑命令前都问你" },
@@ -23,45 +24,50 @@ const WINDOWS: Record<string, string> = {
   seven_day_opus: "7 天 Opus",
   seven_day_sonnet: "7 天 Sonnet",
 };
-const SEVERITY: Record<string, number> = { rejected: 3, allowed_warning: 2, allowed: 1 };
 
 const kTokens = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
 
-function quota(limits: Record<string, RateLimit>, tz: HostTz | null) {
-  const resetText = (at: number | null) => (at ? hostShortTime(at, tz) : "");
-  const list = Object.values(limits);
-  if (!list.length) {
-    return {
-      cls: "idle",
-      text: "额度 —",
-      title: "发一条消息后显示：云端 Claude 每次回复完会报告 5 小时 / 7 天窗口的用量。\n用 API key 按量计费时没有额度，看花费即可。",
-    };
-  }
-  // 显示最紧张的那个窗口：先比状态，状态一样比已用比例
-  const rank = (r: RateLimit) => (SEVERITY[r.status] ?? 0) * 1000 + (r.usedPct ?? 0);
-  const worst = list.reduce((a, b) => (rank(b) > rank(a) ? b : a));
-  const label = worst.status === "rejected" ? "已用尽" : worst.status === "allowed_warning" ? "接近上限" : "正常";
-  const cls = worst.status === "rejected" ? "bad" : worst.status === "allowed_warning" ? "warn" : "ok";
-  const reset = resetText(worst.resetsAt);
-  const short = (WINDOWS[worst.window] ?? worst.window).replace("窗口", "").trim();
-  const text = `额度 ${worst.usedPct !== null ? `${short} ${worst.usedPct}%` : label}${reset ? ` · ${reset} 重置` : ""}`;
-  const lines = list.map((r) => {
-    const name = WINDOWS[r.window] ?? r.window;
-    const st = r.status === "rejected" ? "已用尽" : r.status === "allowed_warning" ? "接近上限" : "正常";
-    return `${name}：${st}${r.usedPct !== null ? `，已用 ${r.usedPct}%` : ""}${r.resetsAt ? `，${resetText(r.resetsAt)} 重置` : ""}`;
-  });
-  const updated = Math.max(...list.map((r) => r.updatedAt));
-  lines.push(`数据更新于 ${hostShortTime(updated / 1000, tz)}（每次回复后刷新）`, `时间按${tzLabel(tz)}`);
-  return { cls, text, title: lines.join("\n") };
+/** 距重置还有多久：44m / 4h44m / 4天14h */
+function left(sec: number): string {
+  const m = Math.max(1, Math.ceil(sec / 60));
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h${m % 60 ? `${m % 60}m` : ""}`;
+  return `${Math.floor(h / 24)}天${h % 24 ? `${h % 24}h` : ""}`;
 }
 
-/** 输入框上方的状态栏：权限模式（可切换）· 上下文占用 · 本会话花费 · 订阅额度 */
+/** 一个额度窗口在状态栏里的一段（如「5h 6% 4h44m」）和悬浮详情里的一行 */
+function windowView(short: string, r: RateLimit | undefined, now: number, tz: HostTz | null) {
+  const name = r ? (WINDOWS[r.window] ?? r.window) : short;
+  if (!r) return { cls: "idle", text: `${short} —`, line: null };
+  const remain = r.resetsAt ? r.resetsAt - now : null;
+  const at = r.resetsAt ? hostShortTime(r.resetsAt, tz) : "";
+  // 已过重置时间：手里的数据是上个窗口的，不再沿用旧状态
+  if (remain !== null && remain <= 0) {
+    return { cls: "idle", text: `${short} 已重置`, line: `${name}：${at} 已重置，下次回复后刷新` };
+  }
+  const t = remain !== null ? ` ${left(remain)}` : "";
+  if (r.status === "rejected") {
+    return { cls: "bad", text: `${short} 用尽${t}`, line: `${name}：已用尽${at ? `，${at} 恢复` : ""}` };
+  }
+  const pct = r.usedPct;
+  const cls = r.status === "allowed_warning" || (pct ?? 0) >= 80 ? "warn" : "ok";
+  return {
+    cls,
+    text: `${short} ${pct !== null ? `${pct}%` : "—"}${t}`,
+    line: `${name}：${pct !== null ? `已用 ${pct}%` : "用量未报告"}${r.status === "allowed_warning" ? "（接近上限）" : ""}${at ? `，${at} 重置` : ""}`,
+  };
+}
+
+/** 输入框上方的状态栏：权限模式（可切换），再是和 CLI 状态栏一样的一行：5h · 7d · ctx · 花费 */
 export function ChatStatus({
   mode,
   onMode,
   usage,
   rateLimits,
   tz,
+  baseContext,
+  onHotCompact,
 }: {
   mode: PermissionMode;
   onMode: (m: PermissionMode) => void;
@@ -69,14 +75,36 @@ export function ChatStatus({
   rateLimits: Record<string, RateLimit>;
   /** 云主机时区：重置时间按 Claude 运行的地方显示 */
   tz: HostTz | null;
+  /** 新会话还没回复时用来预估上下文（这台主机上次新会话首轮的大小） */
+  baseContext: number | null;
+  /** 上下文很大且缓存还在时给出：点了发 /compact */
+  onHotCompact?: () => void;
 }) {
   const [menu, setMenu] = useState(false);
   const anchor = useRef<HTMLButtonElement>(null);
+  // 重置倒计时每分钟走一次，不用等下次回复
+  const [now, setNow] = useState(() => Date.now() / 1000);
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now() / 1000), 60_000);
+    return () => clearInterval(t);
+  }, []);
+
   const cur = MODES.find((m) => m.value === mode) ?? MODES[0];
   const used = usage.contextUsed;
   const pct = used !== null && usage.contextWindow ? Math.min(100, Math.round((used / usage.contextWindow) * 100)) : null;
-  const level = pct === null ? "" : pct >= 85 ? "bad" : pct >= 60 ? "warn" : "ok";
-  const q = quota(rateLimits, tz);
+  const ctxCls = pct === null ? "" : pct >= 85 ? "bad" : pct >= 60 ? "warn" : "";
+  const ctxEst = used === null && baseContext ? (usage.contextWindow ? `~${Math.round((baseContext / usage.contextWindow) * 100)}%` : `~${kTokens(baseContext)}`) : null;
+
+  const h5 = windowView("5h", rateLimits.five_hour, now, tz);
+  const d7 = windowView("7d", rateLimits.seven_day, now, tz);
+  const list = Object.values(rateLimits);
+  const quotaTitle = list.length
+    ? [
+        ...list.map((r) => windowView("", r, now, tz).line),
+        `数据更新于 ${hostShortTime(Math.max(...list.map((r) => r.updatedAt)) / 1000, tz)}（每次回复后刷新）`,
+        `时间按${tzLabel(tz)}`,
+      ].join("\n")
+    : "发一条消息后显示：云端 Claude 每次回复完会报告 5 小时 / 7 天窗口的用量。\n用 API key 按量计费时没有额度，看花费即可。";
 
   return (
     <div className="chat-status">
@@ -103,30 +131,41 @@ export function ChatStatus({
         </PopupMenu>
       )}
 
-      <span
-        className={`ctx-meter ${level}`}
-        title={
-          used !== null
-            ? `上下文已用 ${used.toLocaleString()} tokens${usage.contextWindow ? ` / 窗口 ${usage.contextWindow.toLocaleString()}` : "（窗口大小在第一轮回复后知道）"}`
-            : "发一条消息、或继续一个历史会话后显示"
-        }
-      >
-        上下文
-        <span className="ctx-bar" aria-hidden="true">
-          {Array.from({ length: 10 }, (_, i) => (
-            <i key={i} className={pct !== null && i < Math.ceil(pct / 10) ? "on" : ""} />
-          ))}
+      <span className="status-line">
+        <span className="status-quota" title={quotaTitle}>
+          <span className={`seg ${h5.cls}`}>{h5.text}</span>
+          <span className="sep">·</span>
+          <span className={`seg ${d7.cls}`}>{d7.text}</span>
         </span>
-        {used === null ? "—" : pct !== null ? `${pct}% · ${kTokens(used)}/${kTokens(usage.contextWindow!)}` : kTokens(used)}
+        <span className="sep">·</span>
+        <span
+          className={`seg ${ctxCls} ${used === null ? "est" : ""}`}
+          title={
+            used !== null
+              ? `上下文已用 ${used.toLocaleString()} tokens${usage.contextWindow ? ` / 窗口 ${usage.contextWindow.toLocaleString()}` : "（窗口大小在第一轮回复后知道）"}`
+              : ctxEst
+                ? `新会话预估约 ${baseContext!.toLocaleString()} tokens（系统提示 + 工具 + CLAUDE.md），首轮回复后更新为实际值`
+                : "新会话：首轮回复后显示实际上下文大小"
+          }
+        >
+          ctx {used !== null ? (pct !== null ? `${pct}%` : kTokens(used)) : (ctxEst ?? "新会话")}
+        </span>
+        <span className="sep">·</span>
+        <span className="seg" title="本会话累计花费（按 API 价格估算，订阅账号不实际扣费）">
+          {usage.costUsd !== null ? `$${usage.costUsd.toFixed(2)}` : "$—"}
+        </span>
       </span>
-
-      <span className="status-item" title="本会话累计花费（按 API 价格估算，订阅账号不实际扣费）">
-        本会话 {usage.costUsd !== null ? `$${usage.costUsd.toFixed(2)}` : "—"}
-      </span>
-
-      <span className={`quota-chip ${q.cls}`} title={q.title}>
-        {q.text}
-      </span>
+      {onHotCompact && used !== null && (
+        <button
+          className="hot-compact"
+          onClick={onHotCompact}
+          title={`上下文已超过 200k，缓存还在（上次回复不到 1 小时），现在 /compact 最便宜${
+            estimatePct(used / 10) !== null ? `，预计约消耗 5 小时额度的 ${pctText(estimatePct(used / 10)!)}` : ""
+          }。\n隔久了再压缩，要按完整上下文重新计费一次。`}
+        >
+          趁热压缩
+        </button>
+      )}
     </div>
   );
 }

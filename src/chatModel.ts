@@ -7,8 +7,10 @@ export type Block =
   | { type: "image"; src: string };
 
 export type Item =
-  | { kind: "user"; key: string; blocks: Block[] }
-  | { kind: "assistant"; key: string; messageId: string; blocks: Block[] }
+  /** at：发送时间（毫秒） */
+  | { kind: "user"; key: string; blocks: Block[]; at?: number }
+  /** done：这条是一轮的最后一条回复时，这轮的结束时间和耗时（毫秒） */
+  | { kind: "assistant"; key: string; messageId: string; blocks: Block[]; done?: { at: number; ms: number } }
   | { kind: "system"; key: string; text: string; tone: "info" | "error" };
 
 export interface ToolResult {
@@ -91,6 +93,8 @@ export interface ChatState {
   usage: Usage;
   /** 各额度窗口的最新状态，按窗口名 */
   rateLimits: Record<string, RateLimit>;
+  /** 会话最后一次活动的时间（毫秒）：超过缓存有效期后，下一轮要按完整上下文重新计费 */
+  lastActive: number | null;
   /** 最近的 stderr，进程异常退出时展示 */
   stderr: string[];
 }
@@ -110,6 +114,7 @@ export const emptyState: ChatState = {
   tools: [],
   usage: { costUsd: null, contextUsed: null, contextWindow: null },
   rateLimits: {},
+  lastActive: null,
   stderr: [],
 };
 
@@ -161,7 +166,19 @@ function addAssistant(items: Item[], messageId: string, blocks: Block[]): Item[]
 }
 
 /** 用户消息里可能混着 tool_result（工具回传）和真正的用户输入 */
-function addUser(s: ChatState, content: any): ChatState {
+function addUser(s: ChatState, content: any, at?: number, compactSummary?: boolean): ChatState {
+  // CLI 塞进对话的本地记录：压缩摘要不显示（压缩点另有提示），本地命令的回显丢掉、输出转成系统提示
+  const text = typeof content === "string" ? content : content?.length === 1 && content[0].type === "text" ? String(content[0].text) : null;
+  if (compactSummary || text?.startsWith("This session is being continued from a previous conversation")) return s;
+  if (text !== null) {
+    const t = text.trim();
+    const out = /^<local-command-(stdout|stderr)>([\s\S]*)<\/local-command-\1>$/.exec(t);
+    if (out) {
+      const msg = out[2].trim();
+      return !msg || msg === "Compacted" || msg === "(no content)" ? s : system(s, msg, out[1] === "stderr" ? "error" : "info");
+    }
+    if (/^<(command-name|command-message|local-command-caveat)>/.test(t)) return s;
+  }
   const results = { ...s.results };
   if (Array.isArray(content)) {
     for (const b of content) {
@@ -169,8 +186,26 @@ function addUser(s: ChatState, content: any): ChatState {
     }
   }
   const blocks = toBlocks(Array.isArray(content) ? content.filter((b: any) => b.type !== "tool_result") : content);
-  const items = blocks.length ? [...s.items, { kind: "user" as const, key: key(), blocks }] : s.items;
+  const items = blocks.length ? [...s.items, { kind: "user" as const, key: key(), blocks, at }] : s.items;
   return { ...s, results, items };
+}
+
+/** 给本轮（最后一条用户消息之后）的最后一条回复打上结束时间和耗时；本轮没有回复就不动 */
+function markTurnEnd(items: Item[], at: number, ms: number): Item[] {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.kind === "user") return items;
+    if (it.kind === "assistant") return [...items.slice(0, i), { ...it, done: { at, ms } }, ...items.slice(i + 1)];
+  }
+  return items;
+}
+
+/** 最后一条用户消息的发送时间（本轮开始时间） */
+export function lastUserAt(items: Item[]): number | undefined {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    if (it.kind === "user") return it.at;
+  }
 }
 
 /** 子代理的消息带 parent_tool_use_id：不进主对话，记为对应 Task 卡片里的步骤 */
@@ -190,7 +225,12 @@ function addSub(s: ChatState, parent: string, content: any): ChatState {
 export function addLocalUser(s: ChatState, text: string, images: string[]): ChatState {
   const blocks: Block[] = images.map((src) => ({ type: "image", src }));
   if (text.trim()) blocks.push({ type: "text", text });
-  return { ...s, running: true, items: [...s.items, { kind: "user", key: key(), blocks }] };
+  return { ...s, running: true, items: [...s.items, { kind: "user", key: key(), blocks, at: Date.now() }] };
+}
+
+function compactNote(preTokens: unknown): string {
+  const k = typeof preTokens === "number" ? `（压缩前约 ${Math.round(preTokens / 1000)}k tokens）` : "";
+  return `上下文已压缩${k}，更早的细节 Claude 可能记不清了`;
 }
 
 export function system(s: ChatState, text: string, tone: "info" | "error" = "info"): ChatState {
@@ -215,10 +255,7 @@ export function reduce(s: ChatState, e: Record<string, any>): ChatState {
           tools: e.tools ?? s.tools,
         };
       }
-      if (e.subtype === "compact_boundary") {
-        const before = e.compact_metadata?.pre_tokens;
-        return system(s, `上下文已压缩${before ? `（压缩前约 ${Math.round(before / 1000)}k tokens）` : ""}，更早的细节 Claude 可能记不清了`);
-      }
+      if (e.subtype === "compact_boundary") return system(s, compactNote(e.compact_metadata?.pre_tokens));
       return s;
     case "stream_event": {
       // 子代理的流式片段不显示在主对话里
@@ -238,7 +275,7 @@ export function reduce(s: ChatState, e: Record<string, any>): ChatState {
         e.message?.usage,
       );
     case "user":
-      return addUser(s, e.message?.content);
+      return addUser(s, e.message?.content, undefined, e.isCompactSummary);
     case "rate_limit_event": {
       const list = rateLimitsOf(e.rate_limit_info ?? {});
       if (!list.length) return s;
@@ -246,7 +283,11 @@ export function reduce(s: ChatState, e: Record<string, any>): ChatState {
     }
     case "result": {
       const usage = { ...s.usage, costUsd: e.total_cost_usd ?? s.usage.costUsd, contextWindow: contextWindowOf(e) ?? s.usage.contextWindow };
-      const next = { ...s, running: false, streaming: "", usage };
+      const now = Date.now();
+      const start = lastUserAt(s.items);
+      const ms = typeof e.duration_ms === "number" ? e.duration_ms : start ? now - start : null;
+      const items = ms !== null ? markTurnEnd(s.items, now, ms) : s.items;
+      const next = { ...s, items, running: false, streaming: "", usage, lastActive: now };
       return e.is_error ? system(next, `本轮出错：${e.result ?? e.subtype}`, "error") : next;
     }
     case "control_request":
@@ -356,14 +397,32 @@ function contextWindowOf(e: Record<string, any>): number | null {
 /** 把会话 jsonl 的历史行转成初始状态（用于继续历史会话时回显） */
 export function fromHistory(lines: Record<string, any>[]): ChatState {
   let s = emptyState;
+  // 历史里没有每轮耗时：用「用户发消息」到「这轮最后一条回复」的时间差
+  let turnStart: number | null = null;
+  let lastReply: number | null = null;
+  const endTurn = (items: Item[]) => (turnStart && lastReply ? markTurnEnd(items, lastReply, lastReply - turnStart) : items);
   for (const l of lines) {
+    const t = Date.parse(l.timestamp);
+    if (t > (s.lastActive ?? 0)) s = { ...s, lastActive: t };
     if (l.isMeta || l.isSidechain) continue;
-    if (l.type === "user") s = addUser(s, l.message?.content);
-    // 历史里的 assistant 记录带着当时的用量，取最后一条就是继续会话时的上下文大小
-    else if (l.type === "assistant")
+    if (l.type === "user") {
+      const before = s.items;
+      s = addUser(s, l.message?.content, t || undefined, l.isCompactSummary);
+      // 新的一轮（不是只带工具结果、也不是本地命令输出的用户行）：结算上一轮
+      if (s.items.length > before.length && s.items[s.items.length - 1].kind === "user") {
+        s = { ...s, items: [...endTurn(before), s.items[s.items.length - 1]] };
+        turnStart = t || null;
+        lastReply = null;
+      }
+    } else if (l.type === "system" && l.subtype === "compact_boundary") {
+      s = system(s, compactNote(l.preTokens));
+    } else if (l.type === "assistant") {
+      if (t) lastReply = t;
+      // 历史里的 assistant 记录带着当时的用量，取最后一条就是继续会话时的上下文大小
       s = withContext({ ...s, items: addAssistant(s.items, l.message?.id ?? key(), toBlocks(l.message?.content)) }, l.message?.usage);
+    }
   }
-  return s;
+  return { ...s, items: endTurn(s.items) };
 }
 
 /** 一条消息里的纯文字（复制、搜索用） */

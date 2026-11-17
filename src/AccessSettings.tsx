@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ask } from "./modal";
 import { NumberInput } from "./NumberInput";
-import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { SaveButton } from "./SaveButton";
+import { copyText } from "./copy";
 import { api, BUILTIN_NAME, defaultCloudName, errorText, Settings } from "./api";
 
 type Patch = Partial<Pick<Settings, "roots" | "allowCommands" | "remotePort" | "device" | "builtinAlias">>;
@@ -16,37 +17,33 @@ async function savePatch(patch: Patch) {
 function useSettings() {
   const [s, setS] = useState<Settings | null>(null);
   const [error, setError] = useState("");
-  const [saved, setSaved] = useState(false);
   useEffect(() => {
     api.settingsGet().then(setS).catch((e) => setError(errorText(e)));
   }, []);
   const patch = (p: Patch) => {
     setS((cur) => cur && { ...cur, ...p });
-    setSaved(false);
   };
   const save = async (p: Patch, onSaved?: (s: Settings) => void) => {
     try {
       const next = await savePatch(p);
       setS(next);
-      setSaved(true);
       setError("");
       onSaved?.(next);
+      return true;
     } catch (e) {
       setError(errorText(e));
+      return false;
     }
   };
-  return { s, setS, error, saved, patch, save };
+  return { s, setS, error, patch, save };
 }
 
-function Footer({ error, saved, onSave }: { error: string; saved: boolean; onSave: () => void }) {
+function Footer({ error, onSave }: { error: string; onSave: () => Promise<boolean> }) {
   return (
     <>
       {error && <p className="form-error">{error}</p>}
       <div className="dialog-actions">
-        {saved && <span className="muted">已保存</span>}
-        <button className="primary" onClick={onSave}>
-          保存
-        </button>
+        <SaveButton onSave={onSave} />
       </div>
     </>
   );
@@ -54,7 +51,7 @@ function Footer({ error, saved, onSave }: { error: string; saved: boolean; onSav
 
 /** 内置工具的设置：云端名字和端口、云端能碰到哪些目录、能不能执行命令 */
 export function BuiltinSettings({ onSaved }: { onSaved: (s: Settings) => void }) {
-  const { s, error, saved, patch, save } = useSettings();
+  const { s, error, patch, save } = useSettings();
   if (!s) return null;
   const device = s.device.trim();
 
@@ -103,7 +100,6 @@ export function BuiltinSettings({ onSaved }: { onSaved: (s: Settings) => void })
       </label>
       <Footer
         error={error}
-        saved={saved}
         onSave={() =>
           save({ roots: s.roots, allowCommands: s.allowCommands, builtinAlias: s.builtinAlias.trim(), remotePort: s.remotePort }, onSaved)
         }
@@ -115,7 +111,7 @@ export function BuiltinSettings({ onSaved }: { onSaved: (s: Settings) => void })
 
 /** 这台电脑：标识和访问令牌。多台电脑连同一台主机时靠标识区分云端名字 */
 export function DeviceSettings({ onSaved }: { onSaved: (s: Settings) => void }) {
-  const { s, setS, error, saved, patch, save } = useSettings();
+  const { s, setS, error, patch, save } = useSettings();
   if (!s) return null;
   const device = s.device.trim();
 
@@ -141,14 +137,14 @@ export function DeviceSettings({ onSaved }: { onSaved: (s: Settings) => void }) 
           </span>
         </label>
       </div>
-      <Footer error={error} saved={saved} onSave={() => save({ device }, onSaved)} />
+      <Footer error={error} onSave={() => save({ device }, onSaved)} />
 
       <div className="field-title">访问令牌：</div>
       <div className="row token-row">
         <code className="grow">
           {s.token.slice(0, 6)}…{s.token.slice(-4)}
         </code>
-        <button onClick={() => writeText(s.token)}>复制</button>
+        <button onClick={() => copyText(s.token, "访问令牌")}>复制</button>
         <button onClick={regen}>更换</button>
       </div>
       <p className="muted small">内置工具和本机命令类工具要求云端带上这个令牌，「配置 Claude」会自动写入；HTTP 类工具是直接端口转发，用它自己的鉴权。</p>

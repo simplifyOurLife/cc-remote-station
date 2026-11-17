@@ -45,6 +45,8 @@ regex = "1.13.1"
 tauri-plugin-dialog = "2"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 base64 = "0.23.1"
+# 历史会话在云端 gzip 后传输，这里解压（russh 的 flate2 特性已经引入它，不增加体积）
+flate2 = "1"
 # 工具箱「测试连接」访问 HTTP MCP；rustls 走 ring，和 russh 共用，不引入 OpenSSL/aws-lc
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
