@@ -26,14 +26,34 @@ pub use toolbox::{TestResult, Toolbox, cloud_url, http_target, validate as valid
 use tasks::Tasks;
 use tools::ToolOut;
 
+/// 省 token 的用法规则，两个平台共用
+macro_rules! usage_rules {
+    () => {
+        "省 token 用法：① 文件读写/查找/列目录用专用工具，不要用 run_command 跑 type/cat/dir/findstr；\
+② 超过约 500 行的文件先用 search_files 定位，再用 read_file 的 offset/limit 读需要的段；\
+③ 只想知道哪些文件命中用 search_files 的 output_mode=files_with_matches 或 count，要看命中附近代码传 context（如 3），不必再读整个文件；\
+④ 比较两个文件用 run_command 跑 git diff --no-index，不要把两份全文都读进来；\
+⑤ 命令输出可能很大时（构建、测试、日志）传 include/exclude 正则或 tail_lines，只拿需要的行；\
+⑥ 结果里出现【已截断】说明不完整，按提示缩小范围或继续读；\
+⑦ edit_file 失败时会给出行号或最相似的行，按行号读那几行即可，不必重读整个文件；\
+⑧ 互不依赖的多个读取/搜索在同一条消息里并行调用。"
+    };
+}
+
 #[cfg(windows)]
-const INSTRUCTIONS: &str = "这些工具操作的是用户本地的 Windows 电脑（经 cc-workstation 的 SSH 隧道提供），不是当前这台云主机。\
+const INSTRUCTIONS: &str = concat!(
+    "这些工具操作的是用户本地的 Windows 电脑（经 cc-workstation 的 SSH 隧道提供），不是当前这台云主机。\
 路径一律用 Windows 绝对路径；先调用 list_allowed_roots 查看允许访问的目录。写入、修改、删除前会自动备份。\
-构建、测试等长命令用 run_command 的 background=true，再用 command_output 取输出。";
+构建、测试等长命令用 run_command 的 background=true，再用 command_output 取输出。\n",
+    usage_rules!()
+);
 #[cfg(not(windows))]
-const INSTRUCTIONS: &str = "这些工具操作的是用户本地的 Mac 电脑（经 cc-workstation 的 SSH 隧道提供），不是当前这台云主机。\
+const INSTRUCTIONS: &str = concat!(
+    "这些工具操作的是用户本地的 Mac 电脑（经 cc-workstation 的 SSH 隧道提供），不是当前这台云主机。\
 路径一律用本机绝对路径（如 /Users/me/project）；先调用 list_allowed_roots 查看允许访问的目录。写入、修改、删除前会自动备份。\
-构建、测试等长命令用 run_command 的 background=true，再用 command_output 取输出。";
+构建、测试等长命令用 run_command 的 background=true，再用 command_output 取输出。\n",
+    usage_rules!()
+);
 
 pub struct McpState {
     guard: Arc<Guard>,
@@ -137,7 +157,15 @@ async fn call_tool(st: &McpState, params: &Value) -> Value {
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     let started = Instant::now();
     let result = tools::call(st, name, &args).await;
+    // 返回给模型的字节数和是否触顶，用来看哪些调用最费 token
+    let (bytes, capped) = match &result {
+        Ok(ToolOut::Text(t)) => (t.len(), t.contains(tools::CAPPED)),
+        Ok(ToolOut::Image { data, .. }) => (data.len(), false),
+        Err(e) => (format!("{e:#}").len(), false),
+    };
     let entry = json!({
+        "bytes": bytes,
+        "capped": capped,
         "ts": chrono::Local::now().to_rfc3339(),
         "tool": name,
         "args": abbreviate(&args),
