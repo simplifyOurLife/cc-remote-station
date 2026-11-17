@@ -36,27 +36,46 @@ function left(sec: number): string {
   return `${Math.floor(h / 24)}天${h % 24 ? `${h % 24}h` : ""}`;
 }
 
-/** 一个额度窗口在状态栏里的一段（如「5h 6% 4h44m」）和悬浮详情里的一行 */
-function windowView(short: string, r: RateLimit | undefined, now: number, tz: HostTz | null) {
-  const name = r ? (WINDOWS[r.window] ?? r.window) : short;
-  if (!r) return { cls: "idle", text: `${short} —`, line: null };
+interface ChipView {
+  cls: string;
+  /** 芯片底色填充比例 0–100 */
+  fill: number;
+  value: string;
+  /** 重置倒计时，没有就不显示 */
+  reset: string | null;
+  /** 悬浮详情里的一行 */
+  line: string | null;
+}
+
+/** 一个额度窗口的芯片：已用比例、重置倒计时、悬浮详情里的一行 */
+function windowView(r: RateLimit | undefined, now: number, tz: HostTz | null): ChipView {
+  if (!r) return { cls: "idle", fill: 0, value: "—", reset: null, line: null };
+  const name = WINDOWS[r.window] ?? r.window;
   const remain = r.resetsAt ? r.resetsAt - now : null;
   const at = r.resetsAt ? hostShortTime(r.resetsAt, tz) : "";
-  // 已过重置时间：手里的数据是上个窗口的，不再沿用旧状态
-  if (remain !== null && remain <= 0) {
-    return { cls: "idle", text: `${short} 已重置`, line: `${name}：${at} 已重置，下次回复后刷新` };
-  }
-  const t = remain !== null ? ` ${left(remain)}` : "";
-  if (r.status === "rejected") {
-    return { cls: "bad", text: `${short} 用尽${t}`, line: `${name}：已用尽${at ? `，${at} 恢复` : ""}` };
-  }
+  // 已过重置时间：新窗口还没开始计，就是 0%
+  if (remain !== null && remain <= 0) return { cls: "ok", fill: 0, value: "0%", reset: null, line: `${name}：${at} 已重置，下次回复后刷新` };
+  const reset = remain !== null ? left(remain) : null;
+  if (r.status === "rejected") return { cls: "bad", fill: 100, value: "用尽", reset, line: `${name}：已用尽${at ? `，${at} 恢复` : ""}` };
   const pct = r.usedPct;
-  const cls = r.status === "allowed_warning" || (pct ?? 0) >= 80 ? "warn" : "ok";
   return {
-    cls,
-    text: `${short} ${pct !== null ? `${pct}%` : "—"}${t}`,
+    cls: r.status === "allowed_warning" || (pct ?? 0) >= 80 ? "warn" : "ok",
+    fill: pct ?? 0,
+    value: pct !== null ? `${pct}%` : "—",
+    reset,
     line: `${name}：${pct !== null ? `已用 ${pct}%` : "用量未报告"}${r.status === "allowed_warning" ? "（接近上限）" : ""}${at ? `，${at} 重置` : ""}`,
   };
+}
+
+/** 切角芯片：底色按比例从左填充，重置倒计时跟在后面 */
+function Chip({ label, v, title }: { label: string; v: ChipView; title?: string }) {
+  return (
+    <span className={`q-chip ${v.cls}`} style={{ "--fill": `${Math.min(100, Math.max(0, v.fill))}%` } as React.CSSProperties} title={title}>
+      <b>{label}</b>
+      <span className="q-val">{v.value}</span>
+      {v.reset && <span className="q-reset">⟳ {v.reset}</span>}
+    </span>
+  );
 }
 
 /** 输入框上方的状态栏：权限模式（可切换），再是和 CLI 状态栏一样的一行：5h · 7d · ctx · 花费 */
@@ -92,15 +111,21 @@ export function ChatStatus({
   const cur = MODES.find((m) => m.value === mode) ?? MODES[0];
   const used = usage.contextUsed;
   const pct = used !== null && usage.contextWindow ? Math.min(100, Math.round((used / usage.contextWindow) * 100)) : null;
-  const ctxCls = pct === null ? "" : pct >= 85 ? "bad" : pct >= 60 ? "warn" : "";
-  const ctxEst = used === null && baseContext ? (usage.contextWindow ? `~${Math.round((baseContext / usage.contextWindow) * 100)}%` : `~${kTokens(baseContext)}`) : null;
+  // 上下文：有实际值用实际值；新会话用上次首轮大小预估（暗色）；都没有就是空槽
+  const estPct = used === null && baseContext && usage.contextWindow ? Math.round((baseContext / usage.contextWindow) * 100) : null;
+  const ctx: ChipView =
+    used !== null
+      ? { cls: pct === null ? "ok" : pct >= 85 ? "bad" : pct >= 60 ? "warn" : "ok", fill: pct ?? 0, value: pct !== null ? `${pct}%` : kTokens(used), reset: null, line: null }
+      : estPct !== null
+        ? { cls: "idle est", fill: estPct, value: `~${estPct}%`, reset: null, line: null }
+        : { cls: "idle", fill: 0, value: "—", reset: null, line: null };
 
-  const h5 = windowView("5h", rateLimits.five_hour, now, tz);
-  const d7 = windowView("7d", rateLimits.seven_day, now, tz);
+  const h5 = windowView(rateLimits.five_hour, now, tz);
+  const d7 = windowView(rateLimits.seven_day, now, tz);
   const list = Object.values(rateLimits);
   const quotaTitle = list.length
     ? [
-        ...list.map((r) => windowView("", r, now, tz).line),
+        ...list.map((r) => windowView(r, now, tz).line),
         `数据更新于 ${hostShortTime(Math.max(...list.map((r) => r.updatedAt)) / 1000, tz)}（每次回复后刷新）`,
         `时间按${tzLabel(tz)}`,
       ].join("\n")
@@ -132,28 +157,22 @@ export function ChatStatus({
       )}
 
       <span className="status-line">
-        <span className="status-quota" title={quotaTitle}>
-          <span className={`seg ${h5.cls}`}>{h5.text}</span>
-          <span className="sep">·</span>
-          <span className={`seg ${d7.cls}`}>{d7.text}</span>
-        </span>
-        <span className="sep">·</span>
-        <span
-          className={`seg ${ctxCls} ${used === null ? "est" : ""}`}
+        <Chip label="5H" v={h5} title={quotaTitle} />
+        <Chip label="7D" v={d7} title={quotaTitle} />
+        <Chip
+          label="CTX"
+          v={ctx}
           title={
             used !== null
               ? `上下文已用 ${used.toLocaleString()} tokens${usage.contextWindow ? ` / 窗口 ${usage.contextWindow.toLocaleString()}` : "（窗口大小在第一轮回复后知道）"}`
-              : ctxEst
+              : estPct !== null
                 ? `新会话预估约 ${baseContext!.toLocaleString()} tokens（系统提示 + 工具 + CLAUDE.md），首轮回复后更新为实际值`
                 : "新会话：首轮回复后显示实际上下文大小"
           }
-        >
-          ctx {used !== null ? (pct !== null ? `${pct}%` : kTokens(used)) : (ctxEst ?? "新会话")}
-        </span>
-        <span className="sep">·</span>
-        <span className="seg" title="本会话累计花费（按 API 价格估算，订阅账号不实际扣费）">
-          {usage.costUsd !== null ? `$${usage.costUsd.toFixed(2)}` : "$—"}
-        </span>
+        />
+        {usage.costUsd !== null && (
+          <span className="q-cost" title="本会话累计花费（按 API 价格估算，订阅账号不实际扣费）">${usage.costUsd.toFixed(2)}</span>
+        )}
       </span>
       {onHotCompact && used !== null && (
         <button

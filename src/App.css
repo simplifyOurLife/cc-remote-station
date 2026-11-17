@@ -1490,34 +1490,82 @@ button.activity-line:hover:not(:disabled)::after {
   box-shadow: 0 0 6px var(--mode);
   vertical-align: 1px;
 }
-/* 和 CLI 状态栏一样的一行：5h 6% 4h44m · 7d 28% 4天14h · ctx 12% · $1.96 */
+/* 额度状态栏：5H / 7D / CTX 三个切角芯片，底色按已用比例从左填充，花费有了才显示 */
 .status-line {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   white-space: nowrap;
 }
-.status-quota {
+.q-chip {
+  --c: var(--cyan);
+  --c-rgb: 45 226 255;
+  position: relative;
   display: inline-flex;
-  gap: 7px;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 9px 2px 8px;
+  line-height: 1.4;
+  color: var(--ink);
+  /* 已用部分：半透明亮色；剩余部分：暗底 */
+  background:
+    linear-gradient(90deg, rgb(var(--c-rgb) / 0.28), rgb(var(--c-rgb) / 0.16)) 0 0 / var(--fill) 100% no-repeat,
+    var(--void);
+  box-shadow: inset 0 0 0 1px rgb(var(--c-rgb) / 0.35);
+  clip-path: polygon(0 0, calc(100% - 6px) 0, 100% 6px, 100% 100%, 6px 100%, 0 calc(100% - 6px));
+  transition: background-size 0.4s ease-out;
 }
-.status-line .sep {
-  color: var(--wire-hi);
+/* 底边一条发光线，长度 = 已用比例 */
+.q-chip::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: var(--fill);
+  height: 2px;
+  background: var(--c);
+  box-shadow: 0 0 6px var(--c);
 }
-.status-line .seg.est {
-  opacity: 0.6;
+.q-chip b {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--c);
 }
-.status-line .seg.ok {
-  color: var(--cyan);
+.q-val {
+  font-weight: 600;
+  color: #fff;
 }
-.status-line .seg.warn {
-  color: var(--amber);
-  text-shadow: 0 0 6px rgb(255 193 77 / 0.5);
+.q-reset {
+  font-size: 10.5px;
+  color: var(--dim);
 }
-.status-line .seg.bad {
-  color: var(--red);
-  text-shadow: 0 0 8px rgb(255 84 112 / 0.6);
+.q-chip.warn {
+  --c: var(--amber);
+  --c-rgb: 255 193 77;
+}
+.q-chip.bad {
+  --c: var(--red);
+  --c-rgb: 255 84 112;
   animation: lost-blink 1.2s steps(1) infinite;
+}
+.q-chip.bad .q-val {
+  color: #ffc9d3;
+}
+/* 还没数据 / 预估：暗色空槽 */
+.q-chip.idle {
+  --c: var(--dim);
+  --c-rgb: 138 132 184;
+}
+.q-chip.idle .q-val {
+  color: var(--dim);
+  font-weight: 400;
+}
+.q-chip.est {
+  opacity: 0.75;
+}
+.q-cost {
+  color: var(--dim);
 }
 /* 上下文很大、缓存还热：琥珀色小按钮轻轻呼吸 */
 .hot-compact {
