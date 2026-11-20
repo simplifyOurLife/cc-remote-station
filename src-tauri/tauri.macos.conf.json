@@ -3,7 +3,7 @@
   "app": {
     "windows": [
       {
-        "title": "cc-workstation",
+        "title": "cc-remote-station",
         "width": 1200,
         "height": 780,
         "minWidth": 900,

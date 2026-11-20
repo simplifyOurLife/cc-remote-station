@@ -77,7 +77,7 @@ function ToolList({ tools }: { tools: ToolBrief[] }) {
   );
 }
 
-/** MCP 工具箱：内置的 cc-workstation 工具是第一项，其余是用户加的本机/局域网 MCP */
+/** MCP 工具箱：内置的 cc-remote-station 工具是第一项，其余是用户加的本机/局域网 MCP */
 export function ToolboxPage({
   builtinPort,
   device,
@@ -423,7 +423,7 @@ function ToolboxForm({
                 placeholder="npx -y @playwright/mcp@latest"
                 spellCheck={false}
               />
-              <span className="muted small">由 cc-workstation 在本机启动，云端第一次用到时才运行；含空格的参数用双引号括起来</span>
+              <span className="muted small">由 cc-remote-station 在本机启动，云端第一次用到时才运行；含空格的参数用双引号括起来</span>
             </label>
             <label>
               工作目录：

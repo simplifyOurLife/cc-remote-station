@@ -359,7 +359,7 @@ impl StdioProc {
             if msg.get("method").is_some() {
                 // 服务端反向请求（roots/sampling 等）转不到云端，直接回不支持，免得它一直等；通知忽略
                 if let Some(id) = msg.get("id") {
-                    let reply = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "cc-workstation 工具箱不支持此请求" } });
+                    let reply = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "cc-remote-station 工具箱不支持此请求" } });
                     let _ = self.write(&reply).await;
                 }
                 continue;
@@ -463,7 +463,7 @@ fn init_params() -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {},
-        "clientInfo": { "name": "cc-workstation", "version": env!("CARGO_PKG_VERSION") },
+        "clientInfo": { "name": "cc-remote-station", "version": env!("CARGO_PKG_VERSION") },
     })
 }
 

@@ -66,7 +66,7 @@ export function defaultCloudName(name: string, device: string) {
   return device ? `${base}-${device}` : base;
 }
 
-/** 工具显示的名字：内置工具内部 id 是 ccws，显示为 cc-workstation */
+/** 工具显示的名字：内置工具内部 id 是 ccws，显示为 cc-remote-station */
 export function toolLabel(name: string) {
   return name === BUILTIN_NAME ? BUILTIN_CLOUD_NAME : name;
 }
@@ -79,7 +79,7 @@ export function cloudNameOf(s: Pick<Settings, "device" | "builtinAlias" | "toolb
 /** 内置工具的内部 id（主机保存的工具列表里用它） */
 export const BUILTIN_NAME = "ccws";
 /** 内置工具显示的名字，也是默认的云端名字 */
-export const BUILTIN_CLOUD_NAME = "cc-workstation";
+export const BUILTIN_CLOUD_NAME = "cc-remote-station";
 
 export interface KeyValue {
   key: string;

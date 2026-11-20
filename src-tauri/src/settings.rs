@@ -69,7 +69,7 @@ pub struct ToolboxItem {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Source {
-    /// 本机命令（stdio），由 cc-workstation 启动并桥接成 HTTP
+    /// 本机命令（stdio），由 cc-remote-station 启动并桥接成 HTTP
     Stdio {
         command: String,
         #[serde(default)]
@@ -98,7 +98,7 @@ pub struct KeyValue {
 /// 内置工具的内部 id（主机保存的工具列表里用它指代内置工具），工具箱条目不能重名
 pub const BUILTIN_NAME: &str = "ccws";
 /// 内置工具显示的名字，也是它默认的云端名字
-pub const BUILTIN_CLOUD_NAME: &str = "cc-workstation";
+pub const BUILTIN_CLOUD_NAME: &str = "cc-remote-station";
 
 impl Settings {
     /// 工具在云端 Claude Code 里的名字：有自定义名字就用它，否则设了电脑标识就加后缀，如 ccws-home

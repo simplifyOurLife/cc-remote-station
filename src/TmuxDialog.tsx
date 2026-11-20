@@ -3,7 +3,7 @@ import { Loading } from "./Loading";
 import { hostDateTime, tzLabel, useHostTz } from "./hostTime";
 import { api, errorText, Host, TmuxSession } from "./api";
 
-/** 列出主机上 cc-workstation 建的 tmux 会话，可接回或结束 */
+/** 列出主机上 cc-remote-station 建的 tmux 会话，可接回或结束 */
 export function TmuxDialog({
   host,
   onAttach,

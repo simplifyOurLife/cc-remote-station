@@ -284,7 +284,7 @@ struct TmuxSession {
     activity: u64,
 }
 
-/// 列出该主机上 cc-workstation 建的 tmux 会话（ccws- 前缀），用于接回或清理
+/// 列出该主机上 cc-remote-station 建的 tmux 会话（ccws- 前缀），用于接回或清理
 #[tauri::command]
 async fn tmux_sessions(state: State<'_, AppState>, host_id: String) -> CmdResult<Vec<TmuxSession>> {
     let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
@@ -873,7 +873,7 @@ fn show_main(app: &AppHandle) {
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-    let show = MenuItem::with_id(app, "show", "显示 cc-workstation", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "显示 cc-remote-station", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &PredefinedMenuItem::separator(app)?, &quit])?;
     // 托盘用单独的透明底图标（icons/tray.png，由 tray-icon.svg 生成），比带底板的应用图标在 16px 下清爽。
@@ -887,7 +887,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let tray = TrayIconBuilder::with_id("main")
         .icon(tauri::include_image!("icons/tray.png"))
         .show_menu_on_left_click(false);
-    tray.tooltip("cc-workstation")
+    tray.tooltip("cc-remote-station")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main(app),
@@ -918,9 +918,9 @@ fn hide_to_tray(window: &tauri::Window) {
     let _ = std::fs::write(&marker, "");
     use tauri_plugin_notification::NotificationExt;
     let (title, body) = if cfg!(target_os = "macos") {
-        ("cc-workstation 仍在后台运行", "点 Dock 图标或菜单栏图标可以重新打开，⌘Q 或菜单栏图标 → 退出。")
+        ("cc-remote-station 仍在后台运行", "点 Dock 图标或菜单栏图标可以重新打开，⌘Q 或菜单栏图标 → 退出。")
     } else {
-        ("cc-workstation 已最小化到托盘", "终端和对话仍在后台运行。点托盘图标打开，右键可以退出。")
+        ("cc-remote-station 已最小化到托盘", "终端和对话仍在后台运行。点托盘图标打开，右键可以退出。")
     };
     let _ = app.notification().builder().title(title).body(body).show();
 }

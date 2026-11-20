@@ -47,14 +47,14 @@ macro_rules! usage_rules {
 
 #[cfg(windows)]
 const INSTRUCTIONS: &str = concat!(
-    "这些工具操作的是用户本地的 Windows 电脑（经 cc-workstation 的 SSH 隧道提供），不是当前这台云主机。\
+    "这些工具操作的是用户本地的 Windows 电脑（经 cc-remote-station 的 SSH 隧道提供），不是当前这台云主机。\
 路径一律用 Windows 绝对路径；先调用 list_allowed_roots 查看允许访问的目录。写入、修改、删除前会自动备份。\
 构建、测试等长命令用 run_command 的 background=true，再用 command_output 取输出。\n",
     usage_rules!()
 );
 #[cfg(not(windows))]
 const INSTRUCTIONS: &str = concat!(
-    "这些工具操作的是用户本地的 Mac 电脑（经 cc-workstation 的 SSH 隧道提供），不是当前这台云主机。\
+    "这些工具操作的是用户本地的 Mac 电脑（经 cc-remote-station 的 SSH 隧道提供），不是当前这台云主机。\
 路径一律用本机绝对路径（如 /Users/me/project）；先调用 list_allowed_roots 查看允许访问的目录。写入、修改、删除前会自动备份。\
 构建、测试等长命令用 run_command 的 background=true，再用 command_output 取输出。\n",
     usage_rules!()
@@ -160,7 +160,7 @@ async fn handle(
         "initialize" => Ok(json!({
             "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "cc-workstation", "version": env!("CARGO_PKG_VERSION") },
+            "serverInfo": { "name": "cc-remote-station", "version": env!("CARGO_PKG_VERSION") },
             "instructions": INSTRUCTIONS,
         })),
         "ping" => Ok(json!({})),

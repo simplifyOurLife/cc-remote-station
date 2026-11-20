@@ -337,7 +337,7 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey, true);
   }, []);
   const crumbs = [
-    "cc-workstation",
+    "cc-remote-station",
     { hosts: "主机", workspace: "工作区", toolbox: "MCP 工具箱", settings: "设置" }[page],
     ...(page === "workspace" && activeTab
       ? [`${activeTab.host.name} · ${activeTab.panes.find((p) => p.key === activeTab.activePane)?.kind === "chat" ? "对话" : "终端"}`]
@@ -349,10 +349,10 @@ export default function App() {
       <TitleBar crumbs={crumbs} />
       <div className="app">
       <nav className={`rail ${railCollapsed ? "collapsed" : ""}`} aria-label="主导航">
-        <div className="rail-brand" title={railCollapsed ? "cc-workstation · 云端 Claude Code 工作台" : undefined}>
+        <div className="rail-brand" title={railCollapsed ? "cc-remote-station · 云端 Claude Code 工作台" : undefined}>
           <Logo />
           <div className="rail-brand-text">
-            <span className="brand">cc-workstation</span>
+            <span className="brand">cc-remote-station</span>
             <span className="muted rail-tagline">云端 Claude Code 工作台</span>
           </div>
         </div>

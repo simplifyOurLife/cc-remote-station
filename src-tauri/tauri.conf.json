@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "cc-workstation",
+  "productName": "cc-remote-station",
   "version": "0.1.0",
   "identifier": "com.ccworkstation.app",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "cc-workstation",
+        "title": "cc-remote-station",
         "width": 1200,
         "height": 780,
         "minWidth": 900,

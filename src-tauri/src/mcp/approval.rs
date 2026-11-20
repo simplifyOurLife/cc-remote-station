@@ -81,7 +81,7 @@ impl Approvals {
             .notification()
             .builder()
             .title(format!("{host_name} 上的 Claude 想在本机执行命令"))
-            .body("命令执行现在是关闭的，已拒绝。需要的话到「MCP 工具箱 → cc-workstation → 命令执行」里开启。")
+            .body("命令执行现在是关闭的，已拒绝。需要的话到「MCP 工具箱 → cc-remote-station → 命令执行」里开启。")
             .show();
     }
 
@@ -107,7 +107,7 @@ impl Approvals {
             CommandMode::Off => {
                 self.notify_off(app, host_name);
                 bail!(
-                    "{host_name} 未开启本机命令执行。请提示用户在 cc-workstation「MCP 工具箱 → cc-workstation → 命令执行」里开启，或改用文件类工具。"
+                    "{host_name} 未开启本机命令执行。请提示用户在 cc-remote-station「MCP 工具箱 → cc-remote-station → 命令执行」里开启，或改用文件类工具。"
                 )
             }
             CommandMode::All => return Ok(None),

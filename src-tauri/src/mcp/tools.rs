@@ -93,7 +93,7 @@ pub fn list() -> Value {
         },
         {
             "name": "delete_file",
-            "description": "删除单个文件（删除前自动备份，可在 cc-workstation 里恢复）。不支持删除目录。",
+            "description": "删除单个文件（删除前自动备份，可在 cc-remote-station 里恢复）。不支持删除目录。",
             "inputSchema": { "type": "object", "required": ["path"], "properties": { "path": path } }
         },
         {

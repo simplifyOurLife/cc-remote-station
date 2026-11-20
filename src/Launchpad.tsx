@@ -76,7 +76,7 @@ export function Launchpad({
       <header className="launchpad-head">
         <Logo size={44} />
         <div>
-          <h2>{fresh ? "欢迎使用 cc-workstation" : "开始工作"}</h2>
+          <h2>{fresh ? "欢迎使用 cc-remote-station" : "开始工作"}</h2>
           <p className="muted">{fresh ? "在云主机上跑 Claude Code，用本机的文件和工具。按下面的清单一步步来。" : "从一台主机开始，或接着上次的对话"}</p>
         </div>
       </header>

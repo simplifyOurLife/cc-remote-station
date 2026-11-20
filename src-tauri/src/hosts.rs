@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// 改名 cc-remote-station 后仍用旧服务名：改了会读不到已保存的密码
 const KEYRING_SERVICE: &str = "cc-workstation";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
