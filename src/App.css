@@ -3147,20 +3147,181 @@ button.select:focus-visible {
   gap: 12px;
   flex-wrap: wrap;
 }
-.update-status {
-  color: var(--ink-dim, inherit);
+/* 当前版本：切角铭牌 */
+.update-ver {
+  display: inline-flex;
+  align-items: stretch;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--cyan);
+  border: 1px solid rgb(45 226 255 / 0.5);
+  clip-path: polygon(0 0, calc(100% - var(--cut-sm)) 0, 100% var(--cut-sm), 100% 100%, 0 100%);
+  padding-right: 10px;
+  text-shadow: 0 0 8px rgb(45 226 255 / 0.5);
 }
-.update-ok {
+.update-ver-label {
+  margin-right: 8px;
+  padding: 2px 6px;
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  color: var(--void);
+  background: var(--cyan);
+  text-shadow: none;
+  display: inline-flex;
+  align-items: center;
+}
+/* 状态读数：终端一行 */
+.update-readout {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--dim);
+}
+.update-prompt {
+  color: var(--wire-hi);
+}
+.update-readout.scan {
   color: var(--cyan);
 }
-.update-err {
+.update-readout.ok {
+  color: var(--mint);
+  text-shadow: 0 0 8px rgb(92 242 176 / 0.45);
+}
+.update-readout.found {
+  color: var(--magenta);
+  text-shadow: var(--glow-magenta);
+}
+.update-readout.fail {
   color: var(--red);
+}
+.update-readout:is(.scan, .ok, .found, .fail) .update-prompt {
+  color: currentColor;
+}
+.update-readout .caret {
+  animation: cursor-blink 1s steps(1) infinite;
+}
+/* 检查按钮：青色描边、等宽字；检查中乱码错位 + 扫描光，失败撕裂 */
+button.update-check-btn {
+  position: relative;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 118px;
+  justify-content: center;
+  overflow: hidden;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  color: var(--cyan);
+  border-color: rgb(45 226 255 / 0.55);
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - var(--cut-sm)), calc(100% - var(--cut-sm)) 100%, 0 100%);
+}
+button.update-check-btn:hover:not(:disabled) {
+  color: var(--void);
+  background: var(--cyan);
+  box-shadow: 0 0 16px rgb(45 226 255 / 0.5);
+}
+.update-check-glyph {
+  display: inline-block;
+  font-size: 14px;
+  line-height: 1;
+}
+button.update-check-btn.busy:disabled {
+  opacity: 1;
+  cursor: progress;
+  background: rgb(45 226 255 / 0.08);
+  box-shadow: inset 0 0 12px rgb(45 226 255 / 0.25);
+}
+.update-check-btn.busy .update-check-glyph {
+  animation: update-spin 0.8s linear infinite;
+}
+.update-check-btn.busy .update-check-text {
+  animation: glitch-text 0.16s steps(2) infinite;
+}
+.update-check-btn.busy::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, rgb(45 226 255 / 0.35), transparent);
+  animation: update-sweep 0.9s linear infinite;
+  pointer-events: none;
+}
+button.update-check-btn.fail {
+  color: var(--red);
+  border-color: var(--red);
+  animation: glitch-tear 0.45s steps(1);
+}
+@keyframes update-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes update-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(260%); }
+}
+.save-hud.found {
+  color: var(--magenta);
+  text-shadow: var(--glow-magenta);
+}
+/* 报错块：红色切角面板 + 扫描线，出现时闪烁撕裂 */
+.update-alert {
+  position: relative;
+  margin: 12px 0 4px;
+  padding: 10px 14px 10px 16px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink);
+  background:
+    repeating-linear-gradient(0deg, rgb(255 84 112 / 0.05) 0 1px, transparent 1px 3px),
+    rgb(255 84 112 / 0.08);
+  border: 1px solid rgb(255 84 112 / 0.45);
+  border-left: 3px solid var(--red);
+  clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
+  animation: update-alert-in 0.5s steps(1);
+}
+.update-alert-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--red);
+  text-shadow: 0 0 8px rgb(255 84 112 / 0.6);
+}
+.update-alert-tag {
+  padding: 0 6px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  color: var(--void);
+  background: var(--red);
+  text-shadow: none;
+}
+.update-alert-msg {
   word-break: break-word;
 }
-.update-check-btn {
-  flex-shrink: 0;
-  white-space: nowrap;
-  min-width: 84px;
+.update-alert-msg::before {
+  content: "> ";
+  color: var(--red);
+}
+.update-alert-hint {
+  margin-top: 4px;
+  color: var(--dim);
+}
+@keyframes update-alert-in {
+  0% { opacity: 0; transform: translateX(-6px) skewX(-6deg); filter: hue-rotate(40deg); }
+  15% { opacity: 1; transform: translateX(4px); }
+  30% { opacity: 0.4; transform: translateX(-2px) skewX(3deg); filter: none; }
+  45% { opacity: 1; transform: none; }
+  60% { opacity: 0.7; }
+  75%, 100% { opacity: 1; transform: none; }
 }
 .dialog.update-dialog {
   width: min(560px, calc(100vw - 32px));

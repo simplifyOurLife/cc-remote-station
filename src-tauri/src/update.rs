@@ -43,7 +43,13 @@ fn updater(app: &AppHandle, proxy: &str) -> anyhow::Result<tauri_plugin_updater:
 
 #[tauri::command]
 pub async fn update_check(app: AppHandle, pending: State<'_, Pending>, proxy: String) -> CmdResult<Option<UpdateInfo>> {
-    let update = updater(&app, &proxy)?.check().await.map_err(|e| anyhow::anyhow!("检查更新失败：{e}"))?;
+    let update = match updater(&app, &proxy)?.check().await {
+        Ok(u) => u,
+        // 连上了但发布源没给出版本清单（如 404：还没有正式发布的版本，草稿不算），对用户就是没有新版本
+        Err(tauri_plugin_updater::Error::ReleaseNotFound) => None,
+        Err(tauri_plugin_updater::Error::Reqwest(err)) => return Err(anyhow::anyhow!("连不上 GitHub：{err}。可以在下方填代理后重试").into()),
+        Err(e) => return Err(anyhow::anyhow!("检查更新失败：{e}").into()),
+    };
     let info = update.as_ref().map(|u| UpdateInfo {
         version: u.version.clone(),
         current: u.current_version.clone(),

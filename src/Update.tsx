@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { noise } from "./SaveButton";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api, errorText, UpdateInfo, UpdateProgress } from "./api";
@@ -22,9 +23,11 @@ export interface Updater {
   /** 上次检查的结果：未检查 / 已是最新 / 有新版本 / 出错 */
   status: "idle" | "latest" | "found" | "error";
   error: string;
+  /** 上次检查完成的时刻（HH:MM:SS） */
+  checkedAt: string;
   proxy: string;
   setProxy: (p: string) => void;
-  check: () => Promise<void>;
+  check: () => Promise<Updater["status"]>;
 }
 
 /** 启动 5 秒后悄悄检查一次（失败不打扰，只在设置页显示），设置页可手动再查 */
@@ -34,6 +37,7 @@ export function useUpdater(): Updater {
   const [checking, setChecking] = useState(false);
   const [status, setStatus] = useState<Updater["status"]>("idle");
   const [error, setError] = useState("");
+  const [checkedAt, setCheckedAt] = useState("");
   const [proxy, setProxyState] = useState(loadProxy);
 
   const setProxy = (p: string) => {
@@ -48,16 +52,19 @@ export function useUpdater(): Updater {
   const check = useCallback(async () => {
     setChecking(true);
     setError("");
+    let result: Updater["status"];
     try {
       const found = await api.updateCheck(loadProxy());
       setInfo(found);
-      setStatus(found ? "found" : "latest");
+      result = found ? "found" : "latest";
     } catch (e) {
       setError(errorText(e));
-      setStatus("error");
-    } finally {
-      setChecking(false);
+      result = "error";
     }
+    setStatus(result);
+    setCheckedAt(new Date().toLocaleTimeString("zh-CN", { hour12: false }));
+    setChecking(false);
+    return result;
   }, []);
 
   useEffect(() => {
@@ -68,7 +75,7 @@ export function useUpdater(): Updater {
     return () => clearTimeout(t);
   }, [check]);
 
-  return { current, info, checking, status, error, proxy, setProxy, check };
+  return { current, info, checking, status, error, checkedAt, proxy, setProxy, check };
 }
 
 const mb = (n: number) => (n / 1048576).toFixed(1);
@@ -125,11 +132,7 @@ export function UpdateDialog({ info, openTabs, onClose }: { info: UpdateInfo; op
           </p>
         )}
         {error && (
-          <p className="update-err small">
-            {error}
-            <br />
-            连不上 GitHub 的话，可以在「设置 → 在线升级」里填代理，或者到发布页手动下载安装包。
-          </p>
+          <UpdateAlert key={error} title="升级中断" message={error} hint="连不上 GitHub 的话，可以在「设置 → 在线升级」里填代理，或者到发布页手动下载安装包。" />
         )}
         <div className="dialog-actions">
           <button disabled={installing} onClick={onClose}>
@@ -146,26 +149,96 @@ export function UpdateDialog({ info, openTabs, onClose }: { info: UpdateInfo; op
   );
 }
 
+/** 终端风报错块：红色切角面板 + 扫描线，出现时信号撕裂一下 */
+function UpdateAlert({ title, message, hint }: { title: string; message: string; hint?: string }) {
+  return (
+    <div className="update-alert" role="alert">
+      <div className="update-alert-head">
+        <span className="update-alert-tag">ERR</span>
+        {title}
+      </div>
+      <div className="update-alert-msg">{message}</div>
+      {hint && <div className="update-alert-hint">{hint}</div>}
+    </div>
+  );
+}
+
+/** 检查时按钮文字乱码跳动（红青错位），完成后按钮上方飘一行回执；失败时按钮撕裂一下 */
+function CheckButton({ checking, onCheck }: { checking: boolean; onCheck: () => Promise<Updater["status"]> }) {
+  const label = "检查更新";
+  const [text, setText] = useState(label);
+  const [result, setResult] = useState<{ status: Updater["status"]; n: number } | null>(null);
+  const [hudOn, setHudOn] = useState(false);
+  const timer = useRef(0);
+
+  useEffect(() => {
+    if (!checking) {
+      setText(label);
+      return;
+    }
+    timer.current = window.setInterval(() => setText(noise(label.length + 2)), 50);
+    return () => clearInterval(timer.current);
+  }, [checking]);
+
+  const click = async () => {
+    setHudOn(false);
+    // 至少跳 0.4 秒乱码，结果回来太快看不到扫描感
+    const [status] = await Promise.all([onCheck(), new Promise((r) => setTimeout(r, 400))]);
+    setResult({ status, n: Date.now() });
+    setHudOn(true);
+  };
+
+  const hud = result && {
+    latest: { cls: "ok", text: "> UPLINK OK · 已是最新" },
+    found: { cls: "found", text: "> NEW BUILD DETECTED" },
+    error: { cls: "fail", text: "> SIGNAL LOST ✕" },
+    idle: null,
+  }[result.status];
+  const failed = !checking && result?.status === "error";
+
+  return (
+    <span className="save-wrap">
+      {hudOn && hud && (
+        <span key={result!.n} className={`save-hud ${hud.cls}`} onAnimationEnd={() => setHudOn(false)}>
+          {hud.text}
+        </span>
+      )}
+      <button
+        key={failed ? result!.n : "btn"}
+        className={`update-check-btn${checking ? " busy" : ""}${failed ? " fail" : ""}`}
+        disabled={checking}
+        onClick={click}
+      >
+        <span className="update-check-glyph">⟳</span>
+        <span className="update-check-text">{text}</span>
+      </button>
+    </span>
+  );
+}
+
 /** 设置页里的「在线升级」：当前版本、手动检查、下载代理 */
 export function UpdatePanel({ updater, onShow }: { updater: Updater; onShow: () => void }) {
-  const { current, info, checking, status, error, proxy, setProxy, check } = updater;
+  const { current, info, checking, status, error, checkedAt, proxy, setProxy, check } = updater;
+  const readout = checking
+    ? { cls: "scan", text: "正在连接发布源 github.com" }
+    : status === "latest"
+      ? { cls: "ok", text: `已是最新版本 · ${checkedAt}` }
+      : status === "found" && info
+        ? { cls: "found", text: `检测到新版本 v${info.version}${info.date ? ` · ${info.date} 发布` : ""}` }
+        : status === "error"
+          ? { cls: "fail", text: `检查失败 · ${checkedAt}` }
+          : { cls: "", text: "尚未检查" };
   return (
     <section className="page-card host-form update-panel">
       <h3>在线升级</h3>
       <div className="update-row">
-        <span>
-          当前版本 <b>v{current || "…"}</b>
+        <span className="update-ver" title="当前版本">
+          <span className="update-ver-label">BUILD</span>v{current || "…"}
         </span>
-        <span className="update-status small">
-          {checking
-            ? "正在检查…"
-            : status === "latest"
-              ? "已是最新版本"
-              : status === "found" && info
-                ? <span className="update-ok">有新版本 v{info.version}</span>
-                : status === "error"
-                  ? <span className="update-err">{error}</span>
-                  : ""}
+        <span className={`update-readout ${readout.cls}`}>
+          <span className="update-prompt">›_</span>
+          {readout.text}
+          {checking && <span className="caret">▌</span>}
         </span>
         <div className="grow" />
         {status === "found" && info && (
@@ -173,10 +246,9 @@ export function UpdatePanel({ updater, onShow }: { updater: Updater; onShow: () 
             查看并升级
           </button>
         )}
-        <button className="update-check-btn" disabled={checking} onClick={check}>
-          {checking ? "检查中" : "检查更新"}
-        </button>
+        <CheckButton checking={checking} onCheck={check} />
       </div>
+      {status === "error" && !checking && <UpdateAlert key={checkedAt} title="检查更新失败" message={error} />}
       <label>
         下载代理：
         <input value={proxy} placeholder="留空跟随系统代理，如 http://127.0.0.1:7890" spellCheck={false} onChange={(e) => setProxy(e.target.value)} />

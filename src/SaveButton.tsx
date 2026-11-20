@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 const GLYPHS = "#%@!&$*<>/\\|=+?01アカサタナ";
-const noise = (n: number) => Array.from({ length: n }, () => GLYPHS[Math.floor(Math.random() * GLYPHS.length)]).join("");
+export const noise = (n: number) => Array.from({ length: n }, () => GLYPHS[Math.floor(Math.random() * GLYPHS.length)]).join("");
 const clock = () => new Date().toLocaleTimeString("zh-CN", { hour12: false });
 
 /**
