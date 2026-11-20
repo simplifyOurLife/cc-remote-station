@@ -22,6 +22,7 @@ import { SshPromptHost } from "./SshPrompt";
 import { CommandConfirmHost } from "./CommandConfirm";
 import { Launchpad } from "./Launchpad";
 import { useOnboarding } from "./onboarding";
+import { UpdateDialog, UpdatePanel, useUpdater } from "./Update";
 import { kbd, modKey } from "./platform";
 import { ShortcutsPanel } from "./ShortcutsPanel";
 import { ContextMenuHost, openMenu } from "./ContextMenu";
@@ -263,6 +264,8 @@ export default function App() {
 
   const toolbox = access?.toolbox ?? [];
   const onboarding = useOnboarding(hosts, hasOpened, access);
+  const updater = useUpdater();
+  const [showUpdate, setShowUpdate] = useState(false);
   const attention = tabs.some((t) => t.attention);
   const mcpError = [...mcpStatus.values()].some((s) => forwardState(s) === "error");
 
@@ -372,7 +375,23 @@ export default function App() {
           </>,
         )}
         {navItem("toolbox", "▦", "MCP 工具箱", mcpError && <span className="mcp-dot error" title="有主机的端口映射建立失败" />)}
-        {navItem("settings", "⚙", "设置")}
+        {navItem(
+          "settings",
+          "⚙",
+          "设置",
+          updater.info && (
+            <span
+              className="rail-count rail-update"
+              title={`有新版本 v${updater.info.version}，点击查看`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowUpdate(true);
+              }}
+            >
+              新版本
+            </span>
+          ),
+        )}
         <div className="grow" />
         <button
           className="rail-foot activity-line"
@@ -499,9 +518,10 @@ export default function App() {
             <header className="page-head">
               <div>
                 <h1>设置</h1>
-                <p className="muted">终端的外观和快捷命令，保存后立即作用到所有已打开的终端。</p>
+                <p className="muted">在线升级，以及终端的外观和快捷命令（保存后立即作用到所有已打开的终端）。</p>
               </div>
             </header>
+            <UpdatePanel updater={updater} onShow={() => setShowUpdate(true)} />
             <PrefsPanel prefs={prefs} onSave={savePrefs} />
           </div>
         )}
@@ -715,6 +735,7 @@ export default function App() {
       <ModalHost />
       <SshPromptHost />
       <CommandConfirmHost />
+      {showUpdate && updater.info && <UpdateDialog info={updater.info} openTabs={tabs.length} onClose={() => setShowUpdate(false)} />}
       <TooltipLayer />
       <ContextMenuHost />
       {showKeys && <ShortcutsPanel onClose={() => setShowKeys(false)} />}

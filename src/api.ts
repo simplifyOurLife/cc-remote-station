@@ -241,6 +241,18 @@ export interface OpenOptions {
   session: string | null;
 }
 
+export interface UpdateInfo {
+  version: string;
+  current: string;
+  notes: string;
+  date: string | null;
+}
+
+export interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
+}
+
 export const api = {
   hostsList: () => invoke<Host[]>("hosts_list"),
   /** secret: undefined 不改；"" 删除；其他写入系统凭据管理器 */
@@ -257,6 +269,14 @@ export const api = {
   sshPromptAnswer: (id: string, answers: string[] | null) => invoke<void>("ssh_prompt_answer", { id, answers }),
   /** 检查云主机环境：claude 是否安装、是否登录、有没有 tmux；没连接会自动连上 */
   hostCheck: (hostId: string) => invoke<HostCheck>("host_check", { hostId }),
+  /** 检查新版本；proxy 为空走系统代理；没有新版本返回 null */
+  updateCheck: (proxy: string) => invoke<UpdateInfo | null>("update_check", { proxy }),
+  /** 下载并安装刚检查到的版本，完成后应用重启 */
+  updateInstall: (onProgress: (p: UpdateProgress) => void) => {
+    const ch = new Channel<UpdateProgress>();
+    ch.onmessage = onProgress;
+    return invoke<void>("update_install", { onProgress: ch });
+  },
   /** 回答命令确认弹窗；always 时 rule 加进白名单 */
   commandConfirmAnswer: (id: string, decision: "once" | "always" | "deny", rule: string | null) =>
     invoke<void>("command_confirm_answer", { id, decision, rule }),

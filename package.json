@@ -2,6 +2,8 @@
   "name": "cc-workstation",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
+  "author": "qiyifeng",
   "type": "module",
   "scripts": {
     "dev": "vite",

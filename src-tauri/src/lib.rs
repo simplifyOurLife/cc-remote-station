@@ -4,6 +4,7 @@ mod mcp;
 mod settings;
 mod ssh;
 mod terminal;
+mod update;
 
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
@@ -971,6 +972,8 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(update::Pending::default())
         // 点关闭（标题栏 ✕、Alt+F4、任务栏关闭、macOS 红灯）不退出，缩到托盘；真正退出走托盘菜单（macOS 还有 ⌘Q）
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1022,6 +1025,8 @@ pub fn run() {
             claude_mcp_apply,
             command_confirm_answer,
             host_check,
+            update::update_check,
+            update::update_install,
             terminal_open,
             ssh_prompt_answer,
             terminal_write,

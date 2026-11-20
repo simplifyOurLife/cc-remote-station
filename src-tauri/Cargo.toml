@@ -2,7 +2,8 @@
 name = "cc-workstation"
 version = "0.1.0"
 description = "SSH workstation tuned for remote Claude Code"
-authors = ["cc-workstation"]
+authors = ["qiyifeng"]
+license = "MIT"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -49,6 +50,7 @@ base64 = "0.23.1"
 flate2 = "1"
 # 工具箱「测试连接」访问 HTTP MCP；rustls 走 ring，和 russh 共用，不引入 OpenSSL/aws-lc
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tauri-plugin-updater = "2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

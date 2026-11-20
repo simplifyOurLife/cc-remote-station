@@ -3133,6 +3133,78 @@ button.select:focus-visible {
 .command-confirm-rule input {
   font-family: "JetBrains Mono", Consolas, Menlo, monospace;
 }
+/* 在线升级 */
+.rail-count.rail-update {
+  width: auto;
+  cursor: pointer;
+  color: var(--void);
+  background: var(--magenta);
+  box-shadow: 0 0 8px rgb(255 61 154 / 0.6);
+}
+.update-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.update-status {
+  color: var(--ink-dim, inherit);
+}
+.update-ok {
+  color: var(--cyan);
+}
+.update-err {
+  color: var(--red);
+  word-break: break-word;
+}
+.update-check-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+  min-width: 84px;
+}
+.dialog.update-dialog {
+  width: min(560px, calc(100vw - 32px));
+}
+.update-notes {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  max-height: 40vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink);
+  background: var(--void);
+  border-left: 2px solid var(--magenta);
+}
+.update-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.update-bar {
+  position: relative;
+  height: 6px;
+  overflow: hidden;
+  background: var(--void);
+  border: 1px solid rgb(45 226 255 / 0.3);
+}
+.update-bar-fill {
+  height: 100%;
+  background: var(--cyan);
+  box-shadow: 0 0 8px rgb(45 226 255 / 0.7);
+  transition: width 0.2s;
+}
+.update-bar-fill.indeterminate {
+  width: 30%;
+  animation: update-slide 1.2s ease-in-out infinite;
+}
+@keyframes update-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(340%); }
+}
 /* 内置工具设置：顶部三个标签，下面一次只显示一块 */
 .builtin-settings {
   padding: 14px 16px 12px;
