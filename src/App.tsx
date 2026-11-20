@@ -7,7 +7,7 @@ import { ChatView } from "./ChatView";
 import { api, AuditEntry, ChatSession, errorText, forwardState, Host, hostToolbox, McpHostStatus, Settings } from "./api";
 import { HostForm } from "./HostForm";
 import { HostsPage } from "./HostsPage";
-import { HostMcpDialog, McpStep } from "./HostMcpDialog";
+import { HostMcpDialog, McpTab } from "./HostMcpDialog";
 import { ImportDialog } from "./ImportDialog";
 import { Logo } from "./Logo";
 import { PrefsPanel } from "./PrefsPanel";
@@ -19,6 +19,9 @@ import { TooltipLayer } from "./Tooltip";
 import { TitleBar } from "./TitleBar";
 import { PopupMenu } from "./PopupMenu";
 import { SshPromptHost } from "./SshPrompt";
+import { CommandConfirmHost } from "./CommandConfirm";
+import { Launchpad } from "./Launchpad";
+import { useOnboarding } from "./onboarding";
 import { kbd, modKey } from "./platform";
 import { ShortcutsPanel } from "./ShortcutsPanel";
 import { ContextMenuHost, openMenu } from "./ContextMenu";
@@ -56,8 +59,8 @@ type Dialog =
   | { kind: "host"; host: Host | null }
   | { kind: "import" }
   | { kind: "tmux"; host: Host }
-  /** 主机的 MCP 配置：① 选工具 → ② 写入 Claude */
-  | { kind: "mcp"; host: Host; step: McpStep };
+  /** 主机的 MCP 弹窗：端口转发 / Claude 注册两个标签页 */
+  | { kind: "mcp"; host: Host; tab: McpTab };
 
 const newKey = () => crypto.randomUUID().replace(/-/g, "");
 const OPENED_KEY = "ccws.hasOpened";
@@ -241,9 +244,9 @@ export default function App() {
     ctl.focus();
   };
 
-  /** 打开主机的 MCP 弹窗：已选好工具就直接到「写入 Claude」，否则从「选择工具」开始 */
+  /** 打开主机的 MCP 弹窗：已有转发就到「Claude 注册」，否则到「端口转发」 */
   const setupClaude = (host: Host) =>
-    setDialog({ kind: "mcp", host, step: host.mcp && hostToolbox(host).length > 0 ? 2 : 1 });
+    setDialog({ kind: "mcp", host, tab: host.mcp && hostToolbox(host).length > 0 ? "reg" : "fwd" });
 
   const remove = async (host: Host) => {
     if (
@@ -259,7 +262,7 @@ export default function App() {
   };
 
   const toolbox = access?.toolbox ?? [];
-  const accessReady = !!access && (access.roots.length > 0 || toolbox.some((i) => i.enabled)) && hosts.some((h) => h.mcp);
+  const onboarding = useOnboarding(hosts, hasOpened, access);
   const attention = tabs.some((t) => t.attention);
   const mcpError = [...mcpStatus.values()].some((s) => forwardState(s) === "error");
 
@@ -360,6 +363,11 @@ export default function App() {
           "工作区",
           <>
             {tabs.length > 0 && <span className="rail-count">{tabs.length}</span>}
+            {!onboarding.hidden && onboarding.done < onboarding.total && (
+              <span className="rail-count rail-onboard" title="上手清单进度；工作区没有标签时显示清单">
+                上手 {onboarding.done}/{onboarding.total}
+              </span>
+            )}
             {attention && <span className="tab-dot" title="有后台标签在等你" />}
           </>,
         )}
@@ -410,8 +418,6 @@ export default function App() {
           <HostsPage
             hosts={hosts}
             mcpStatus={mcpStatus}
-            hasOpened={hasOpened}
-            accessReady={accessReady}
             onAdd={() => setDialog({ kind: "host", host: null })}
             onImport={() => setDialog({ kind: "import" })}
             onEdit={(h) => setDialog({ kind: "host", host: h })}
@@ -420,8 +426,7 @@ export default function App() {
             onChat={(h) => openTab(h, undefined, "chat")}
             onSessions={(h) => setDialog({ kind: "tmux", host: h })}
             onSetupClaude={setupClaude}
-            onTools={(h) => setDialog({ kind: "mcp", host: h, step: 1 })}
-            onGoAccess={() => setPage("toolbox")}
+            onTools={(h) => setDialog({ kind: "mcp", host: h, tab: "fwd" })}
           />
         )}
 
@@ -688,11 +693,19 @@ export default function App() {
               </div>
             ))}
             {tabs.length === 0 && (
-              <div className="placeholder workspace-empty">
-                <div>这里会显示你打开的对话和终端</div>
-                <button className="primary" onClick={() => setPage("hosts")}>
-                  去选一台主机
-                </button>
+              <div className="placeholder launchpad-bg">
+                <Launchpad
+                  hosts={hosts}
+                  mcpStatus={mcpStatus}
+                  onboarding={onboarding}
+                  onImport={() => setDialog({ kind: "import" })}
+                  onTerminal={(h) => openTab(h)}
+                  onChat={(h, s) => openTab(h, undefined, "chat", s)}
+                  onAllHosts={() => setPage("hosts")}
+                  onAddHost={() => setDialog({ kind: "host", host: null })}
+                  onToolbox={() => setPage("toolbox")}
+                  onShortcuts={() => setShowKeys(true)}
+                />
               </div>
             )}
           </div>
@@ -701,6 +714,7 @@ export default function App() {
 
       <ModalHost />
       <SshPromptHost />
+      <CommandConfirmHost />
       <TooltipLayer />
       <ContextMenuHost />
       {showKeys && <ShortcutsPanel onClose={() => setShowKeys(false)} />}
@@ -719,7 +733,7 @@ export default function App() {
           host={dialog.host}
           settings={access}
           status={mcpStatus.get(dialog.host.id)}
-          initialStep={dialog.step}
+          initialTab={dialog.tab}
           onHostSaved={() => reload()}
           onClose={() => setDialog(null)}
           onManage={() => {
@@ -738,12 +752,10 @@ export default function App() {
           onClose={() => setDialog(null)}
         />
       )}
-      {dialog?.kind === "host" && access && (
+      {dialog?.kind === "host" && (
         <HostForm
           initial={dialog.host}
           hosts={hosts}
-          settings={access}
-          status={dialog.host ? mcpStatus.get(dialog.host.id) : undefined}
           onCancel={() => setDialog(null)}
           onSaved={() => {
             setDialog(null);

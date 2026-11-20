@@ -3,15 +3,10 @@ import { describeForwards, forwardState, Host, hostToolbox, McpHostStatus, toolL
 import { PopupMenu } from "./PopupMenu";
 
 const UNGROUPED = "未分组";
-const GUIDE_HIDDEN_KEY = "ccws.guideHidden";
 
 interface Props {
   hosts: Host[];
   mcpStatus: Map<string, McpHostStatus>;
-  /** 是否已经打开过终端或对话（引导第 2 步） */
-  hasOpened: boolean;
-  /** 是否已准备好工具箱：有允许的目录或启用的 MCP，且有主机开启了工具箱（引导第 3 步） */
-  accessReady: boolean;
   onAdd: () => void;
   onImport: () => void;
   onEdit: (h: Host) => void;
@@ -22,46 +17,15 @@ interface Props {
   onSetupClaude: (h: Host) => void;
   /** 单独配置这台主机用哪些 MCP 工具 */
   onTools: (h: Host) => void;
-  onGoAccess: () => void;
 }
 
-function guideHidden() {
-  try {
-    return localStorage.getItem(GUIDE_HIDDEN_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-/** 首页：开始使用引导 + 主机卡片。每台主机的两个主操作（对话 / 终端）始终可见，其余收进 ⋯ 菜单 */
+/** 主机页：主机卡片（上手清单在工作区启动台）。每台主机的两个主操作（对话 / 终端）始终可见，其余收进 ⋯ 菜单 */
 export function HostsPage(p: Props) {
   const [filter, setFilter] = useState("");
   const [menu, setMenu] = useState<string | null>(null);
   /** 当前打开菜单的那个 ⋯ 按钮，菜单按它定位 */
   const menuBtn = useRef<HTMLButtonElement>(null);
   const closeMenu = useCallback(() => setMenu(null), []);
-  const [hideGuide, setHideGuide] = useState(guideHidden);
-
-  const steps = [
-    { done: p.hosts.length > 0, title: "添加一台云主机", hint: "填地址和登录方式，或从 ~/.ssh/config 导入已有的主机" },
-    { done: p.hasOpened, title: "开始对话或打开终端", hint: "对话：用图形界面和云端 Claude Code 协作；终端：像 SSH 一样操作云主机" },
-    {
-      done: p.accessReady,
-      title: "把本机工具交给云端 Claude（可选）",
-      hint: "在 MCP 工具箱里指定目录或添加本机 MCP，云端 Claude Code 就能读写你本机的项目、使用本机的浏览器等工具",
-    },
-  ];
-  const allDone = steps.every((s) => s.done);
-  const showGuide = !hideGuide && !allDone;
-
-  const dismissGuide = () => {
-    setHideGuide(true);
-    try {
-      localStorage.setItem(GUIDE_HIDDEN_KEY, "1");
-    } catch {
-      // 存不下只是下次还会显示
-    }
-  };
 
   const grouped = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -117,7 +81,7 @@ export function HostsPage(p: Props) {
                 )}
                 <div className="menu-item" onClick={() => p.onSetupClaude(h)}>
                   <span>MCP 工具</span>
-                  <span className="muted menu-hint">选择工具并写入云端 Claude</span>
+                  <span className="muted menu-hint">端口转发、注册到云端 Claude</span>
                 </div>
                 <div className="menu-item danger" onClick={() => p.onDelete(h)}>
                   删除主机
@@ -136,10 +100,10 @@ export function HostsPage(p: Props) {
           {h.tmux && <span>保持会话</span>}
           <button
             className={`tag-access tag-button ${h.mcp ? "" : "off"}`}
-            title={h.mcp ? `使用的工具：${hostToolbox(h).map(toolLabel).join("、") || "无"}\n点击修改` : "未使用 MCP 工具箱，点击配置"}
+            title={h.mcp ? `连接时转发的工具：${hostToolbox(h).map(toolLabel).join("、") || "无"}\n点击修改` : "未转发 MCP 工具，点击配置"}
             onClick={() => p.onTools(h)}
           >
-            ▦ 工具箱 {h.mcp ? hostToolbox(h).length : "未用"}
+            ⇄ MCP 转发 {h.mcp ? hostToolbox(h).length : "未开"}
           </button>
         </div>
         <footer className="host-card-actions">
@@ -160,38 +124,6 @@ export function HostsPage(p: Props) {
           <p className="muted">开始对话，用图形界面和云端 Claude Code 协作。</p>
         </div>
       </header>
-
-      {showGuide && (
-        <section className="guide">
-          <div className="guide-head">
-            <h3>开始使用</h3>
-            <button className="link" onClick={dismissGuide}>
-              不再显示
-            </button>
-          </div>
-          <ol className="guide-steps">
-            {steps.map((s, i) => (
-              <li key={s.title} className={s.done ? "done" : ""}>
-                <span className="guide-mark">{s.done ? "✓" : i + 1}</span>
-                <div className="grow">
-                  <div className="guide-title">{s.title}</div>
-                  <div className="muted">{s.hint}</div>
-                </div>
-                {!s.done && i === 0 && (
-                  <div className="row">
-                    <button onClick={p.onImport}>从 ssh config 导入</button>
-                    <button className="primary" onClick={p.onAdd}>
-                      添加主机
-                    </button>
-                  </div>
-                )}
-                {!s.done && i === 1 && p.hosts.length > 0 && <span className="muted">在下方主机卡片上点「开始对话」</span>}
-                {!s.done && i === 2 && <button onClick={p.onGoAccess}>去设置</button>}
-              </li>
-            ))}
-          </ol>
-        </section>
-      )}
 
       {p.hosts.length > 0 && (
         <div className="page-toolbar">
@@ -226,8 +158,7 @@ export function HostsPage(p: Props) {
         </section>
       ))}
       {p.hosts.length > 0 && grouped.length === 0 && <p className="muted">没有匹配「{filter}」的主机</p>}
-      {/* 引导被关掉、又没有主机时，也要有地方添加 */}
-      {p.hosts.length === 0 && !showGuide && (
+      {p.hosts.length === 0 && (
         <section className="hosts-empty">
           <h3>还没有主机</h3>
           <p className="muted">添加一台云主机，或从 ~/.ssh/config 导入已有的主机。</p>

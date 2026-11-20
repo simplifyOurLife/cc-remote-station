@@ -14,25 +14,44 @@ export interface Host {
   tmux: boolean;
   /** 允许该主机上的 Claude Code 经反向转发使用本机 MCP */
   mcp: boolean;
-  /** 这台主机用的工具及在这台主机上改过的云端名字/端口；null 表示只用内置工具 */
+  /** 这台主机转发的工具及在这台主机上改过的云端端口；null 表示只转发内置工具 */
   tools?: HostTool[] | null;
   /** 侧栏分组名，null 表示未分组 */
   group: string | null;
   /** 默认工作目录（云主机路径），新终端和新对话从这里开始 */
   dir: string | null;
+  /** 这台主机上的 Claude 执行本机命令的管控模式；null 跟随全局 */
+  commandMode?: CommandMode | null;
 }
 
-/** 主机上的一个工具：alias / remotePort 为空表示用工具箱里的默认值 */
+/** 云端执行本机命令的管控模式 */
+export type CommandMode = "off" | "confirm" | "allowlist" | "all";
+
+export const COMMAND_MODES: { value: CommandMode; label: string; hint: string }[] = [
+  { value: "off", label: "关闭", hint: "不允许执行命令" },
+  { value: "confirm", label: "每条确认", hint: "每条命令都在本机弹窗确认，60 秒无人处理则拒绝" },
+  { value: "allowlist", label: "白名单 + 确认", hint: "白名单里的直接执行，其余弹窗确认" },
+  { value: "all", label: "全部允许", hint: "不确认直接执行，只用于完全信任的主机" },
+];
+
+export const commandModeLabel = (m: CommandMode) => COMMAND_MODES.find((x) => x.value === m)?.label ?? m;
+
+/** 主机转发的一个工具：remotePort 为空表示用工具箱里的默认映射端口 */
 export interface HostTool {
   name: string;
-  alias: string;
   remotePort: number | null;
 }
+
+/** settings_save 接收的字段 */
+export type SettingsField = "roots" | "commandMode" | "commandAllowlist" | "remotePort" | "device" | "builtinAlias";
 
 export interface Settings {
   token: string;
   roots: string[];
-  allowCommands: boolean;
+  /** 云端执行本机命令的全局模式；主机可单独设 */
+  commandMode: CommandMode;
+  /** 白名单：按词匹配命令开头，如 git、npm run build */
+  commandAllowlist: string[];
   remotePort: number;
   /** 这台电脑的标识；设了就加在云端 MCP 名字后面（ccws-home），多台电脑连同一主机不互相覆盖 */
   device: string;
@@ -147,8 +166,8 @@ export interface ClaudeMcpState {
   global: Record<string, string>;
   /** 所选项目已配置的 MCP */
   project: Record<string, string>;
-  /** 这台主机勾选的工具应配的地址 */
-  wanted: { name: string; cloudName: string; url: string | null; error: string | null }[];
+  /** 这台主机转发的工具应配的地址；defaultName 是工具箱里的默认映射名称 */
+  wanted: { name: string; defaultName: string; url: string | null; error: string | null }[];
 }
 
 /** 一条工具箱端口映射在某台主机上的建立结果 */
@@ -177,6 +196,13 @@ export function describeForwards(st: McpHostStatus): string {
   return st.forwards
     .map((f) => `${f.error ? "✕" : "✓"} ${f.name}：云端 127.0.0.1:${f.remotePort} → 本机 ${f.target}${f.error ? `\n   ${f.error}` : ""}`)
     .join("\n");
+}
+
+export interface HostCheck {
+  /** claude --version 的输出；没装为 null */
+  claude: string | null;
+  loggedIn: boolean;
+  tmux: boolean;
 }
 
 export interface ChatSession {
@@ -229,13 +255,18 @@ export const api = {
   terminalClose: (id: string, killSession = false) => invoke<void>("terminal_close", { id, killSession }),
   /** 回答登录中途的验证码弹窗；null 表示取消 */
   sshPromptAnswer: (id: string, answers: string[] | null) => invoke<void>("ssh_prompt_answer", { id, answers }),
+  /** 检查云主机环境：claude 是否安装、是否登录、有没有 tmux；没连接会自动连上 */
+  hostCheck: (hostId: string) => invoke<HostCheck>("host_check", { hostId }),
+  /** 回答命令确认弹窗；always 时 rule 加进白名单 */
+  commandConfirmAnswer: (id: string, decision: "once" | "always" | "deny", rule: string | null) =>
+    invoke<void>("command_confirm_answer", { id, decision, rule }),
   notify: (title: string, body: string) => invoke<void>("notify", { title, body }),
   /** 剪贴板有图片则上传到远端并返回路径，没有图片返回 null */
   terminalPasteImage: (id: string) => invoke<string | null>("terminal_paste_image", { id }),
   tmuxSessions: (hostId: string) => invoke<TmuxSession[]>("tmux_sessions", { hostId }),
   tmuxKill: (hostId: string, name: string) => invoke<void>("tmux_kill", { hostId, name }),
   settingsGet: () => invoke<Settings>("settings_get"),
-  settingsSave: (patch: Pick<Settings, "roots" | "allowCommands" | "remotePort" | "device" | "builtinAlias">) => invoke<Settings>("settings_save", { patch }),
+  settingsSave: (patch: Pick<Settings, SettingsField>) => invoke<Settings>("settings_save", { patch }),
   settingsRegenToken: () => invoke<Settings>("settings_regen_token"),
   toolboxSave: (items: ToolboxItem[]) => invoke<ToolboxItem[]>("toolbox_save", { items }),
   toolboxImportScan: () => invoke<ImportCandidate[]>("toolbox_import_scan"),
@@ -246,8 +277,8 @@ export const api = {
   mcpLocalPort: () => invoke<number>("mcp_local_port"),
   /** 读云端 ~/.claude.json 里的 MCP 配置并和应配的对比；没连接会自动连上。dir 为 null 只看全局 */
   claudeMcpState: (hostId: string, dir: string | null) => invoke<ClaudeMcpState>("claude_mcp_state", { hostId, dir }),
-  /** dir 为 null 写全局（user），否则写该项目（local） */
-  claudeMcpApply: (hostId: string, dir: string | null, add: string[], remove: string[]) =>
+  /** dir 为 null 写全局（user），否则写该项目（local）；remove 是 Claude 里已有的名字 */
+  claudeMcpApply: (hostId: string, dir: string | null, add: { name: string; cloudName: string }[], remove: string[]) =>
     invoke<string>("claude_mcp_apply", { hostId, dir, add, remove }),
   uiPrefsGet: () => invoke<Record<string, unknown>>("ui_prefs_get"),
   uiPrefsSet: (prefs: unknown) => invoke<void>("ui_prefs_set", { prefs }),
@@ -277,7 +308,7 @@ export const api = {
 
 /** 主机用的工具；从没配过时只有内置工具 */
 export function hostTools(h: Host): HostTool[] {
-  return h.tools ?? [{ name: BUILTIN_NAME, alias: "", remotePort: null }];
+  return h.tools ?? [{ name: BUILTIN_NAME, remotePort: null }];
 }
 
 /** 主机用的工具名 */

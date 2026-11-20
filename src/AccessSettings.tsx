@@ -4,14 +4,22 @@ import { ask } from "./modal";
 import { NumberInput } from "./NumberInput";
 import { SaveButton } from "./SaveButton";
 import { copyText } from "./copy";
-import { api, BUILTIN_NAME, defaultCloudName, errorText, Settings } from "./api";
+import { api, BUILTIN_NAME, COMMAND_MODES, CommandMode, commandModeLabel, defaultCloudName, errorText, Settings, SettingsField } from "./api";
 
-type Patch = Partial<Pick<Settings, "roots" | "allowCommands" | "remotePort" | "device" | "builtinAlias">>;
+type Patch = Partial<Pick<Settings, SettingsField>>;
 
 /** 两块设置各自保存：保存前重读一次，只改自己管的字段，不会覆盖另一块刚保存的内容 */
 async function savePatch(patch: Patch) {
   const cur = await api.settingsGet();
-  return api.settingsSave({ roots: cur.roots, allowCommands: cur.allowCommands, remotePort: cur.remotePort, device: cur.device, builtinAlias: cur.builtinAlias, ...patch });
+  return api.settingsSave({
+    roots: cur.roots,
+    commandMode: cur.commandMode,
+    commandAllowlist: cur.commandAllowlist,
+    remotePort: cur.remotePort,
+    device: cur.device,
+    builtinAlias: cur.builtinAlias,
+    ...patch,
+  });
 }
 
 function useSettings() {
@@ -38,6 +46,76 @@ function useSettings() {
   return { s, setS, error, patch, save };
 }
 
+/** 命令执行的管控：全局模式 + 白名单（主机可在「MCP 转发」里单独设模式） */
+function CommandControl({
+  mode,
+  allowlist,
+  onMode,
+  onAllowlist,
+}: {
+  mode: CommandMode;
+  allowlist: string[];
+  onMode: (m: CommandMode) => void;
+  onAllowlist: (rules: string[]) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const add = () => {
+    const rule = draft.trim().split(/\s+/).join(" ");
+    if (rule && !allowlist.includes(rule)) onAllowlist([...allowlist, rule]);
+    setDraft("");
+  };
+  return (
+    <section className="builtin-pane command-control">
+      <p className="muted small">
+        管 run_command / command_output / stop_command。命令不受目录限制，能做当前用户能做的任何事。这里是默认模式，主机可在「MCP 转发」里单独设。
+      </p>
+      <div className="seg command-modes" role="radiogroup">
+        {COMMAND_MODES.map((m) => (
+          <button key={m.value} type="button" role="radio" aria-checked={mode === m.value} className={mode === m.value ? "active" : ""} onClick={() => onMode(m.value)}>
+            {m.label}
+            <span className="muted small">{m.hint}</span>
+          </button>
+        ))}
+      </div>
+      <div className="field-title">白名单 <span className="muted small">「白名单 + 确认」模式下直接执行</span></div>
+      <ul className="root-list">
+        {allowlist.map((r) => (
+          <li key={r}>
+            <code>{r}</code>
+            <button className="icon" title="移除" onClick={() => onAllowlist(allowlist.filter((x) => x !== r))}>
+              ×
+            </button>
+          </li>
+        ))}
+        {allowlist.length === 0 && <li className="muted">空：所有命令都要确认，可在确认弹窗里点「总是允许」加入</li>}
+      </ul>
+      <div className="row command-rule-add">
+        <input
+          className="grow"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              add();
+            }
+          }}
+          placeholder="如 git 或 npm run build"
+          spellCheck={false}
+        />
+        <button type="button" disabled={!draft.trim()} onClick={add}>
+          添加
+        </button>
+      </div>
+      <p className="muted small">
+        按词匹配开头：git 放行全部 git 命令，git status 只放这一种；带 &amp; | &gt; 等拼接符或带路径的命令总要确认。
+        <br />
+        npm、mvn、node、python 会运行项目里的脚本，加进白名单等于允许运行项目代码。
+      </p>
+    </section>
+  );
+}
+
 function Footer({ error, onSave }: { error: string; onSave: () => Promise<boolean> }) {
   return (
     <>
@@ -49,9 +127,12 @@ function Footer({ error, onSave }: { error: string; onSave: () => Promise<boolea
   );
 }
 
-/** 内置工具的设置：云端名字和端口、云端能碰到哪些目录、能不能执行命令 */
+/** 内置工具的设置，分三个标签：默认映射、文件访问、命令执行；一个保存按钮一起保存 */
+type BuiltinTab = "map" | "files" | "cmd";
+
 export function BuiltinSettings({ onSaved }: { onSaved: (s: Settings) => void }) {
   const { s, error, patch, save } = useSettings();
+  const [tab, setTab] = useState<BuiltinTab>("map");
   if (!s) return null;
   const device = s.device.trim();
 
@@ -60,51 +141,86 @@ export function BuiltinSettings({ onSaved }: { onSaved: (s: Settings) => void })
     if (typeof dir === "string" && !s.roots.includes(dir)) patch({ roots: [...s.roots, dir] });
   };
 
-  return (
-    <div className="host-form toolbox-detail">
-      <div className="row">
-        <label className="grow">
-          云端名字：
-          <input
-            value={s.builtinAlias}
-            onChange={(e) => patch({ builtinAlias: e.target.value })}
-            placeholder={`默认 ${defaultCloudName(BUILTIN_NAME, device)}，可改成如 win-home`}
-            spellCheck={false}
-          />
-          <span className="muted small">云端 Claude 里显示的名字，工具会叫 mcp__云端名字__工具名</span>
-        </label>
-        <label className="builtin-port">
-          云端端口：
-          <NumberInput min={1024} max={65535} value={s.remotePort} onChange={(remotePort) => patch({ remotePort })} />
-          <span className="muted small">云主机 127.0.0.1 上的端口</span>
-        </label>
-      </div>
-      <p className="muted">只有下面的目录会暴露给云端。写入、修改、删除前自动备份，每次操作都记入审计。</p>
-      <div className="field-title">允许访问的目录：</div>
-      <ul className="root-list">
-        {s.roots.map((r) => (
-          <li key={r}>
-            <code>{r}</code>
-            <button className="icon" title="移除" onClick={() => patch({ roots: s.roots.filter((x) => x !== r) })}>
-              ×
-            </button>
-          </li>
-        ))}
-        {s.roots.length === 0 && <li className="muted">还没有添加，云端目前访问不到任何文件</li>}
-      </ul>
-      <button onClick={addRoot}>添加目录…</button>
+  const tabs: { key: BuiltinTab; label: string; meta: string }[] = [
+    { key: "map", label: "默认映射", meta: `${s.builtinAlias.trim() || defaultCloudName(BUILTIN_NAME, device)} :${s.remotePort}` },
+    { key: "files", label: "文件访问", meta: s.roots.length ? `${s.roots.length} 个目录` : "未添加" },
+    { key: "cmd", label: "命令执行", meta: commandModeLabel(s.commandMode) },
+  ];
 
-      <label className="checkbox" style={{ marginTop: 16 }}>
-        <input type="checkbox" checked={s.allowCommands} onChange={(e) => patch({ allowCommands: e.target.checked })} />
-        允许执行命令：云端可在本机用 cmd 运行命令（工作目录限定在上面的目录内）
-      </label>
+  return (
+    <div className="host-form toolbox-detail builtin-settings">
+      <div className="segmented builtin-tabs" role="tablist">
+        {tabs.map((t) => (
+          <button key={t.key} type="button" role="tab" aria-selected={tab === t.key} className={tab === t.key ? "on" : ""} onClick={() => setTab(t.key)}>
+            {t.label}
+            <span className="builtin-tab-meta">{t.meta}</span>
+          </button>
+        ))}
+      </div>
+
+      {tab === "map" && (
+        <section className="builtin-pane">
+          <p className="muted small">每台主机默认这样映射：端口用于端口转发，名称用于注册到 Claude（工具名 mcp__名称__…）。</p>
+          <div className="row builtin-map-row">
+            <label className="default-map-port">
+              默认映射端口
+              <NumberInput min={1024} max={65535} value={s.remotePort} onChange={(remotePort) => patch({ remotePort })} />
+            </label>
+            <label className="grow">
+              默认映射名称
+              <input
+                value={s.builtinAlias}
+                onChange={(e) => patch({ builtinAlias: e.target.value })}
+                placeholder={`${defaultCloudName(BUILTIN_NAME, device)}，可改成如 win-home`}
+                spellCheck={false}
+              />
+            </label>
+          </div>
+          <p className="muted small">改端口后，在主机的「Claude 注册」里重新注册一次；改名称只影响以后的注册。</p>
+        </section>
+      )}
+
+      {tab === "files" && (
+        <section className="builtin-pane">
+          <p className="muted small">只有这些目录会暴露给云端；写入、修改、删除前自动备份，每次操作记入审计。</p>
+          <ul className="root-list">
+            {s.roots.map((r) => (
+              <li key={r}>
+                <code>{r}</code>
+                <button className="icon" title="移除" onClick={() => patch({ roots: s.roots.filter((x) => x !== r) })}>
+                  ×
+                </button>
+              </li>
+            ))}
+            {s.roots.length === 0 && <li className="muted">还没有添加，云端目前访问不到任何文件</li>}
+          </ul>
+          <button onClick={addRoot}>添加目录…</button>
+        </section>
+      )}
+
+      {tab === "cmd" && (
+        <CommandControl
+          mode={s.commandMode}
+          allowlist={s.commandAllowlist}
+          onMode={(commandMode) => patch({ commandMode })}
+          onAllowlist={(commandAllowlist) => patch({ commandAllowlist })}
+        />
+      )}
       <Footer
         error={error}
         onSave={() =>
-          save({ roots: s.roots, allowCommands: s.allowCommands, builtinAlias: s.builtinAlias.trim(), remotePort: s.remotePort }, onSaved)
+          save(
+            {
+              roots: s.roots,
+              commandMode: s.commandMode,
+              commandAllowlist: s.commandAllowlist,
+              builtinAlias: s.builtinAlias.trim(),
+              remotePort: s.remotePort,
+            },
+            onSaved,
+          )
         }
       />
-      <p className="muted small">改名字或端口后，对主机重新「配置 Claude」生效；旧名字的配置可在云端用 claude mcp remove 删掉。</p>
     </div>
   );
 }

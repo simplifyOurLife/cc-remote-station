@@ -6,6 +6,7 @@ export function NumberInput(p: {
   max?: number;
   step?: number;
   required?: boolean;
+  disabled?: boolean;
 }) {
   const step = p.step ?? 1;
   const bump = (dir: 1 | -1) => {
@@ -19,6 +20,7 @@ export function NumberInput(p: {
       <input
         type="number"
         required={p.required}
+        disabled={p.disabled}
         min={p.min}
         max={p.max}
         step={step}
@@ -32,7 +34,7 @@ export function NumberInput(p: {
             type="button"
             tabIndex={-1}
             aria-label={dir > 0 ? "增加" : "减少"}
-            disabled={dir > 0 ? p.max !== undefined && p.value >= p.max : p.min !== undefined && p.value <= p.min}
+            disabled={p.disabled || (dir > 0 ? p.max !== undefined && p.value >= p.max : p.min !== undefined && p.value <= p.min)}
             // 不抢输入框焦点；包在 <label> 里时也不触发标签的默认行为
             onMouseDown={(e) => e.preventDefault()}
             onClick={(e) => {

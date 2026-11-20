@@ -17,6 +17,7 @@ import { openMenu } from "./ContextMenu";
 import { copyText } from "./copy";
 import { TerminalPrefs, themes } from "./prefs";
 import { ConnectScreen } from "./ConnectScreen";
+import { TypeAhead } from "./typeahead";
 
 type Status =
   | { kind: "connecting" }
@@ -70,6 +71,10 @@ export function TerminalView(props: Props) {
   const reloadWebgl = useRef<() => void>(() => {});
   /** 最近一次尚未收到输出的按键时间（诊断回显延迟用） */
   const keyAt = useRef(0);
+  /** 预测回显：高延迟时先在本地画出输入的字 */
+  const typeAheadRef = useRef<TypeAhead | null>(null);
+  /** 在这个时间点之前不回答终端型号查询（见 onData） */
+  const quietUntil = useRef(0);
   // xterm 的回调只在初始化时注册一次，用 ref 读最新的 props
   const propsRef = useRef(props);
   propsRef.current = props;
@@ -121,6 +126,9 @@ export function TerminalView(props: Props) {
     };
     reloadWebgl.current();
     fit.fit();
+    const typeAhead = new TypeAhead(term, () => themes[propsRef.current.prefs.theme]);
+    typeAhead.enabled = prefs.predictiveEcho;
+    typeAheadRef.current = typeAhead;
 
     const send = (data: Uint8Array) => {
       if (!idRef.current) return;
@@ -255,7 +263,14 @@ export function TerminalView(props: Props) {
     });
     term.onTitleChange((t) => propsRef.current.onTitle(t));
 
-    term.onData((s) => send(encoder.encode(s)));
+    term.onData((s) => {
+      // tmux 接入时会问外层终端型号（DA 查询），xterm 自动应答 ESC[?1;2c / ESC[>0;276;0c。
+      // 应答要绕网络一圈，晚到时 tmux 已不再等，会被当成键盘输入出现在命令行（"1;2c0;276;0"）。
+      // 刚连上的几秒里丢掉这类应答，tmux 收不到就按默认能力工作
+      if (performance.now() < quietUntil.current && /^(\x1b\[[?>][\d;]*c)+$/.test(s)) return;
+      send(encoder.encode(s));
+      if (idRef.current) typeAhead.onInput(s);
+    });
     term.onBinary((s) => send(Uint8Array.from(s, (c) => c.charCodeAt(0))));
     term.onResize(({ cols, rows }) => idRef.current && api.terminalResize(idRef.current, cols, rows));
 
@@ -271,6 +286,7 @@ export function TerminalView(props: Props) {
       clearTimeout(retryRef.current.timer);
       // 用户关窗格/标签：顺带结束远端 tmux 会话
       if (idRef.current) api.terminalClose(idRef.current, true);
+      typeAhead.dispose();
       term.dispose();
     };
   }, []);
@@ -283,6 +299,10 @@ export function TerminalView(props: Props) {
     term.options.scrollback = prefs.scrollback;
     term.options.theme = themes[prefs.theme];
     fitRef.current?.fit();
+    if (typeAheadRef.current) {
+      typeAheadRef.current.enabled = prefs.predictiveEcho;
+      if (!prefs.predictiveEcho) typeAheadRef.current.clear();
+    }
   }, [prefs]);
 
   // 断线后按退避间隔自动重连
@@ -299,6 +319,7 @@ export function TerminalView(props: Props) {
     const term = termRef.current!;
     let cancelled = false;
     setStatus({ kind: "connecting" });
+    quietUntil.current = Infinity;
     const channel = new Channel<ArrayBuffer>();
     channel.onmessage = (buf) => {
       // 诊断：按键后超过 1.5 秒才有输出，记下当时的渲染状态，分辨是本机画不出来还是云端没响应
@@ -307,13 +328,16 @@ export function TerminalView(props: Props) {
         if (ms > 1500) console.warn(`[终端 ${host.name}] 按键后 ${Math.round(ms)}ms 才收到输出（WebGL ${webglLost.current ? "已丢失，用 DOM 渲染" : "正常"}）`);
         keyAt.current = 0;
       }
-      term.write(new Uint8Array(buf));
+      const ta = typeAheadRef.current;
+      ta?.onOutput();
+      term.write(new Uint8Array(buf), ta?.afterWrite);
     };
     api
       .terminalOpen(host.id, term.cols, term.rows, { trust, secrets, remember, session }, channel)
       .then(({ id, notice }) => {
         if (cancelled) return api.terminalClose(id);
         idRef.current = id;
+        quietUntil.current = performance.now() + 5000;
         if (notice) term.write(`\x1b[33m[${notice}]\x1b[0m\r\n`);
         retryRef.current.count = 0;
         setFails({ n: 0, at: 0 });

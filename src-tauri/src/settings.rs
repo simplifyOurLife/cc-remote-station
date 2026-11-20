@@ -10,8 +10,12 @@ pub struct Settings {
     pub token: String,
     /// 允许云端访问的本机目录；为空时拒绝一切文件访问
     pub roots: Vec<String>,
-    /// 是否允许云端在本机执行命令（默认关）
-    pub allow_commands: bool,
+    /// 云端在本机执行命令（run_command）的全局管控模式；主机可以单独设
+    #[serde(default)]
+    pub command_mode: CommandMode,
+    /// 白名单模式下直接放行的命令前缀，如 git、npm run build（按词匹配，程序名不区分大小写和 .exe）
+    #[serde(default = "default_allowlist")]
+    pub command_allowlist: Vec<String>,
     /// 云主机上反向转发监听的端口（127.0.0.1），云端 CC 的 MCP 地址用它
     pub remote_port: u16,
     /// 这台电脑的标识（如 home / office）。多台电脑连同一台主机时，云端的 MCP 名字加上它以免互相覆盖；空表示不加
@@ -23,6 +27,26 @@ pub struct Settings {
     /// MCP 工具箱：本机其他 MCP 服务，挂在内置服务的 /mcp/<name> 下一起转发给云端
     #[serde(default)]
     pub toolbox: Vec<ToolboxItem>,
+}
+
+/// 云端执行本机命令的管控模式
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandMode {
+    /// 不允许
+    #[default]
+    Off,
+    /// 每条都在本机弹窗确认
+    Confirm,
+    /// 命中白名单直接执行，其余弹窗确认
+    Allowlist,
+    /// 全部直接执行
+    All,
+}
+
+/// 新装时的白名单：只放只读的 git 查询，其余由用户在确认弹窗里「总是允许」逐步加
+fn default_allowlist() -> Vec<String> {
+    ["git status", "git diff", "git log", "git show"].map(String::from).to_vec()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -112,7 +136,16 @@ impl Settings {
         if path.exists() {
             return Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?);
         }
-        let settings = Settings { token: new_token(), roots: vec![], allow_commands: false, remote_port: 47823, device: String::new(), builtin_alias: String::new(), toolbox: vec![] };
+        let settings = Settings {
+            token: new_token(),
+            roots: vec![],
+            command_mode: CommandMode::Off,
+            command_allowlist: default_allowlist(),
+            remote_port: 47823,
+            device: String::new(),
+            builtin_alias: String::new(),
+            toolbox: vec![],
+        };
         settings.save(path)?;
         Ok(settings)
     }

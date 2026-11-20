@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP 原型</title>
+<style>
+:root{--bg:#f4f5f7;--panel:#fff;--fg:#1f2328;--muted:#6b7280;--line:#e2e5ea;--accent:#2563eb;--accent-bg:#e8efff;--ok:#16a34a;--ok-bg:#e7f6ec;--warn:#b45309;--warn-bg:#fdf3e2;--bad:#dc2626;--bad-bg:#fdecec;--code:#f1f3f6;--fwd:#0e7490;--fwd-bg:#e0f4f8;--reg:#7c3aed;--reg-bg:#f1eafe}
+@media (prefers-color-scheme:dark){:root{--bg:#16181c;--panel:#1f2227;--fg:#e6e8eb;--muted:#9aa1ab;--line:#30343b;--accent:#6b9bff;--accent-bg:#1d2a45;--ok:#4ade80;--ok-bg:#16301f;--warn:#fbbf24;--warn-bg:#3a2d12;--bad:#f87171;--bad-bg:#3a1b1b;--code:#2a2e35;--fwd:#5ad1e6;--fwd-bg:#123138;--reg:#b794ff;--reg-bg:#2a2140}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:980px;margin:0 auto;padding:28px 16px 80px}
+h1{font-size:22px;margin:0 0 4px}
+h2{font-size:17px;margin:40px 0 6px;display:flex;align-items:center;gap:8px}
+h2 .n{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;background:var(--accent);color:#fff;font-size:13px}
+p.lead{color:var(--muted);margin:0 0 14px}
+.muted{color:var(--muted)}.small{font-size:12px}
+code{background:var(--code);padding:1px 6px;border-radius:4px;font:12.5px Consolas,monospace}
+.note{border-left:3px solid var(--accent);background:var(--accent-bg);padding:8px 12px;border-radius:0 6px 6px 0;margin:10px 0;font-size:13px}
+
+/* 总览图 */
+.flow{display:grid;grid-template-columns:1fr auto 1fr auto 1fr auto 1fr;align-items:center;gap:6px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}
+.box{border:1px solid var(--line);border-radius:8px;padding:10px;text-align:center;min-height:78px;display:flex;flex-direction:column;justify-content:center}
+.box b{display:block}
+.arrow{text-align:center;font-size:12px;font-weight:600}
+.arrow .line{font-size:20px;line-height:1}
+.arrow.fwd{color:var(--fwd)}.arrow.reg{color:var(--reg)}
+.layer{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+.layer>div{border-radius:8px;padding:12px 14px;font-size:13px}
+.layer .f{background:var(--fwd-bg)}.layer .r{background:var(--reg-bg)}
+.layer h4{margin:0 0 4px;font-size:14px}
+.layer .f h4{color:var(--fwd)}.layer .r h4{color:var(--reg)}
+.layer ul{margin:4px 0 0;padding-left:18px}
+
+/* 对话框 */
+.dialog{background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.08);padding:18px 20px;max-width:720px}
+.dialog h3{margin:0 0 12px;font-size:16px}
+label.f{display:block;margin:10px 0}
+label.f>span.l{display:block;font-weight:600;font-size:13px;margin-bottom:3px}
+input[type=text],input[type=number],select{width:100%;padding:6px 9px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);font:inherit}
+input[type=number]{width:110px}
+.row{display:flex;gap:12px;align-items:flex-end}.row>.grow{flex:1}
+.fake{padding:6px 9px;border:1px dashed var(--line);border-radius:6px;color:var(--muted);font-size:13px}
+.group{border:1px solid var(--line);border-radius:8px;padding:10px 14px 12px;margin-top:14px;position:relative}
+.group.new{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+.group>.gt{font-weight:700;font-size:13px;margin-bottom:2px}
+.badge{display:inline-block;font-size:11px;padding:0 6px;border-radius:9px;background:var(--accent);color:#fff;margin-left:6px;vertical-align:1px;font-weight:600}
+.tag{display:inline-block;font-size:11px;padding:0 7px;border-radius:9px;font-weight:600}
+.tag.f{background:var(--fwd-bg);color:var(--fwd)}.tag.r{background:var(--reg-bg);color:var(--reg)}
+.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+button{font:inherit;padding:5px 14px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--fg);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.link{border:none;background:none;color:var(--accent);padding:2px 4px}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.sm{padding:2px 10px;font-size:12px}
+.checkbox{display:flex;gap:8px;align-items:flex-start;margin:8px 0}
+.removed{text-decoration:line-through;color:var(--muted)}
+
+/* 标签页 */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);margin-bottom:14px}
+.tabs button{border:none;border-bottom:2px solid transparent;border-radius:0;background:none;padding:8px 14px;color:var(--muted);font-weight:600}
+.tabs button.on{color:var(--fg);border-bottom-color:var(--accent)}
+.tabs .cnt{font-weight:400;font-size:12px;margin-left:4px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:12px;padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr.off td{color:var(--muted)}
+tr.off input[type=text]{opacity:.5}
+.st{font-size:12px;font-weight:600;white-space:nowrap}
+.st.ok{color:var(--ok)}.st.bad{color:var(--bad)}.st.warn{color:var(--warn)}.st.none{color:var(--muted)}
+td input[type=text]{padding:3px 7px;width:150px}
+td input[type=number]{padding:3px 7px;width:90px}
+.scope{display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.seg button{border:none;border-radius:0;padding:5px 14px}
+.seg button.on{background:var(--accent);color:#fff}
+.scope select{width:220px}
+.toast{margin-top:10px;font-size:13px;color:var(--ok);min-height:20px}
+
+/* 对比 */
+.cmp{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.cmp>div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;font-size:13px}
+.cmp h4{margin:0 0 6px}
+.cmp ol{margin:0;padding-left:20px}
+.cmp .bad{color:var(--bad)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;display:flex;gap:14px;align-items:center;max-width:720px}
+.card .grow{flex:1}
+.pill{font-size:12px;border:1px solid var(--line);border-radius:6px;padding:3px 10px;background:var(--panel);cursor:pointer}
+@media (max-width:720px){.flow{grid-template-columns:1fr}.arrow .line{transform:rotate(90deg)}.layer,.cmp{grid-template-columns:1fr}td input[type=text]{width:100px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>MCP 工具箱 · 主机侧改版原型</h1>
+<p class="lead">界面元素是示意，按钮可以点。核心思路：把「端口转发」和「注册到 Claude」拆成两件独立的事。</p>
+
+<h2><span class="n">0</span>先看这两件事分别是什么</h2>
+<div class="flow">
+  <div class="box"><b>本机 MCP 工具</b><span class="muted small">idea / chrome / mysql…<br>工具箱里注册的</span></div>
+  <div class="arrow fwd"><div class="line">⟶</div>端口转发</div>
+  <div class="box"><b>云主机 127.0.0.1:47824</b><span class="muted small">连上主机后<br>这个端口就通了</span></div>
+  <div class="arrow reg"><div class="line">⟶</div>注册</div>
+  <div class="box"><b>~/.claude.json</b><span class="muted small">写一条<br><code>idea → http://127.0.0.1:47824/…</code></span></div>
+  <div class="arrow"><div class="line">⟶</div>读取</div>
+  <div class="box"><b>云端 claude</b><span class="muted small">出现工具<br><code>mcp__idea__*</code></span></div>
+</div>
+<div class="layer">
+  <div class="f"><h4>① 端口转发（网络层，像 Bitvise）</h4>
+    <ul><li>决定：哪些工具通到这台主机、<b>用哪个端口</b></li><li>连接主机时自动建立，断开就没了</li><li>和 Claude 毫无关系，只是把端口打通</li></ul></div>
+  <div class="r"><h4>② 注册到 Claude（配置层）</h4>
+    <ul><li>决定：在哪个作用域（全局 / 某个项目）登记、<b>叫什么名字</b></li><li>写一次就一直在 ~/.claude.json 里</li><li>前提：对应端口已经转发，不然 claude 连不上</li></ul></div>
+</div>
+<div class="note">所以 <b>端口</b> 只属于 ①，<b>名字</b> 只属于 ②。现在的问题是两者挤在同一张表、还被做成「第 1 步 → 第 2 步」的向导。</div>
+
+<h2><span class="n">1</span>工具箱页 · 编辑 MCP</h2>
+<p class="lead">名字和端口合到底部一块「主机默认映射」。这里填的只是<b>默认值</b>：端口给 ① 用，名字给 ② 用。</p>
+<div class="dialog">
+  <h3>编辑 idea</h3>
+  <label class="f"><span class="l">名称</span><input type="text" value="idea"><span class="muted small">工具箱里的标识</span></label>
+  <label class="f"><span class="l">类型</span><div class="fake">本机 HTTP</div></label>
+  <label class="f"><span class="l">本机地址</span><input type="text" value="http://127.0.0.1:64342/sse"></label>
+  <div class="fake">请求头 / 旧版 SSE …（不变）</div>
+
+  <div class="group new">
+    <div class="gt">主机默认映射 <span class="badge">合并到这里</span></div>
+    <div class="muted small" style="margin-bottom:6px">每台主机默认这样映射，个别主机可以在主机里另改</div>
+    <div class="row">
+      <label class="f grow"><span class="l"><span class="tag f">转发</span> 默认映射端口</span><input type="number" id="tbPort" value="47824"></label>
+      <label class="f grow"><span class="l"><span class="tag r">注册</span> 默认映射名称</span><input type="text" id="tbName" placeholder="idea-home"></label>
+    </div>
+    <div class="muted small" id="tbPreview"></div>
+  </div>
+  <div class="actions"><button>测试连接</button><button>取消</button><button class="primary">保存</button></div>
+</div>
+
+<h2><span class="n">2</span>编辑主机对话框</h2>
+<p class="lead">去掉里面那张工具表（现在和 MCP 弹窗里重复了一份），只留一个开关。</p>
+<div class="dialog">
+  <h3>编辑主机 · 公司云主机</h3>
+  <div class="fake">名称 / 地址 / 用户 / 认证 / 跳板机 / tmux …（不变）</div>
+  <label class="checkbox"><input type="checkbox" checked> <span>连接时转发 MCP 工具<br><span class="muted small">具体转发哪些，在主机卡片的「MCP」里设置</span></span></label>
+  <div class="fake removed">（原来这里的工具表格：启用 / 云端名字 / 端口 —— 删掉）</div>
+  <div class="actions"><button>取消</button><button class="primary">保存</button></div>
+</div>
+
+<h2><span class="n">3</span>主机卡片 → MCP 弹窗（两个标签页，不是两步）</h2>
+<p class="lead">可以随便点：关掉某个转发，再切到「Claude 注册」看它变灰；在注册页点「开启转发」也行。</p>
+<div class="card">
+  <div class="grow"><b>公司云主机</b> <span class="muted small">ubuntu@10.0.3.21 · 已连接</span><br><span class="muted small" id="cardSum"></span></div>
+  <button class="pill" onclick="openTab('fwd')">MCP</button>
+</div>
+<div style="height:10px"></div>
+<div class="dialog" id="mcpDlg">
+  <h3>公司云主机 · MCP</h3>
+  <div class="tabs">
+    <button id="tFwd" onclick="openTab('fwd')"><span class="tag f">①</span> 端口转发<span class="cnt" id="cFwd"></span></button>
+    <button id="tReg" onclick="openTab('reg')"><span class="tag r">②</span> Claude 注册<span class="cnt" id="cReg"></span></button>
+  </div>
+
+  <div id="pFwd">
+    <p class="muted small" style="margin-top:0">连接时为勾选的工具建立转发：云主机 127.0.0.1:端口 → 本机。这里没有「名字」。</p>
+    <table><thead><tr><th style="width:50px">转发</th><th>工具</th><th>本机目标</th><th>云主机端口</th><th>状态</th></tr></thead><tbody id="fwdBody"></tbody></table>
+    <div class="actions"><button class="link" style="margin-right:auto">管理工具箱…</button><button>关闭</button><button class="primary" onclick="flash('已保存，转发已按新设置重建')">保存</button></div>
+  </div>
+
+  <div id="pReg" hidden>
+    <p class="muted small" style="margin-top:0">把已转发的工具登记到云端 Claude。按<b>地址</b>识别是否已注册，所以云端改过名字也认得出。你在云端自己加的其他 MCP 不受影响。</p>
+    <div class="scope">
+      <span class="seg"><button id="sG" onclick="setScope('global')">全局</button><button id="sP" onclick="setScope('project')">指定项目</button></span>
+      <select id="dirSel" onchange="setScope('project')" hidden><option>~/work/app</option><option>~/work/dim-data</option></select>
+    </div>
+    <table><thead><tr><th>工具</th><th>在 Claude 里的名字</th><th>地址</th><th>状态</th><th style="width:110px"></th></tr></thead><tbody id="regBody"></tbody></table>
+    <div class="actions"><button>关闭</button><button class="primary" id="regAll" onclick="regAll()">全部注册</button></div>
+  </div>
+  <div class="toast" id="toast"></div>
+</div>
+
+<h2><span class="n">4</span>现在 vs 改后</h2>
+<div class="cmp">
+  <div><h4>现在</h4><ol>
+    <li>编辑主机里有工具表（启用 / 云端名字 / 端口）</li>
+    <li>MCP 弹窗「第 1 步 选择工具」又是同一张表</li>
+    <li>「下一步：写入 Claude」只能写第 1 步勾的那些</li>
+    <li class="bad">名字（注册用）和端口（转发用）混在第 1 步</li>
+    <li class="bad">像向导，感觉每次都要从第 1 步走到第 2 步</li>
+  </ol></div>
+  <div><h4>改后</h4><ol>
+    <li>编辑主机只剩一个开关</li>
+    <li>「端口转发」页：只管启用 + 端口，连接时自动生效</li>
+    <li>「Claude 注册」页：只管作用域 + 名字，随时增删</li>
+    <li>两页平级，互相只有一个依赖：没转发的不能注册（给快捷按钮）</li>
+    <li>主机上不再单独存名字覆盖，名字在注册时决定</li>
+  </ol></div>
+</div>
+</div>
+
+<script>
+const device = 'home';
+const tools = [
+  {id:'ccws', label:'cc-workstation', target:'内置（文件/命令/剪贴板）', port:47823, name:'cc-workstation'},
+  {id:'idea', label:'idea', target:'127.0.0.1:64342', port:47824, name:''},
+  {id:'chrome', label:'chrome', target:'工具箱启动的命令', port:47825, name:''},
+  {id:'mysql', label:'mysql', target:'192.168.1.20:8090', port:47826, name:''},
+];
+const dflName = t => t.name || `${t.id}-${device}`;
+const url = t => `http://127.0.0.1:${fwd[t.id].port}/mcp`;
+const fwd = {ccws:{on:true,port:47823}, idea:{on:true,port:47824}, chrome:{on:false,port:47825}, mysql:{on:true,port:47826,err:'本机 192.168.1.20:8090 连不上'}};
+// 云端 ~/.claude.json 里现有的（名字 → 地址）
+const claude = {global:{'cc-workstation':'http://127.0.0.1:47823/mcp','my-idea':'http://127.0.0.1:47824/mcp'}, '~/work/app':{}, '~/work/dim-data':{}};
+const names = {}; tools.forEach(t => names[t.id] = dflName(t));
+let tab = 'fwd', scope = 'global';
+
+function scopeKey(){ return scope === 'global' ? 'global' : document.getElementById('dirSel').value; }
+function findReg(t){ const m = claude[scopeKey()]; for (const n in m) if (m[n] === url(t)) return n; return null; }
+function findGlobal(t){ const m = claude.global; for (const n in m) if (m[n] === url(t)) return n; return null; }
+
+function renderFwd(){
+  document.getElementById('fwdBody').innerHTML = tools.map(t => {
+    const f = fwd[t.id];
+    const st = !f.on ? '<span class="st none">不转发</span>' : f.err ? `<span class="st bad" title="${f.err}">✕ 失败</span> <span class="muted small">${f.err}</span>` : `<span class="st ok">● 已通 :${f.port}</span>`;
+    return `<tr class="${f.on?'':'off'}"><td><input type="checkbox" ${f.on?'checked':''} onchange="fwd['${t.id}'].on=this.checked;render()"></td><td><b>${t.label}</b></td><td class="muted small">${t.target}</td><td><input type="number" value="${f.port}" ${f.on?'':'disabled'} onchange="fwd['${t.id}'].port=+this.value;render()"></td><td>${st}</td></tr>`;
+  }).join('');
+}
+
+function renderReg(){
+  let todo = 0;
+  document.getElementById('regBody').innerHTML = tools.map(t => {
+    const f = fwd[t.id];
+    if (!f.on) return `<tr class="off"><td><b>${t.label}</b></td><td><input type="text" value="${names[t.id]}" disabled></td><td class="muted small">—</td><td><span class="st none">未转发</span></td><td><button class="sm" onclick="fwd['${t.id}'].on=true;flash('已开启 ${t.label} 的转发');render()">开启转发</button></td></tr>`;
+    const reg = findReg(t);
+    const g = scope !== 'global' && !reg ? findGlobal(t) : null;
+    let st, btn;
+    if (reg) {
+      st = reg === names[t.id] ? '<span class="st ok">✓ 已注册</span>' : `<span class="st ok">✓ 已注册</span> <span class="muted small">（云端叫 ${reg}）</span>`;
+      btn = `<button class="sm" onclick="unreg('${t.id}')">移除</button>`;
+      names[t.id] = reg;
+    } else if (g) {
+      st = `<span class="st ok">全局已有</span> <span class="muted small">不用再配</span>`;
+      btn = `<button class="sm" onclick="reg('${t.id}')">仍然注册</button>`;
+    } else {
+      todo++;
+      st = f.err ? '<span class="st warn">未注册 · 转发失败</span>' : '<span class="st none">未注册</span>';
+      btn = `<button class="sm primary" onclick="reg('${t.id}')">注册</button>`;
+    }
+    return `<tr><td><b>${t.label}</b></td><td><input type="text" value="${names[t.id]}" ${reg?'disabled title="已注册，要改名先移除"':''} oninput="names['${t.id}']=this.value"></td><td><code>:${f.port}/mcp</code></td><td>${st}</td><td>${btn}</td></tr>`;
+  }).join('');
+  const b = document.getElementById('regAll'); b.disabled = !todo; b.textContent = todo ? `全部注册（${todo}）` : '都已注册';
+}
+
+function reg(id){ const t = tools.find(x => x.id === id); claude[scopeKey()][names[id]] = url(t); flash(`已把 ${names[id]} 写入${scope==='global'?'全局':scopeKey()}，新启动的 claude 生效`); render(); }
+function unreg(id){ const t = tools.find(x => x.id === id); const n = findReg(t); delete claude[scopeKey()][n]; names[id] = dflName(t); flash(`已移除 ${n}`); render(); }
+function regAll(){ tools.forEach(t => { if (fwd[t.id].on && !findReg(t) && !(scope!=='global' && findGlobal(t))) claude[scopeKey()][names[t.id]] = url(t); }); flash('已全部写入'); render(); }
+function setScope(s){ scope = s; render(); }
+function openTab(t){ tab = t; render(); document.getElementById('mcpDlg').scrollIntoView({behavior:'smooth',block:'nearest'}); }
+let tt; function flash(m){ const e = document.getElementById('toast'); e.textContent = m; clearTimeout(tt); tt = setTimeout(() => e.textContent = '', 3000); }
+
+function render(){
+  document.getElementById('pFwd').hidden = tab !== 'fwd';
+  document.getElementById('pReg').hidden = tab !== 'reg';
+  document.getElementById('tFwd').classList.toggle('on', tab === 'fwd');
+  document.getElementById('tReg').classList.toggle('on', tab === 'reg');
+  document.getElementById('sG').classList.toggle('on', scope === 'global');
+  document.getElementById('sP').classList.toggle('on', scope === 'project');
+  document.getElementById('dirSel').hidden = scope !== 'project';
+  const on = tools.filter(t => fwd[t.id].on);
+  const ok = on.filter(t => !fwd[t.id].err).length;
+  const regd = tools.filter(t => fwd[t.id].on && findGlobal(t)).length;
+  document.getElementById('cFwd').textContent = `${ok}/${on.length}`;
+  document.getElementById('cReg').textContent = `全局 ${regd}`;
+  document.getElementById('cardSum').innerHTML = `<span class="tag f">转发 ${ok}/${on.length}</span> <span class="tag r">已注册（全局） ${regd}</span>`;
+  renderFwd(); renderReg();
+}
+function tbPreview(){
+  const p = document.getElementById('tbPort').value, n = document.getElementById('tbName').value.trim() || 'idea-home';
+  document.getElementById('tbPreview').innerHTML = `本机 127.0.0.1:64342 → 云主机 :${p}　·　Claude 里叫 <code>${n}</code>，工具名 <code>mcp__${n}__…</code>`;
+}
+document.getElementById('tbPort').oninput = tbPreview;
+document.getElementById('tbName').oninput = tbPreview;
+tbPreview(); render();
+</script>
+</body>
+</html>

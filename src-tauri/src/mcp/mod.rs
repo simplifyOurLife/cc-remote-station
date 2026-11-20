@@ -2,6 +2,7 @@
 //! 实现 Streamable HTTP 传输的最小子集：POST /mcp 收单条 JSON-RPC，直接返回 JSON（不开 SSE 流）。
 //! /mcp/<name> 是工具箱里的本机命令（stdio，见 toolbox.rs），共用同一个令牌。
 
+mod approval;
 mod guard;
 mod import;
 mod tasks;
@@ -10,16 +11,20 @@ mod tools;
 
 use anyhow::Result;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
+use crate::hosts::{Host, HostStore};
+pub use approval::{Approvals, Decision};
 pub use guard::{BackupEntry, Guard};
 pub use import::{ImportCandidate, scan as scan_imports};
 pub use toolbox::{TestResult, Toolbox, cloud_url, http_target, validate as validate_toolbox};
@@ -60,6 +65,11 @@ pub struct McpState {
     tasks: Tasks,
     toolbox: Arc<Toolbox>,
     app: AppHandle,
+    /// 取发起请求的主机（名字、命令管控模式）
+    hosts: HostStore,
+    approvals: Arc<Approvals>,
+    /// 确认弹窗里「总是允许」写白名单时保存设置
+    settings_path: PathBuf,
 }
 
 /// 内置工具列表（界面展示用）
@@ -71,8 +81,15 @@ pub fn builtin_tools() -> Value {
 pub const PREFERRED_PORT: u16 = 47800;
 
 /// 启动服务，返回本机监听端口（只听 127.0.0.1，给 SSH 反向转发用）。固定端口被占用时退回系统分配
-pub async fn serve(app: AppHandle, guard: Arc<Guard>, toolbox: Arc<Toolbox>) -> Result<u16> {
-    let state = Arc::new(McpState { guard, tasks: Tasks::default(), toolbox, app });
+pub async fn serve(
+    app: AppHandle,
+    guard: Arc<Guard>,
+    toolbox: Arc<Toolbox>,
+    hosts: HostStore,
+    approvals: Arc<Approvals>,
+    settings_path: PathBuf,
+) -> Result<u16> {
+    let state = Arc::new(McpState { guard, tasks: Tasks::default(), toolbox, app, hosts, approvals, settings_path });
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", PREFERRED_PORT)).await {
         Ok(l) => l,
         Err(e) => {
@@ -86,7 +103,8 @@ pub async fn serve(app: AppHandle, guard: Arc<Guard>, toolbox: Arc<Toolbox>) -> 
         .route("/mcp/{name}", any(proxy))
         .with_state(state);
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = axum::serve(listener, router).await {
+        // 带上对端地址：经反向转发进来的连接按源端口认出主机
+        if let Err(e) = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
             log::error!("MCP 服务退出: {e}");
         }
     });
@@ -123,10 +141,16 @@ fn record(st: &McpState, entry: &Value) {
     let _ = st.app.emit("mcp-activity", entry);
 }
 
-async fn handle(State(st): State<Arc<McpState>>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+async fn handle(
+    State(st): State<Arc<McpState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<Value>,
+) -> Response {
     if !authorized(&st, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let host = crate::ssh::peer_host(peer.port()).and_then(|id| st.hosts.get(&id).ok());
     // 没有 id 的是通知（如 notifications/initialized），按协议回 202 且无内容
     let Some(id) = req.get("id").cloned() else {
         return StatusCode::ACCEPTED.into_response();
@@ -141,7 +165,7 @@ async fn handle(State(st): State<Arc<McpState>>, headers: HeaderMap, Json(req): 
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools::list() })),
-        "tools/call" => Ok(call_tool(&st, &params).await),
+        "tools/call" => Ok(call_tool(&st, &params, host.as_ref()).await),
         other => Err(json!({ "code": -32601, "message": format!("未知方法：{other}") })),
     };
     let body = match result {
@@ -152,11 +176,12 @@ async fn handle(State(st): State<Arc<McpState>>, headers: HeaderMap, Json(req): 
 }
 
 /// 执行工具、写审计并通知前端；工具失败按 MCP 约定放在 isError 里返回，让 Claude 看到原因
-async fn call_tool(st: &McpState, params: &Value) -> Value {
+/// host：发起请求的主机；本机其他程序直连时为 None
+async fn call_tool(st: &McpState, params: &Value, host: Option<&Host>) -> Value {
     let name = params["name"].as_str().unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     let started = Instant::now();
-    let result = tools::call(st, name, &args).await;
+    let result = tools::call(st, name, &args, host).await;
     // 返回给模型的字节数和是否触顶，用来看哪些调用最费 token
     let (bytes, capped) = match &result {
         Ok(ToolOut::Text(t)) => (t.len(), t.contains(tools::CAPPED)),
@@ -168,6 +193,7 @@ async fn call_tool(st: &McpState, params: &Value) -> Value {
         "capped": capped,
         "ts": chrono::Local::now().to_rfc3339(),
         "tool": name,
+        "host": host.map(|h| h.name.as_str()),
         "args": abbreviate(&args),
         "ok": result.is_ok(),
         "error": result.as_ref().err().map(|e| format!("{e:#}")),

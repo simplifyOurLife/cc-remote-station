@@ -160,7 +160,7 @@ export function ToolboxPage({
       <div className="card-head">
         <div>
           <h3>工具箱</h3>
-          <p className="muted">每个工具一条端口映射：云主机上的 127.0.0.1:云端端口 转发到本机。哪台主机用哪些工具，在主机的「MCP 工具」里选。</p>
+          <p className="muted">注册本机可用的 MCP，每个工具带一份主机默认映射（端口 + 名称）。哪台主机转发哪些、注册到 Claude，在主机卡片的「MCP 转发」里设置。</p>
         </div>
         <div className="card-head-actions">
           <button onClick={() => setImporting(true)} title="从本机 Claude Code / Claude Desktop / Cursor 的配置里批量导入">
@@ -186,12 +186,12 @@ export function ToolboxPage({
             </div>
           </div>
           <div className="tool-row-meta">
-            <button className="cloud-name" title="在云端 Claude Code 里的名字，点击修改" onClick={() => setOpen({ name: BUILTIN_NAME, part: "settings" })}>
-              ☁ {builtinAlias || defaultCloudName(BUILTIN_NAME, device)}
-            </button>
             <span className="toolbox-map" title="文件读写与搜索、执行命令、剪贴板、通知">
-              127.0.0.1:{localPort ?? "…"} <span className="arrow">→</span> 云端 :{builtinPort}
+              <code className="toolbox-desc">127.0.0.1:{localPort ?? "…"}</code>
             </span>
+            <button className="cloud-name" title="主机默认映射，点击修改" onClick={() => setOpen({ name: BUILTIN_NAME, part: "settings" })}>
+              → {builtinAlias || defaultCloudName(BUILTIN_NAME, device)} :{builtinPort}
+            </button>
             {builtin.length > 0 && (
               <button className="link" onClick={() => toggleOpen(BUILTIN_NAME, "tools")}>
                 {builtin.length} 个工具 {open?.name === BUILTIN_NAME && open.part === "tools" ? "▴" : "▾"}
@@ -235,13 +235,12 @@ export function ToolboxPage({
                 </div>
               </div>
               <div className="tool-row-meta">
-                <button className="cloud-name" title="在云端 Claude Code 里的名字，点击修改" onClick={() => setEditing(item)}>
-                  ☁ {item.alias || defaultCloudName(item.name, device)}
-                </button>
-                <span className="toolbox-map" title={`${describe(item)}\n云端地址：${cloudUrl(item)}`}>
+                <span className="toolbox-map" title={describe(item)}>
                   <code className="toolbox-desc">{item.kind === "stdio" ? describe(item) : localTarget(item.url)}</code>
-                  <span className="arrow">→</span> 云端 :{item.remotePort}
                 </span>
+                <button className="cloud-name" title={`主机默认映射，点击修改\n云端地址：${cloudUrl(item)}`} onClick={() => setEditing(item)}>
+                  → {item.alias || defaultCloudName(item.name, device)} :{item.remotePort}
+                </button>
                 {result ? (
                   <button className="link" onClick={() => toggleOpen(item.name, "tools")}>
                     {result.tools.length} 个工具 {isOpen ? "▴" : "▾"}
@@ -337,12 +336,12 @@ function ToolboxForm({
     if (!/^[A-Za-z0-9_-]{1,32}$/.test(n)) throw "名字只能用英文字母、数字、- 和 _，最多 32 个字符";
     if (n === BUILTIN_NAME || n === BUILTIN_CLOUD_NAME) throw `名字 ${n} 已被内置工具占用`;
     if (others.some((i) => i.name === n)) throw `工具箱里已经有「${n}」`;
-    if (!(remotePort >= 1024 && remotePort <= 65535)) throw "云端端口要在 1024–65535 之间";
-    if (remotePort === builtinPort) throw `云端端口 ${remotePort} 已被内置工具占用`;
+    if (!(remotePort >= 1024 && remotePort <= 65535)) throw "默认映射端口要在 1024–65535 之间";
+    if (remotePort === builtinPort) throw `默认映射端口 ${remotePort} 已被内置工具占用`;
     const clash = others.find((i) => i.remotePort === remotePort);
-    if (clash) throw `云端端口 ${remotePort} 已被「${clash.name}」占用`;
+    if (clash) throw `默认映射端口 ${remotePort} 已被「${clash.name}」占用`;
     const a = alias.trim();
-    if (a && !/^[A-Za-z0-9_-]{1,48}$/.test(a)) throw "云端名字只能用英文字母、数字、- 和 _";
+    if (a && !/^[A-Za-z0-9_-]{1,48}$/.test(a)) throw "默认映射名称只能用英文字母、数字、- 和 _";
     const enabled = initial?.enabled ?? true;
     const base = { name: n, enabled, remotePort, alias: a };
     if (kind === "stdio") {
@@ -392,23 +391,11 @@ function ToolboxForm({
     <div className="terminal-overlay" onKeyDown={(e) => e.key === "Escape" && onCancel()}>
       <form className="dialog host-form toolbox-form" onSubmit={submit}>
         <h3>{initial ? `编辑 ${initial.name}` : "添加 MCP"}</h3>
-        <div className="row">
-          <label className="grow">
-            名字：
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="如 playwright" autoFocus />
-            <span className="muted small">工具箱里的名字，英文</span>
-          </label>
-          <label className="grow">
-            云端名字：
-            <input
-              value={alias}
-              onChange={(e) => setAlias(e.target.value)}
-              placeholder={`默认 ${defaultCloudName(name.trim() || "名字", device)}`}
-              spellCheck={false}
-            />
-            <span className="muted small">云端 Claude 里显示的名字，工具会叫 mcp__云端名字__工具名</span>
-          </label>
-        </div>
+        <label>
+          名称：
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="如 playwright" autoFocus />
+          <span className="muted small">工具箱里的标识，英文</span>
+        </label>
         <div className="row">
           <label className="toolbox-kind-field">
             类型：
@@ -477,33 +464,42 @@ function ToolboxForm({
           </>
         )}
 
-        <div className="port-map">
-          <div className="port-map-side">
-            <div className="muted small">本机</div>
-            <code>{kind === "stdio" ? "工具箱启动的命令" : localTarget(url.trim()) || "—"}</code>
+        <fieldset className="default-map">
+          <legend>主机默认映射</legend>
+          <p className="muted small">每台主机默认这样映射：端口用于端口转发，名称用于注册到 Claude；个别主机可以在主机的「MCP 转发」里另改。</p>
+          <div className="row">
+            <label className="default-map-port">
+              默认映射端口：
+              <NumberInput min={1024} max={65535} value={remotePort} onChange={setRemotePort} />
+            </label>
+            <label className="grow">
+              默认映射名称：
+              <input
+                value={alias}
+                onChange={(e) => setAlias(e.target.value)}
+                placeholder={defaultCloudName(name.trim() || "名称", device)}
+                spellCheck={false}
+              />
+            </label>
           </div>
-          <span className="port-map-arrow">→</span>
-          <label className="port-map-side">
-            <div className="muted small">云主机 127.0.0.1 的端口</div>
-            <NumberInput min={1024} max={65535} value={remotePort} onChange={setRemotePort} />
-          </label>
-        </div>
-        {(() => {
-          let preview = "";
-          try {
-            preview = cloudUrl(build());
-          } catch {
-            // 表单还没填完，不显示预览
-          }
-          const shown = alias.trim() || defaultCloudName(name.trim(), device);
-          return (
-            preview && (
-              <p className="muted small">
-                云端 Claude Code 里叫 <code>{shown}</code>，连接 <code>{preview}</code>
-              </p>
-            )
-          );
-        })()}
+          {(() => {
+            let preview = "";
+            try {
+              preview = cloudUrl(build());
+            } catch {
+              // 表单还没填完，不显示预览
+            }
+            const shown = alias.trim() || defaultCloudName(name.trim(), device);
+            const local = kind === "stdio" ? "工具箱启动的命令" : localTarget(url.trim()) || "—";
+            return (
+              preview && (
+                <p className="muted small">
+                  本机 <code>{local}</code> → 云主机 <code>:{remotePort}</code>　·　Claude 里叫 <code>{shown}</code>，地址 <code>{preview}</code>
+                </p>
+              )
+            );
+          })()}
+        </fieldset>
 
         {result && (
           <div className="toolbox-result">

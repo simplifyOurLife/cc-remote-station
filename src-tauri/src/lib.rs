@@ -39,6 +39,8 @@ pub struct AppState {
     connecting: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 登录中途的验证码等输入：弹窗问用户
     prompter: ssh::Prompter,
+    /// 云端执行本机命令前的弹窗确认
+    approvals: Arc<mcp::Approvals>,
     terminals: Mutex<HashMap<String, TermHandle>>,
     /// 图形对话进程（chat id → stdin 写入端）
     chats: Mutex<HashMap<String, chat::ChatHandle>>,
@@ -75,7 +77,16 @@ impl<E: Into<anyhow::Error>> From<E> for CmdError {
 type CmdResult<T> = Result<T, CmdError>;
 
 async fn alive_conn(state: &AppState, host_id: &str) -> Option<Arc<Conn>> {
-    state.conns.lock().await.get(host_id).filter(|c| !c.handle.is_closed()).cloned()
+    let conn = state.conns.lock().await.get(host_id).cloned()?;
+    if conn.alive().await {
+        return Some(conn);
+    }
+    // 已断：从表里去掉（探测期间可能已被别人换成新连接，只删同一条）
+    let mut conns = state.conns.lock().await;
+    if conns.get(host_id).is_some_and(|c| Arc::ptr_eq(c, &conn)) {
+        conns.remove(host_id);
+    }
+    None
 }
 
 /// 取该主机已有的连接，没有（或已断）就新建；返回的 bool 表示是否新建。
@@ -104,48 +115,30 @@ async fn get_or_connect(
 
 /// 主机用的工具；从没配过时只有内置工具
 fn host_tools(host: &Host) -> Vec<HostTool> {
-    host.tools
-        .clone()
-        .unwrap_or_else(|| vec![HostTool { name: BUILTIN_NAME.into(), alias: String::new(), remote_port: None }])
+    host.tools.clone().unwrap_or_else(|| vec![HostTool { name: BUILTIN_NAME.into(), remote_port: None }])
 }
 
-/// 主机上某个工具实际生效的云端名字和端口：主机里改过的优先，否则用工具箱里的；工具已不在工具箱里时为 None
-fn host_tool_effective(s: &Settings, t: &HostTool) -> Option<(String, u16)> {
+/// 主机上某个工具实际转发用的云端端口：主机里改过的优先，否则用工具箱里的默认映射端口；工具已不在工具箱里时为 None
+fn host_tool_port(s: &Settings, t: &HostTool) -> Option<u16> {
     let port = if t.name == BUILTIN_NAME {
         s.remote_port
     } else {
         s.toolbox.iter().find(|i| i.name == t.name)?.remote_port
     };
-    let name = if t.alias.is_empty() { s.cloud_name(&t.name) } else { t.alias.clone() };
-    Some((name, t.remote_port.unwrap_or(port)))
+    Some(t.remote_port.unwrap_or(port))
 }
 
-/// 保存主机前校验：这台主机上各工具的云端名字（会拼进云端命令）和端口不能重复
+/// 保存主机前校验：这台主机上转发的云端端口不能重复
 fn check_host_tools(s: &Settings, host: &Host) -> anyhow::Result<()> {
-    let (mut names, mut ports) = (Vec::new(), Vec::new());
+    let mut ports = Vec::new();
     for t in host_tools(host) {
-        let Some((name, port)) = host_tool_effective(s, &t) else { continue };
-        anyhow::ensure!(
-            !name.is_empty() && name.len() <= 48 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-            "云端名字「{name}」无效：只能用英文字母、数字、- 和 _"
-        );
-        anyhow::ensure!(!names.contains(&name), "云端名字「{name}」重复了");
+        let Some(port) = host_tool_port(s, &t) else { continue };
         anyhow::ensure!(port >= 1024, "「{}」的云端端口要在 1024–65535 之间", t.name);
         anyhow::ensure!(!ports.contains(&port), "云端端口 {port} 重复了");
-        names.push(name);
         ports.push(port);
     }
     Ok(())
 }
-
-/// 主机上各工具的云端名字（工具箱名字 → 云端名字）
-fn host_cloud_names(s: &Settings, host: &Host) -> HashMap<String, String> {
-    host_tools(host)
-        .iter()
-        .filter_map(|t| host_tool_effective(s, t).map(|(name, _)| (t.name.clone(), name)))
-        .collect()
-}
-
 /// 主机用的工具各自的端口映射：内置工具和本机命令接到内置服务，HTTP 条目接到它自己的 host:port。
 /// 未开启工具箱的主机、已停用或已删除的条目不建转发
 fn host_forwards(state: &AppState, host: &Host) -> Vec<Forward> {
@@ -161,7 +154,7 @@ fn host_forwards(state: &AppState, host: &Host) -> Vec<Forward> {
     };
     let mut list = Vec::new();
     for t in host_tools(host) {
-        let Some((_, port)) = host_tool_effective(&s, &t) else { continue };
+        let Some(port) = host_tool_port(&s, &t) else { continue };
         if t.name == BUILTIN_NAME {
             list.push(local(&t.name, port));
             continue;
@@ -351,7 +344,8 @@ fn settings_get(state: State<AppState>) -> Settings {
 #[serde(rename_all = "camelCase")]
 struct SettingsPatch {
     roots: Vec<String>,
-    allow_commands: bool,
+    command_mode: settings::CommandMode,
+    command_allowlist: Vec<String>,
     remote_port: u16,
     device: String,
     builtin_alias: String,
@@ -371,7 +365,15 @@ fn settings_save(state: State<AppState>, patch: SettingsPatch) -> CmdResult<Sett
     }
     let mut next = s.clone();
     next.roots = patch.roots;
-    next.allow_commands = patch.allow_commands;
+    next.command_mode = patch.command_mode;
+    let mut allowlist: Vec<String> = Vec::new();
+    for rule in patch.command_allowlist {
+        let rule = rule.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !rule.is_empty() && !allowlist.contains(&rule) {
+            allowlist.push(rule);
+        }
+    }
+    next.command_allowlist = allowlist;
     next.remote_port = patch.remote_port;
     next.device = device;
     next.builtin_alias = patch.builtin_alias.trim().to_string();
@@ -379,6 +381,17 @@ fn settings_save(state: State<AppState>, patch: SettingsPatch) -> CmdResult<Sett
     next.save(&state.settings_path)?;
     *s = next;
     Ok(s.clone())
+}
+
+/// 回答命令确认弹窗：decision 为 once / always / deny，always 时 rule 是要加进白名单的规则
+#[tauri::command]
+fn command_confirm_answer(state: State<AppState>, id: String, decision: String, rule: Option<String>) {
+    let d = match (decision.as_str(), rule) {
+        ("once", _) => mcp::Decision::Once,
+        ("always", Some(r)) if !r.trim().is_empty() => mcp::Decision::Always(r),
+        _ => mcp::Decision::Deny,
+    };
+    state.approvals.answer(&id, d);
 }
 
 /// 换新令牌后，已配置的云端 Claude Code 需要重新「一键配置」
@@ -528,7 +541,7 @@ fn mcp_specs(state: &AppState, conn: &Conn) -> Vec<(String, Result<McpSpec, Stri
 }
 
 /// 在云主机上跑一段脚本。不用交互 shell：.bashrc 里的自动 tmux / 提示等在无终端时会卡住
-async fn run_remote(conn: &Conn, script: &str) -> anyhow::Result<String> {
+async fn run_remote(conn: &Arc<Conn>, script: &str) -> anyhow::Result<String> {
     let cmd = format!("bash -lc {} </dev/null", chat::shell_quote(script));
     let out = tokio::time::timeout(std::time::Duration::from_secs(30), conn.exec(&cmd, None))
         .await
@@ -545,8 +558,8 @@ async fn run_remote(conn: &Conn, script: &str) -> anyhow::Result<String> {
 #[serde(rename_all = "camelCase")]
 struct WantedMcp {
     name: String,
-    /// 在云端的名字（设了电脑标识时带后缀），和 global / project 里的键对应
-    cloud_name: String,
+    /// 工具箱里的默认映射名称（设了电脑标识时带后缀），注册时可以改；是否已注册按 url 匹配
+    default_name: String,
     /// 应配的地址；转发没建立时为 None，原因在 error
     url: Option<String>,
     error: Option<String>,
@@ -599,60 +612,67 @@ async fn claude_mcp_state(state: State<'_, AppState>, host_id: String, dir: Opti
     projects.sort();
     let project = dir.as_ref().map(|d| server_map(&config["projects"][d]["mcpServers"])).unwrap_or_default();
     let settings = state.settings.read().unwrap().clone();
-    let names = host_cloud_names(&settings, &state.hosts.get(&host_id)?);
     let wanted = mcp_specs(&state, &conn)
         .into_iter()
         .map(|(name, spec)| {
-            let cloud_name = names.get(&name).cloned().unwrap_or_else(|| settings.cloud_name(&name));
+            let default_name = settings.cloud_name(&name);
             match spec {
-                Ok(s) => WantedMcp { name, cloud_name, url: Some(s.url), error: None },
-                Err(e) => WantedMcp { name, cloud_name, url: None, error: Some(e) },
+                Ok(s) => WantedMcp { name, default_name, url: Some(s.url), error: None },
+                Err(e) => WantedMcp { name, default_name, url: None, error: Some(e) },
             }
         })
         .collect();
     Ok(ClaudeMcpState { dir, projects, global: server_map(&config["mcpServers"]), project, wanted })
 }
 
-/// 在云端写入（先删后加）或移除工具箱里的 MCP。dir 为空写全局（user），否则写该项目（local，仅在该目录下生效）。
-/// 只动传进来的名字，用户在云端自己加的其他 MCP 不碰
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpRegister {
+    /// 工具箱里的名字
+    name: String,
+    /// 在 Claude 里的名字
+    cloud_name: String,
+}
+
+/// 在云端注册（先删后加）或移除 MCP。dir 为空写全局（user），否则写该项目（local，仅在该目录下生效）。
+/// remove 是 Claude 里已有的名字；只动传进来的名字，用户在云端自己加的其他 MCP 不碰
 #[tauri::command]
 async fn claude_mcp_apply(
     state: State<'_, AppState>,
     host_id: String,
     dir: Option<String>,
-    add: Vec<String>,
+    add: Vec<McpRegister>,
     remove: Vec<String>,
 ) -> CmdResult<String> {
-    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
-    let settings = state.settings.read().unwrap().clone();
-    let known: Vec<String> =
-        std::iter::once(BUILTIN_NAME.to_string()).chain(settings.toolbox.iter().map(|i| i.name.clone())).collect();
-    // 名字会拼进命令：只接受工具箱里的名字（保存时已校验只含安全字符）
-    if let Some(n) = add.iter().chain(&remove).find(|n| !known.contains(n)) {
-        return Err(anyhow!("「{n}」不在工具箱里").into());
+    if let Some(a) = add.iter().find(|a| {
+        let n = &a.cloud_name;
+        n.is_empty() || n.len() > 48 || !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }) {
+        return Err(anyhow!("名字「{}」无效：只能用英文字母、数字、- 和 _", a.cloud_name).into());
     }
-    // 云端名字按这台主机的设置算（主机里改过的优先）；保存时已校验只含安全字符
-    let names = host_cloud_names(&settings, &state.hosts.get(&host_id)?);
-    let cloud = |n: &str| names.get(n).cloned().unwrap_or_else(|| settings.cloud_name(n));
+    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
     let scope = if dir.is_some() { "local" } else { "user" };
     let specs = mcp_specs(&state, &conn);
+    // 移除的名字来自云端已有配置，可能带任意字符，一律加引号
     let mut steps: Vec<String> = add
         .iter()
+        .map(|a| &a.cloud_name)
         .chain(&remove)
-        .map(|n| format!("claude mcp remove {} -s {scope} >/dev/null 2>&1", cloud(n)))
+        .map(|n| format!("claude mcp remove {} -s {scope} >/dev/null 2>&1", chat::shell_quote(n)))
         .collect();
     let mut adds = Vec::new();
-    for name in &add {
+    for a in &add {
+        let name = &a.name;
         let spec = match specs.iter().find(|(n, _)| n == name) {
             Some((_, Ok(s))) => s,
-            Some((_, Err(e))) => return Err(anyhow!("「{name}」的端口映射没有建立：{e}").into()),
-            None => return Err(anyhow!("这台主机没有勾选「{name}」").into()),
+            Some((_, Err(e))) => return Err(anyhow!("「{name}」的端口转发没有建立：{e}").into()),
+            None => return Err(anyhow!("这台主机没有转发「{name}」").into()),
         };
         let headers: String = spec.headers.iter().map(|h| format!(" --header {}", chat::shell_quote(h))).collect();
         adds.push(format!(
             "claude mcp add --transport {} -s {scope} {} {}{headers}",
             spec.transport,
-            cloud(name),
+            a.cloud_name,
             chat::shell_quote(&spec.url)
         ));
     }
@@ -662,6 +682,38 @@ async fn claude_mcp_apply(
     let cd = dir.as_deref().map(|d| format!("cd {} && ", chat::cd_target(d))).unwrap_or_default();
     let script = format!("{}{cd}{{ {}; }}", chat::CLAUDE_PATH_SETUP, steps.join("; "));
     Ok(run_remote(&conn, &script).await.context("云端执行 claude mcp 失败")?)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostCheck {
+    /// claude --version 的输出；没装为 None
+    claude: Option<String>,
+    /// 找到登录信息（OAuth 凭据、API Key 或 settings.json 里的 ANTHROPIC_* 环境变量）
+    logged_in: bool,
+    tmux: bool,
+}
+
+/// 上手清单的「检查云主机环境」：claude 是否安装、是否登录过、有没有 tmux。没连接会自动连上
+#[tauri::command]
+async fn host_check(state: State<'_, AppState>, host_id: String) -> CmdResult<HostCheck> {
+    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
+    let script = format!(
+        "{}echo \"claude=$(claude --version 2>/dev/null | head -n 1)\"; \
+         if [ -n \"$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN\" ] || [ -s ~/.claude/.credentials.json ] \
+            || grep -q '\"oauthAccount\"' ~/.claude.json 2>/dev/null || grep -q 'ANTHROPIC_' ~/.claude/settings.json 2>/dev/null; \
+         then echo login=1; else echo login=0; fi; \
+         command -v tmux >/dev/null 2>&1 && echo tmux=1 || echo tmux=0",
+        chat::CLAUDE_PATH
+    );
+    let out = run_remote(&conn, &script).await?;
+    let get = |k: &str| out.lines().find_map(|l| l.strip_prefix(k)).map(str::trim).unwrap_or("");
+    let claude = get("claude=");
+    Ok(HostCheck {
+        claude: (!claude.is_empty()).then(|| claude.to_string()),
+        logged_in: get("login=") == "1",
+        tmux: get("tmux=") == "1",
+    })
 }
 
 #[derive(Deserialize)]
@@ -935,9 +987,17 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             let guard = Arc::new(mcp::Guard::new(settings.clone(), &data_dir));
             let toolbox = Arc::new(mcp::Toolbox::new(settings.clone()));
-            let mcp_port =
-                tauri::async_runtime::block_on(mcp::serve(app.handle().clone(), guard.clone(), toolbox.clone()))?;
+            let approvals = Arc::new(mcp::Approvals::default());
+            let mcp_port = tauri::async_runtime::block_on(mcp::serve(
+                app.handle().clone(),
+                guard.clone(),
+                toolbox.clone(),
+                HostStore::new(dir.join("hosts.json")),
+                approvals.clone(),
+                settings_path.clone(),
+            ))?;
             app.manage(AppState {
+                approvals,
                 hosts: HostStore::new(dir.join("hosts.json")),
                 known_hosts: dir.join("known_hosts"),
                 settings,
@@ -960,6 +1020,8 @@ pub fn run() {
             host_delete,
             claude_mcp_state,
             claude_mcp_apply,
+            command_confirm_answer,
+            host_check,
             terminal_open,
             ssh_prompt_answer,
             terminal_write,

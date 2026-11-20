@@ -156,6 +156,8 @@ fn shell_command(command: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("cmd");
     // raw_arg：cmd 的引号规则和普通程序不同，原样传进去才不会被二次转义
     cmd.arg("/C").raw_arg(command).creation_flags(CREATE_NO_WINDOW);
+    // 不从当前目录找程序：否则云端往工作目录写个 git.bat，白名单里的 git 就会跑它
+    cmd.env("NoDefaultCurrentDirectoryInExePath", "1");
     cmd
 }
 

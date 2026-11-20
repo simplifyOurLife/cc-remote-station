@@ -44,18 +44,41 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { ChatStatus, nextMode } from "./ChatStatus";
 import { PermissionCard, ToolCard } from "./ToolCard";
 import { kbd, modKey } from "./platform";
-import { estimatePct, observeQuota, pctText } from "./quota";
+import { coldPct, observeQuota, pctText } from "./quota";
 
-/** 缓存有效期：超过就按完整上下文重新计费。实际 TTL 未公开，按最短的 5 分钟算，宁可多提醒 */
-const CACHE_TTL_MS = 5 * 60 * 1000;
+/**
+ * 缓存有效期：超过就按完整上下文重新计费。订阅账号下 CLI 和 stream-json 模式写的都是 1 小时缓存
+ * （会话文件 usage.cache_creation 里只有 ephemeral_1h）。以前按 5 分钟算，闲置 5–60 分钟会误报「缓存已过期」，
+ * 提醒多了就没人看，真冷启动反而被点过去
+ */
+const CACHE_TTL_MS = 60 * 60 * 1000;
 /** 缓存已过期且上下文超过这个时，发消息前先拦下确认 */
 const COLD_WARN_TOKENS = 50_000;
+/** 超过这个的大会话冷启动：提醒卡改成醒目的红色（一次重写约等于几十轮普通对话） */
+const COLD_HEAVY_TOKENS = 150_000;
 /** 当前会话上下文超过这个、缓存还在时建议趁热压缩 */
 const HOT_COMPACT_TOKENS = 200_000;
 /** 历史会话每批渲染的消息数 */
 const PAGE = 60;
 const MODELS = ["", "opus", "sonnet", "haiku"];
 const SESSIONS_KEY = "ccws.chatSessionsOpen";
+
+/** 历史会话列表的本地缓存（按主机 + 目录），打开时先显示它 */
+const listCacheKey = (hostId: string, dir: string | null) => `ccws.sessionList.${hostId}.${dir ?? "*"}`;
+function cachedSessions(hostId: string, dir: string | null): ChatSession[] | null {
+  try {
+    return JSON.parse(localStorage.getItem(listCacheKey(hostId, dir)) ?? "null");
+  } catch {
+    return null;
+  }
+}
+function cacheSessions(hostId: string, dir: string | null, list: ChatSession[]) {
+  try {
+    localStorage.setItem(listCacheKey(hostId, dir), JSON.stringify(list));
+  } catch {
+    // 存不下就不缓存
+  }
+}
 
 /** Claude 回复上的角色标：小机器人 + CLAUDE */
 function ClaudeRole() {
@@ -457,10 +480,15 @@ export function ChatView(props: Props) {
   const loadSessions = (dir: string | null = listQuery.current.dir) => {
     const seq = listQuery.current.seq + 1;
     listQuery.current = { dir, seq };
-    setSessions(null);
+    // 先显示上次的列表，云端结果回来再替换（高延迟链路上要等好几个来回）
+    setSessions(cachedSessions(host.id, dir));
     api
       .chatSessions(host.id, dir)
-      .then((list) => listQuery.current.seq === seq && setSessions(list))
+      .then((list) => {
+        if (listQuery.current.seq !== seq) return;
+        setSessions(list);
+        cacheSessions(host.id, dir, list);
+      })
       .catch((e) => {
         if (listQuery.current.seq !== seq) return;
         setSessions([]);
@@ -711,6 +739,8 @@ export function ChatView(props: Props) {
       propsRef.current.onTitle(s.title.slice(0, 30));
     } catch (e) {
       if (seq === resumeSeq.current) setState((st) => system(st, `读取会话失败：${errorText(e)}`, "error"));
+      // 新标签首次载入失败就不会再唤醒，收掉唤醒屏让人看到报错
+      if (s === props.initialSession) setBooting(false);
     } finally {
       if (seq === resumeSeq.current) setLoadingSession(null);
     }
@@ -821,10 +851,33 @@ export function ChatView(props: Props) {
       okLabel: "删除",
     });
     if (!ok) return;
-    await api.chatDelete(host.id, s.file).catch((e) => setState((st) => system(st, `删除失败：${errorText(e)}`, "error")));
+    // 本地直接收起这一行，不重扫列表（重扫要把上百个会话文件再读一遍，很慢还会闪）
+    setRemoving((r) => new Set(r).add(s.sessionId));
+    const anim = new Promise((r) => setTimeout(r, 260));
+    try {
+      await api.chatDelete(host.id, s.file);
+    } catch (e) {
+      setRemoving((r) => {
+        const n = new Set(r);
+        n.delete(s.sessionId);
+        return n;
+      });
+      setState((st) => system(st, `删除失败：${errorText(e)}`, "error"));
+      return;
+    }
     if (s.sessionId === state.sessionId) switchTo(emptyState, cwd);
-    loadSessions();
+    await anim;
+    setSessions((list) => {
+      if (!list) return list;
+      const next = list.filter((x) => x.sessionId !== s.sessionId);
+      cacheSessions(host.id, listQuery.current.dir, next);
+      return next;
+    });
   };
+  /** 新标签打开历史会话时的首次载入：并进唤醒屏（先读历史、再唤醒），不再叠一层载入遮罩 */
+  const firstLoad = loadingSession && loadingSession === props.initialSession ? loadingSession : null;
+  /** 正在播放删除动画的会话 */
+  const [removing, setRemoving] = useState<Set<string>>(() => new Set());
 
   // ---- 对话内搜索 ----
 
@@ -1081,7 +1134,18 @@ export function ChatView(props: Props) {
 
   return (
     <div className={`chat-pane terminal-pane ${focused ? "focused" : ""}`} onMouseDown={props.onFocus} onKeyDown={onPaneKeyDown}>
-      {booting && <ConnectScreen host={host} robot label="正在唤醒 Claude" detail={<code>{cwd}</code>} progress="启动云端 Claude Code" />}
+      {booting &&
+        (firstLoad ? (
+          <ConnectScreen
+            host={host}
+            robot
+            label={`正在载入「${(titles[firstLoad.sessionId] ?? firstLoad.title).slice(0, 40)}」`}
+            detail={<code>{firstLoad.cwd}</code>}
+            progress="读取历史会话"
+          />
+        ) : (
+          <ConnectScreen host={host} robot label="正在唤醒 Claude" detail={<code>{cwd}</code>} progress="启动云端 Claude Code" />
+        ))}
       {showMcp && (
         <McpPanel
           servers={state.mcpServers}
@@ -1176,7 +1240,7 @@ export function ChatView(props: Props) {
                     key={s.sessionId}
                     className={`chat-session ${(loadingSession ? s.sessionId === loadingSession.sessionId : s.sessionId === state.sessionId) ? "active" : ""} ${
                       s.sessionId === loadingSession?.sessionId ? "loading" : ""
-                    }`}
+                    } ${removing.has(s.sessionId) ? "removing" : ""}`}
                     onClick={(e) => openSession(s, e.ctrlKey || e.metaKey)}
                     // 中键：新标签打开（按下时拦掉浏览器的自动滚动）
                     onMouseDown={(e) => e.button === 1 && e.preventDefault()}
@@ -1224,7 +1288,9 @@ export function ChatView(props: Props) {
                             openSession(s, true);
                           }}
                         >
-                          ⧉
+                          <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" />
+                          </svg>
                         </button>
                         <button
                           className="icon"
@@ -1234,17 +1300,21 @@ export function ChatView(props: Props) {
                             setRenaming({ id: s.sessionId, value: titles[s.sessionId] ?? s.title });
                           }}
                         >
-                          ✎
+                          <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M4 20h4L19 9l-4-4L4 16v4zM13.5 6.5l4 4" />
+                          </svg>
                         </button>
                         <button
-                          className="icon"
+                          className="icon del"
                           title="删除"
                           onClick={(e) => {
                             e.stopPropagation();
                             deleteSession(s);
                           }}
                         >
-                          🗑
+                          <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12M9 7V4h6v3" />
+                          </svg>
                         </button>
                       </span>
                     </div>
@@ -1279,7 +1349,7 @@ export function ChatView(props: Props) {
       )}
 
       <div className="chat-main">
-        {loadingSession && (
+        {loadingSession && !firstLoad && (
           <div className="session-loading">
             <div className="session-loading-card">
               <Loading text={`正在载入「${(titles[loadingSession.sessionId] ?? loadingSession.title).slice(0, 40)}」`} />
@@ -1503,9 +1573,14 @@ export function ChatView(props: Props) {
         </div>
         <ChatMinimap scrollRef={scrollRef} items={state.items} shownFrom={shownFrom} matches={matches} onJump={setReveal} />
         {behind && (
-          <button className="jump-latest" onClick={toBottom}>
-            ↓ 有新内容，跳到最新
-          </button>
+          <div className="jump-latest-wrap">
+            <button className="jump-latest" onClick={toBottom}>
+              <span className="jump-arrow" aria-hidden="true">
+                ↓
+              </span>
+              有新内容，跳到最新
+            </button>
+          </div>
         )}
         </div>
 
@@ -1543,12 +1618,13 @@ export function ChatView(props: Props) {
             </div>
           )}
           {coldTokens() !== null && (
-            <div className={`cold-notice${coldArmed ? " armed" : ""}`}>
+            <div className={`cold-notice${coldArmed ? " armed" : ""}${coldTokens()! >= COLD_HEAVY_TOKENS ? " heavy" : ""}`}>
               <div className="cold-text">
+                {coldTokens()! >= COLD_HEAVY_TOKENS && <div className="cold-head">⚠ 大会话冷启动：下一条消息会把整段上下文重新写入缓存</div>}
                 此会话上下文约 <b>{Math.round(coldTokens()! / 1000)}k</b> tokens，已闲置 {idleText(Date.now() - state.lastActive!)}，缓存已过期
-                {estimatePct(coldTokens()!) !== null && (
+                {coldPct(coldTokens()!) !== null && (
                   <>
-                    （预计约消耗 5 小时额度的 <b>{pctText(estimatePct(coldTokens()!)!)}</b>）
+                    （预计约消耗 5 小时额度的 <b>{pctText(coldPct(coldTokens()!)!)}</b>）
                   </>
                 )}
                 。发送消息或执行 /compact 都会按完整上下文重新计费一次。只是追问一两句就直接发；还要继续很多轮，先 /compact

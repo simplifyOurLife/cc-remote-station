@@ -5,6 +5,8 @@ export interface TerminalPrefs {
   fontSize: number;
   theme: "neon" | "dark" | "light";
   scrollback: number;
+  /** 预测回显：网络延迟高时，打的字先在本地显示，云端回显后校正 */
+  predictiveEcho: boolean;
 }
 
 export interface Snippet {
@@ -27,6 +29,7 @@ export const defaultPrefs: UiPrefs = {
     fontSize: 14,
     theme: "neon",
     scrollback: 10000,
+    predictiveEcho: true,
   },
   snippets: [
     { id: "claude", name: "启动 Claude Code", command: "claude", run: true },

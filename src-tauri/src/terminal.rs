@@ -43,7 +43,7 @@ pub async fn open(
     dir: Option<&str>,
     output: Channel<InvokeResponseBody>,
 ) -> Result<mpsc::UnboundedSender<Input>> {
-    let mut channel = conn.handle.channel_open_session().await?;
+    let mut channel = conn.open_channel().await?;
     channel.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await?;
     let cd = dir.map(|d| format!("cd {} 2>/dev/null; ", crate::chat::cd_target(d))).unwrap_or_default();
     match session {
@@ -104,13 +104,13 @@ pub async fn open(
 }
 
 /// 把剪贴板图片写到远端，返回远端绝对路径
-pub async fn upload_clipboard_image(conn: &Conn, png: &[u8]) -> Result<String> {
+pub async fn upload_clipboard_image(conn: &Arc<Conn>, png: &[u8]) -> Result<String> {
     upload(conn, "clipboard", "clip.png", png).await
 }
 
 /// 把本机文件传到远端 ~/.cache/cc-workstation/<kind>/，文件名加时间戳前缀避免重名，返回远端绝对路径。
 /// 顺手清理该目录里 7 天前的旧文件，避免无限堆积。
-pub async fn upload(conn: &Conn, kind: &str, name: &str, data: &[u8]) -> Result<String> {
+pub async fn upload(conn: &Arc<Conn>, kind: &str, name: &str, data: &[u8]) -> Result<String> {
     let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
     // 文件名会拼进远端命令，只保留安全字符（中文等非 ASCII 字符也保留）
     let safe: String = name

@@ -10,6 +10,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use super::McpState;
 use super::guard::describe;
+use crate::hosts::Host;
 use super::tasks::Task;
 
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -124,7 +125,8 @@ pub fn list() -> Value {
         },
         {
             "name": "run_command",
-            "description": format!("{RUN_HINT}（需用户在 cc-workstation 中开启）。工作目录必须在允许的目录内。\
+            "description": format!("{RUN_HINT}。受用户管控：可能未开启、只放行白名单，或需要用户在本机弹窗确认（会等待最多 60 秒）；\
+一条命令只做一件事，不要用 & | > 等拼接，拼接的命令总是要确认。工作目录必须在允许的目录内。\
 构建、跑测试等长任务请传 background=true，立即返回任务 id，再用 command_output 取输出。前台命令超时会结束整个进程树。"),
             "inputSchema": { "type": "object", "required": ["command"], "properties": {
                 "command": { "type": "string" },
@@ -180,7 +182,7 @@ pub fn list() -> Value {
     ])
 }
 
-pub async fn call(st: &McpState, name: &str, args: &Value) -> Result<ToolOut> {
+pub async fn call(st: &McpState, name: &str, args: &Value, host: Option<&Host>) -> Result<ToolOut> {
     let text = match name {
         "list_allowed_roots" => describe(&st.guard.roots()),
         "list_directory" => {
@@ -260,7 +262,7 @@ pub async fn call(st: &McpState, name: &str, args: &Value) -> Result<ToolOut> {
             };
             blocking(move || search_files(&dir, &opts)).await?
         }
-        "run_command" => run_command(st, args).await?,
+        "run_command" => run_command(st, args, host).await?,
         "command_output" => command_output(st, args).await?,
         "stop_command" => {
             let task = st.tasks.get(str_arg(args, "task_id")?).context("任务不存在")?;
@@ -616,17 +618,25 @@ fn clip_around(line: &str, re: &regex::Regex) -> String {
     format!("{head}{body}{tail}（本行共 {total} 字符）")
 }
 
-async fn run_command(st: &McpState, args: &Value) -> Result<String> {
-    ensure!(
-        st.guard.settings.read().unwrap().allow_commands,
-        "用户未开启本机命令执行。请提示用户在 cc-workstation 「本机访问设置」里打开「允许执行命令」。"
-    );
+/// host：发起的主机，用它单独设的管控模式；没设或本机其他程序直连时用全局模式
+async fn run_command(st: &McpState, args: &Value, host: Option<&Host>) -> Result<String> {
+    let command = str_arg(args, "command")?;
     let cwd = match args["cwd"].as_str() {
         Some(c) => st.guard.check(c)?,
         None => st.guard.roots().into_iter().next().context("未配置允许的目录")?,
     };
     let filter = OutFilter::from_args(args)?;
-    let task = st.tasks.spawn(str_arg(args, "command")?, &cwd)?;
+    let (global, allowlist) = {
+        let s = st.guard.settings.read().unwrap();
+        (s.command_mode, s.command_allowlist.clone())
+    };
+    let mode = host.and_then(|h| h.command_mode).unwrap_or(global);
+    let who = host.map_or("本机程序", |h| h.name.as_str());
+    let cwd_text = cwd.to_string_lossy();
+    if let Some(rule) = st.approvals.check(&st.app, mode, &allowlist, who, command, &cwd_text).await? {
+        add_rule(st, &rule)?;
+    }
+    let task = st.tasks.spawn(command, &cwd)?;
     if args["background"].as_bool().unwrap_or(false) {
         return Ok(format!(
             "已在后台启动，任务 id：{}。用 command_output（task_id={}）取输出，stop_command 停止。",
@@ -643,6 +653,17 @@ async fn run_command(st: &McpState, args: &Value) -> Result<String> {
     }
     let chunk = task.read_from(0);
     Ok(format!("退出码：{}\n{}", exit_text(chunk.exit), filter.apply(&chunk.text)))
+}
+
+/// 确认弹窗里选了「总是允许」：规则加进白名单并保存
+fn add_rule(st: &McpState, rule: &str) -> Result<()> {
+    let rule = rule.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut s = st.guard.settings.write().unwrap();
+    if !rule.is_empty() && !s.command_allowlist.contains(&rule) {
+        s.command_allowlist.push(rule);
+        s.save(&st.settings_path)?;
+    }
+    Ok(())
 }
 
 async fn command_output(st: &McpState, args: &Value) -> Result<String> {

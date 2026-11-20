@@ -89,6 +89,13 @@ export function PrefsPanel({ prefs, onSave }: { prefs: UiPrefs; onSave: (p: UiPr
             />
           </label>
         </div>
+        <label className="checkbox">
+          <input type="checkbox" checked={term.predictiveEcho} onChange={(e) => patchTerm({ predictiveEcho: e.target.checked })} />
+          预测回显
+          <span className="muted small">
+            网络延迟高时，打的字先在本地显示、云端回显后自动校正（延迟低于 30ms、vim 等全屏程序、密码输入时自动不预测）
+          </span>
+        </label>
         <div className="field-title">预览：</div>
         <pre
           className="font-preview"

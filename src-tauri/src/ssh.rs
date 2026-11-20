@@ -8,8 +8,9 @@ use russh::keys::{Algorithm, HashAlg, PublicKey, PublicKeyOrCertificate};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::hosts::{Auth, Host, HostStore, secret_get, secret_set};
@@ -20,7 +21,18 @@ pub struct Conn {
     /// 工具箱的反向转发（每个勾选的工具一条）及其建立结果
     pub forwards: Vec<ForwardState>,
     _jump: Option<Box<Conn>>,
+    /// 探测失败、已判定断开（TCP 可能还没关，is_closed 看不出来）
+    dead: AtomicBool,
+    /// 最近一次确认连接活着的时间
+    checked: Mutex<Instant>,
 }
+
+/// 这么久内确认过活着的连接直接复用，不再探测
+const PROBE_FRESH: Duration = Duration::from_secs(10);
+/// 探测只等一个来回，这么久没回应就判定已断
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// 开通道也只等一个来回；死连接上会一直挂着，要等心跳超时（约 45 秒）才报错
+const OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,9 +52,55 @@ pub struct ExecOutput {
 }
 
 impl Conn {
+    /// 复用前确认连接还活着：电脑睡眠、换网络后 TCP 往往已经断了而本地不知道，
+    /// 不探测的话新开的终端、读历史都会挂在死连接上。判定断开时顺手断掉它，
+    /// 挂在上面的终端标签立刻收到退出并自动重连
+    pub async fn alive(self: &Arc<Self>) -> bool {
+        if self.dead.load(Ordering::Relaxed) || self.handle.is_closed() {
+            return false;
+        }
+        if self.checked.lock().unwrap().elapsed() < PROBE_FRESH {
+            return true;
+        }
+        let ok = matches!(tokio::time::timeout(PROBE_TIMEOUT, self.handle.send_ping()).await, Ok(Ok(())))
+            && !self.handle.is_closed();
+        if ok {
+            *self.checked.lock().unwrap() = Instant::now();
+        } else {
+            self.kill();
+        }
+        ok
+    }
+
+    fn kill(self: &Arc<Self>) {
+        if self.dead.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        log::warn!("SSH 连接无响应，断开重连");
+        let conn = self.clone();
+        tokio::spawn(async move {
+            let _ = conn.handle.disconnect(russh::Disconnect::ByApplication, "no response", "").await;
+        });
+    }
+
+    /// 开会话通道，超时就判定连接已断
+    pub async fn open_channel(self: &Arc<Self>) -> Result<russh::Channel<client::Msg>> {
+        match tokio::time::timeout(OPEN_TIMEOUT, self.handle.channel_open_session()).await {
+            Ok(ch) => {
+                let ch = ch?;
+                *self.checked.lock().unwrap() = Instant::now();
+                Ok(ch)
+            }
+            Err(_) => {
+                self.kill();
+                bail!("云主机 {} 秒无响应，连接已断开，请重试", OPEN_TIMEOUT.as_secs())
+            }
+        }
+    }
+
     /// 在独立通道上执行一条非交互命令，可选喂 stdin
-    pub async fn exec(&self, cmd: &str, stdin: Option<&[u8]>) -> Result<ExecOutput> {
-        let mut ch = self.handle.channel_open_session().await?;
+    pub async fn exec(self: &Arc<Self>, cmd: &str, stdin: Option<&[u8]>) -> Result<ExecOutput> {
+        let mut ch = self.open_channel().await?;
         ch.exec(true, cmd).await?;
         if let Some(data) = stdin {
             ch.data(data).await?;
@@ -193,6 +251,17 @@ pub struct Client {
     unknown: Arc<Mutex<Option<String>>>,
     /// 云端端口 → 本机目标；云端经反向转发进来的连接按端口接到对应目标
     targets: HashMap<u32, (String, u16)>,
+    /// 这条连接属于哪台主机，转发进来的连接登记到 PEERS
+    host_id: String,
+}
+
+/// 经反向转发接进本机的连接：本机一侧的源端口 → 主机 id。
+/// 内置服务据此认出请求来自哪台主机（源端口由本机分配，云端伪造不了）
+static PEERS: std::sync::LazyLock<Mutex<HashMap<u16, String>>> = std::sync::LazyLock::new(Mutex::default);
+
+/// 本机连到内置服务的某个源端口属于哪台主机；不是经转发进来的（本机其他程序）为 None
+pub fn peer_host(port: u16) -> Option<String> {
+    PEERS.lock().unwrap().get(&port).cloned()
 }
 
 impl client::Handler for Client {
@@ -212,11 +281,20 @@ impl client::Handler for Client {
             return Ok(()); // 丢弃 reply 即拒绝
         };
         reply.accept().await;
+        let host_id = self.host_id.clone();
         tokio::spawn(async move {
             match tokio::net::TcpStream::connect((host.as_str(), port)).await {
                 Ok(mut tcp) => {
+                    // 先登记再转发数据：内置服务收到请求时一定查得到
+                    let local = tcp.local_addr().ok().map(|a| a.port());
+                    if let Some(p) = local {
+                        PEERS.lock().unwrap().insert(p, host_id);
+                    }
                     let mut stream = channel.into_stream();
                     let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+                    if let Some(p) = local {
+                        PEERS.lock().unwrap().remove(&p);
+                    }
                 }
                 Err(e) => log::warn!("连接本机 {host}:{port} 失败: {e}"),
             }
@@ -271,6 +349,16 @@ fn config() -> Arc<client::Config> {
         keepalive_interval: Some(Duration::from_secs(15)),
         keepalive_max: 3,
         nodelay: true,
+        // 优先开 zlib 压缩（服务器不支持就退回不压缩）：会话列表、命令输出这类文本能小好几倍，
+        // 高延迟链路上传得快；zlib@openssh.com 认证后才启用，不影响握手
+        preferred: russh::Preferred {
+            compression: std::borrow::Cow::Borrowed(&[
+                russh::compression::ZLIB_LEGACY,
+                russh::compression::ZLIB,
+                russh::compression::NONE,
+            ]),
+            ..russh::Preferred::DEFAULT
+        },
         ..Default::default()
     })
 }
@@ -294,6 +382,7 @@ pub async fn connect(
         trust: trust.cloned(),
         unknown: unknown.clone(),
         targets: forwards.iter().map(|f| (f.remote_port.into(), (f.target_host.clone(), f.target_port))).collect(),
+        host_id: host.id.clone(),
     };
 
     let (result, jump) = match &host.jump {
@@ -345,7 +434,7 @@ pub async fn connect(
             error,
         });
     }
-    Ok(Conn { handle, forwards: states, _jump: jump })
+    Ok(Conn { handle, forwards: states, _jump: jump, dead: AtomicBool::new(false), checked: Mutex::new(Instant::now()) })
 }
 
 /// 密码/口令优先用弹窗里刚输入的，其次是凭据管理器里保存的；都没有或不对就返回 NeedSecret

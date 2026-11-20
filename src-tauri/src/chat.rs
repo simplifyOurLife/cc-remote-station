@@ -14,9 +14,19 @@ use crate::AppState;
 use crate::ssh::Conn;
 
 /// 非交互 shell 不加载 .bashrc（常见的 nvm 在里面），显式补上 claude 的常见安装位置
-pub const CLAUDE_PATH_SETUP: &str = "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/bin:$PATH\"; \
-     [ -s \"$HOME/.nvm/nvm.sh\" ] && . \"$HOME/.nvm/nvm.sh\" >/dev/null 2>&1; \
-     command -v claude >/dev/null 2>&1 || { echo '未找到 claude 命令，请确认云主机已安装 Claude Code' >&2; exit 127; }; ";
+macro_rules! claude_path {
+    () => {
+        "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/bin:$PATH\"; \
+         [ -s \"$HOME/.nvm/nvm.sh\" ] && . \"$HOME/.nvm/nvm.sh\" >/dev/null 2>&1; "
+    };
+}
+/// 只补 PATH，不检查 claude 是否存在（环境检查用）
+pub const CLAUDE_PATH: &str = claude_path!();
+/// 补 PATH 并确认 claude 存在，没有就以 127 退出
+pub const CLAUDE_PATH_SETUP: &str = concat!(
+    claude_path!(),
+    "command -v claude >/dev/null 2>&1 || { echo '未找到 claude 命令，云主机可能没装 Claude Code。可在工作区启动台的「检查云主机环境」里查看安装方法' >&2; exit 127; }; "
+);
 
 const PERMISSION_MODES: [&str; 4] = ["default", "acceptEdits", "plan", "bypassPermissions"];
 
@@ -59,7 +69,7 @@ pub async fn start(
         }
     }
     let script = format!("{CLAUDE_PATH_SETUP}cd {} || exit 1; exec {args}", cd_target(&opts.cwd));
-    let mut channel = conn.handle.channel_open_session().await?;
+    let mut channel = conn.open_channel().await?;
     channel.exec(true, format!("bash -lc {}", shell_quote(&script))).await?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -140,7 +150,8 @@ pub struct SessionInfo {
 }
 
 /// 列出云端最近的 Claude Code 会话。每个 jsonl 取两部分：
-/// - 开头 24KB：解析 cwd 和第一条用户消息；
+/// - 开头 24KB里第一条带 cwd 的行和前 5 条用户行：解析 cwd 和第一条用户消息
+///   （在云端就筛掉大块元数据，输出从几百 KB 降到几十 KB，再 gzip）；
 /// - 行首锚定 grep 出的标题记录（custom-title / ai-title / summary / last-prompt）。
 ///   新版会话开头是一串元数据和几十 KB 的大行，第一条用户消息往往不在开头，标题记录才可靠。
 /// 目录名以 - 开头（如 -home-ubuntu-xxx），ls / stat / head 都要加 --，否则会被当成选项。
@@ -148,7 +159,7 @@ pub struct SessionInfo {
 /// dir 有值时只读这个工作目录的会话：Claude Code 把每个目录的会话放在 ~/.claude/projects/<编码后的绝对路径>，
 /// 编码规则是把非字母数字字符都换成 -。路径先用 pwd -P 解析（claude 看到的是解开符号链接后的真实路径）。
 /// dir 为 None 时扫全部目录最近的 150 个。
-pub async fn list_sessions(conn: &Conn, dir: Option<&str>) -> Result<Vec<SessionInfo>> {
+pub async fn list_sessions(conn: &Arc<Conn>, dir: Option<&str>) -> Result<Vec<SessionInfo>> {
     let pick = match dir {
         Some(d) => format!(
             "d=$(cd {} 2>/dev/null && pwd -P) || exit 0; cd ~/.claude/projects 2>/dev/null || exit 0; \
@@ -159,12 +170,18 @@ pub async fn list_sessions(conn: &Conn, dir: Option<&str>) -> Result<Vec<Session
     };
     let script = format!(
         "{pick} | while IFS= read -r f; do \
-          printf '\\036%s\\t%s\\n' \"$f\" \"$(stat -c %Y -- \"$f\")\"; head -c 24000 -- \"$f\"; echo; \
+          printf '\\036%s\\t%s\\n' \"$f\" \"$(stat -c %Y -- \"$f\")\"; \
+          head -c 24000 -- \"$f\" | grep -a -m 1 '\"cwd\":'; head -c 24000 -- \"$f\" | grep -a -m 5 '\"type\":\"user\"'; echo; \
           grep -h '^{{\"type\":\"\\(custom-title\\|ai-title\\|summary\\|last-prompt\\)\"' -- \"$f\" | tail -n 8; \
-        done"
+        done | gzip -1"
     );
     let out = conn.exec(&format!("bash -c {}", shell_quote(&script)), None).await?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let mut raw = Vec::new();
+    // 目录不存在时脚本提前 exit 0，没有输出
+    if !out.stdout.is_empty() {
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&out.stdout[..]), &mut raw).context("解压会话列表失败")?;
+    }
+    let text = String::from_utf8_lossy(&raw);
     let mut sessions = Vec::new();
     for record in text.split('\x1e').filter(|r| !r.is_empty()) {
         let Some((head, body)) = record.split_once('\n') else { continue };
@@ -214,7 +231,7 @@ pub async fn list_sessions(conn: &Conn, dir: Option<&str>) -> Result<Vec<Session
 
 /// 最近用过的工作目录（新的在前）：取每个项目文件夹里最新会话开头的 cwd。
 /// 文件夹名是有损编码（- 分不清是 / 还是 .），所以从会话内容里取真实路径
-pub async fn recent_dirs(conn: &Conn) -> Result<Vec<String>> {
+pub async fn recent_dirs(conn: &Arc<Conn>) -> Result<Vec<String>> {
     let script = "cd ~/.claude/projects 2>/dev/null || exit 0; \
         ls -td -- */ 2>/dev/null | head -n 40 | while IFS= read -r d; do \
           f=$(ls -t -- \"$d\"*.jsonl 2>/dev/null | head -n 1); \
@@ -264,7 +281,7 @@ const HISTORY_KEEP_CHARS: usize = 20_000;
 
 /// 读取某个会话的历史（只取最后 3MB，足够显示近期上下文），返回瘦身后的用户/Claude 消息行。
 /// 会话文件大头是工具返回的全文和内部记录：云端 gzip 压缩传输，这里再丢掉界面用不上的部分
-pub async fn history(conn: &Conn, file: &str) -> Result<Vec<Value>> {
+pub async fn history(conn: &Arc<Conn>, file: &str) -> Result<Vec<Value>> {
     ensure!(!file.contains("..") && file.ends_with(".jsonl"), "非法的会话文件");
     let cmd = format!(
         "f=~/.claude/projects/{}; [ -r \"$f\" ] || {{ echo 会话文件不存在 >&2; exit 1; }}; tail -c 3000000 \"$f\" | gzip -1",
@@ -333,7 +350,7 @@ fn clip(s: &mut String) {
 }
 
 /// 删除云端会话文件（~/.claude/projects 下的某个 jsonl）
-pub async fn delete_session(conn: &Conn, file: &str) -> Result<()> {
+pub async fn delete_session(conn: &Arc<Conn>, file: &str) -> Result<()> {
     ensure!(!file.contains("..") && file.ends_with(".jsonl"), "非法的会话文件");
     let out = conn.exec(&format!("rm -f ~/.claude/projects/{}", shell_quote(file)), None).await?;
     ensure!(out.code == 0, "删除失败：{}", String::from_utf8_lossy(&out.stderr).trim());
@@ -341,7 +358,7 @@ pub async fn delete_session(conn: &Conn, file: &str) -> Result<()> {
 }
 
 /// 列出工作目录下的文件（给 @ 引用补全用）；git 仓库用 git ls-files，否则 find
-pub async fn list_files(conn: &Conn, cwd: &str) -> Result<Vec<String>> {
+pub async fn list_files(conn: &Arc<Conn>, cwd: &str) -> Result<Vec<String>> {
     let script = format!(
         "cd {} 2>/dev/null || exit 0; \
          git ls-files 2>/dev/null | head -n 20000 || true; \
