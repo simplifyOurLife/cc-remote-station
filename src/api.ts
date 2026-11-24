@@ -198,6 +198,15 @@ export function describeForwards(st: McpHostStatus): string {
     .join("\n");
 }
 
+/** 图形版 /config：可设的键（CLI 用法说明原文）和几份配置文件的内容（读不到为 null） */
+export interface ClaudeConfig {
+  usage: string;
+  user: Record<string, any> | null;
+  project: Record<string, any> | null;
+  local: Record<string, any> | null;
+  global: Record<string, any> | null;
+}
+
 export interface HostCheck {
   /** claude --version 的输出；没装为 null */
   claude: string | null;
@@ -300,6 +309,9 @@ export const api = {
   /** dir 为 null 写全局（user），否则写该项目（local）；remove 是 Claude 里已有的名字 */
   claudeMcpApply: (hostId: string, dir: string | null, add: { name: string; cloudName: string }[], remove: string[]) =>
     invoke<string>("claude_mcp_apply", { hostId, dir, add, remove }),
+  claudeConfigRead: (hostId: string, dir: string) => invoke<ClaudeConfig>("claude_config_read", { hostId, dir }),
+  claudeConfigSet: (hostId: string, dir: string, key: string, value: string) =>
+    invoke<string>("claude_config_set", { hostId, dir, key, value }),
   uiPrefsGet: () => invoke<Record<string, unknown>>("ui_prefs_get"),
   uiPrefsSet: (prefs: unknown) => invoke<void>("ui_prefs_set", { prefs }),
   sshConfigRead: () => invoke<string>("ssh_config_read"),

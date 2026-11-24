@@ -46,6 +46,30 @@ function mergeCommands(cur: SlashCommand[], names: string[]): SlashCommand[] {
   return [...cur, ...names.filter((n) => !known.has(n)).map((name) => ({ name }))];
 }
 
+export interface ModelOption {
+  value: string;
+  label: string;
+  description?: string;
+  efforts?: string[];
+}
+
+/**
+ * CLI 原生命令的数据：-p 模式下靠控制请求（get_usage / get_context_usage / get_settings）取，
+ * 不进对话记录、不占一轮、不消耗 token。usage / context 失败时为 { error }
+ */
+export interface NativeInfo {
+  version: string | null;
+  account: { email?: string; organization?: string; subscriptionType?: string; apiProvider?: string } | null;
+  outputStyle: string | null;
+  outputStyles: string[];
+  /** 可用的子代理（内置 + ~/.claude/agents + 项目 .claude/agents） */
+  agents: { name: string; description?: string; model?: string }[];
+  /** 实际生效的模型和思考强度 */
+  applied: { model?: string; effort?: string } | null;
+  usage: Record<string, any> | null;
+  context: Record<string, any> | null;
+}
+
 /** 用量：各项拿不到时为 null（如还没回复过） */
 export interface Usage {
   /** 本会话累计花费（来自每轮 result 的 total_cost_usd） */
@@ -84,8 +108,10 @@ export interface ChatState {
   model: string | null;
   /** 可用斜杠命令：initialize 回执带说明，init 事件只有名字 */
   slashCommands: SlashCommand[];
-  /** initialize 回执里的可选模型 */
-  models: { value: string; label: string }[];
+  /** initialize 回执里的可选模型；efforts 为支持的思考强度（不支持则没有） */
+  models: ModelOption[];
+  /** 图形版 /usage、/context、/model、/status 的数据 */
+  native: NativeInfo;
   /** 云端 claude 加载的 MCP 服务器及状态（init 事件只有名字和状态，mcp_status 回执更详细） */
   mcpServers: McpServer[];
   /** 本轮可用的全部工具名（来自 init），MCP 工具形如 mcp__服务器__工具 */
@@ -110,6 +136,7 @@ export const emptyState: ChatState = {
   model: null,
   slashCommands: [],
   models: [],
+  native: { version: null, account: null, outputStyle: null, outputStyles: [], agents: [], applied: null, usage: null, context: null },
   mcpServers: [],
   tools: [],
   usage: { costUsd: null, contextUsed: null, contextWindow: null },
@@ -306,6 +333,8 @@ export function reduce(s: ChatState, e: Record<string, any>): ChatState {
     case "control_cancel_request":
       return { ...s, permissions: s.permissions.filter((p) => p.requestId !== e.request_id) };
     case "control_response": {
+      const native = nativeResponse(s, String(e.response?.request_id ?? ""), e.response);
+      if (native) return native;
       if (e.response?.subtype === "error") {
         // 老版本 CLI 不认 initialize 时静默忽略，命令列表退回到第一轮 init 里取
         const id = String(e.response.request_id ?? "");
@@ -324,8 +353,25 @@ export function reduce(s: ChatState, e: Record<string, any>): ChatState {
       }
       if (Array.isArray(r.models)) {
         next.models = r.models.map((m: any) =>
-          typeof m === "string" ? { value: m, label: m } : { value: m.value, label: m.displayName ?? m.value },
+          typeof m === "string"
+            ? { value: m, label: m }
+            : {
+                value: m.value,
+                label: m.displayName ?? m.value,
+                description: m.description,
+                efforts: m.supportsEffort && Array.isArray(m.supportedEffortLevels) ? m.supportedEffortLevels : undefined,
+              },
         );
+      }
+      if (r.claude_code_version || r.account) {
+        next.native = {
+          ...s.native,
+          version: r.claude_code_version ?? null,
+          account: r.account ?? null,
+          outputStyle: r.output_style ?? null,
+          outputStyles: Array.isArray(r.available_output_styles) ? r.available_output_styles : [],
+          agents: Array.isArray(r.agents) ? r.agents.filter((a: any) => a?.name).map((a: any) => ({ name: a.name, description: a.description, model: a.model })) : [],
+        };
       }
       return next;
     }
@@ -544,6 +590,64 @@ export function serverTools(server: McpServer, tools: string[]): string[] {
   if (server.tools) return server.tools;
   const prefix = `mcp__${server.name.replace(/[^a-zA-Z0-9_-]/g, "_")}__`;
   return tools.filter((t) => t.startsWith(prefix)).map((t) => t.slice(prefix.length));
+}
+
+// ---- 原生命令（/usage /context /model /effort）的控制请求 ----
+
+const USAGE_PREFIX = "usage-";
+const CONTEXT_PREFIX = "ctx-";
+const SETTINGS_PREFIX = "settings-";
+export const FLAGS_PREFIX = "flags-";
+
+const request = (prefix: string, req: Record<string, any>) => ({ type: "control_request", request_id: prefix + crypto.randomUUID(), request: req });
+/** 订阅额度、本会话花费、近 24 小时 / 7 天的用量构成和建议（即 /usage） */
+export const usageRequest = () => request(USAGE_PREFIX, { subtype: "get_usage" });
+/** 上下文按类别的占用（即 /context） */
+export const contextRequest = () => request(CONTEXT_PREFIX, { subtype: "get_context_usage" });
+/** 实际生效的设置：applied 里有模型和思考强度 */
+export const settingsRequest = () => request(SETTINGS_PREFIX, { subtype: "get_settings" });
+/** 会话级设置（思考强度 effortLevel、输出风格 outputStyle）：CLI 没有单独的 set_effort 等请求，只对当前进程生效 */
+export const flagsRequest = (settings: Record<string, string>) => request(FLAGS_PREFIX, { subtype: "apply_flag_settings", settings });
+
+const USAGE_WINDOWS = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"];
+
+/** get_usage 里的各窗口换成状态栏的额度格式：utilization 已经是 0–100，resets_at 是 ISO 时间 */
+function usageLimits(u: Record<string, any>): Record<string, RateLimit> {
+  const now = Date.now();
+  const out: Record<string, RateLimit> = {};
+  for (const w of USAGE_WINDOWS) {
+    const r = u.rate_limits?.[w];
+    if (typeof r?.utilization !== "number") continue;
+    const t = r.resets_at ? Date.parse(r.resets_at) : NaN;
+    out[w] = {
+      window: w,
+      status: r.locked_reason || r.utilization >= 100 ? "rejected" : "allowed",
+      usedPct: Math.round(r.utilization),
+      resetsAt: isNaN(t) ? null : Math.round(t / 1000),
+      updatedAt: now,
+    };
+  }
+  return out;
+}
+
+/** 原生命令请求的回执；不是这几类返回 null */
+function nativeResponse(s: ChatState, id: string, resp: any): ChatState | null {
+  const ok = resp?.subtype !== "error";
+  const data = ok ? (resp?.response ?? {}) : { error: String(resp?.error ?? "请求失败") };
+  if (id.startsWith(USAGE_PREFIX)) {
+    return { ...s, native: { ...s.native, usage: data }, rateLimits: ok ? { ...s.rateLimits, ...usageLimits(data) } : s.rateLimits };
+  }
+  if (id.startsWith(CONTEXT_PREFIX)) {
+    // 顺便补上窗口大小；新会话还没回复时，用它的估算代替预估值
+    const usage = ok ? { ...s.usage, contextWindow: data.maxTokens ?? s.usage.contextWindow, contextUsed: s.usage.contextUsed ?? data.totalTokens ?? null } : s.usage;
+    return { ...s, native: { ...s.native, context: data }, usage };
+  }
+  if (id.startsWith(SETTINGS_PREFIX)) {
+    if (!ok) return s;
+    return { ...s, native: { ...s.native, applied: data.applied ?? null, outputStyle: data.effective?.outputStyle ?? s.native.outputStyle } };
+  }
+  if (id.startsWith(FLAGS_PREFIX)) return ok ? s : system(s, `设置未生效：${data.error}`, "error");
+  return null;
 }
 
 /** 启动后的 initialize 请求：id 带固定前缀，失败时能认出来并忽略 */

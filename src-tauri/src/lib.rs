@@ -687,6 +687,62 @@ async fn claude_mcp_apply(
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ClaudeConfig {
+    /// `/config` 不带参数的用法说明：每行 key=可选值
+    usage: String,
+    /// ~/.claude/settings.json、<dir>/.claude/settings.json、<dir>/.claude/settings.local.json
+    user: Value,
+    project: Value,
+    local: Value,
+    /// ~/.claude.json 的顶层标量（部分 /config 项存在这里）
+    global: Value,
+}
+
+const CONFIG_SEP: &str = "@@ccws-config@@";
+
+/// 图形版 /config 的数据。-p 模式没有读配置的控制请求，这里用一次性的
+/// `claude -p --no-session-persistence "/config"`（不留会话记录）取可设的键，再直接读几份配置文件拿当前值
+#[tauri::command]
+async fn claude_config_read(state: State<'_, AppState>, host_id: String, dir: String) -> CmdResult<ClaudeConfig> {
+    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
+    let script = format!(
+        "{}cd {} || exit 1; claude -p --no-session-persistence '/config'; \
+         for f in ~/.claude/settings.json .claude/settings.json .claude/settings.local.json ~/.claude.json; do \
+           echo {CONFIG_SEP}; cat \"$f\" 2>/dev/null; done",
+        chat::CLAUDE_PATH_SETUP,
+        chat::cd_target(&dir)
+    );
+    let out = run_remote(&conn, &script).await.context("云端读取 Claude Code 配置失败")?;
+    let mut parts = out.split(CONFIG_SEP).map(str::trim);
+    let usage = parts.next().unwrap_or_default().to_string();
+    let mut json = || serde_json::from_str::<Value>(parts.next().unwrap_or_default()).unwrap_or(Value::Null);
+    let (user, project, local) = (json(), json(), json());
+    // ~/.claude.json 里有项目历史等大对象，只留标量
+    let global = match json() {
+        Value::Object(m) => Value::Object(m.into_iter().filter(|(_, v)| !v.is_object() && !v.is_array()).collect()),
+        _ => Value::Null,
+    };
+    Ok(ClaudeConfig { usage, user, project, local, global })
+}
+
+/// 执行 `/config key=value`，返回 CLI 的说明（成功是 "Set …"，值不对也是退出码 0 加一句说明）
+#[tauri::command]
+async fn claude_config_set(state: State<'_, AppState>, host_id: String, dir: String, key: String, value: String) -> CmdResult<String> {
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(anyhow!("配置项名无效：{key}").into());
+    }
+    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
+    let script = format!(
+        "{}cd {} || exit 1; claude -p --no-session-persistence {}",
+        chat::CLAUDE_PATH_SETUP,
+        chat::cd_target(&dir),
+        chat::shell_quote(&format!("/config {key}={value}"))
+    );
+    Ok(run_remote(&conn, &script).await.context("云端执行 /config 失败")?)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct HostCheck {
     /// claude --version 的输出；没装为 None
     claude: Option<String>,
@@ -1023,6 +1079,8 @@ pub fn run() {
             host_delete,
             claude_mcp_state,
             claude_mcp_apply,
+            claude_config_read,
+            claude_config_set,
             command_confirm_answer,
             host_check,
             update::update_check,

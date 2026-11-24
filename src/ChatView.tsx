@@ -13,8 +13,11 @@ import { api, ChatSession, errorText, Host, PermissionMode } from "./api";
 import {
   addLocalUser,
   ChatState,
+  contextRequest,
   controlRequest,
   emptyState,
+  FLAGS_PREFIX,
+  flagsRequest,
   fromHistory,
   initializeRequest,
   Item,
@@ -29,15 +32,19 @@ import {
   permissionDeny,
   permissionReply,
   reduce,
+  settingsRequest,
   system,
   toMarkdown,
+  usageRequest,
   userMessage,
 } from "./chatModel";
 import { Markdown } from "./Markdown";
+import { AgentsPanel, ConfigPanel, ContextPanel, ModelPanel, OutputStylePanel, StatusPanel, UsagePanel } from "./NativePanels";
 import { McpPanel } from "./McpPanel";
 import { Combo } from "./Select";
 import { PopupMenu } from "./PopupMenu";
 import { ChatMinimap } from "./ChatMinimap";
+import { ChatQueue, Queued, queued } from "./ChatQueue";
 import { openMenu, selectedText } from "./ContextMenu";
 import { copyText } from "./copy";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -167,6 +174,27 @@ const LOCAL_COMMANDS: SlashCommand[] = [
   { name: "fork", description: "本地 · 分叉：在新会话里接着聊，原会话不变" },
   { name: "export", description: "本地 · 导出当前对话为 Markdown" },
   { name: "mcp", description: "本地 · 查看 MCP 服务器状态和工具，可重连、启停" },
+  { name: "usage", description: "本地 · 订阅额度、本会话花费和用量构成" },
+  { name: "context", description: "本地 · 上下文按类别的占用" },
+  { name: "model", description: "本地 · 切换模型和思考强度，可直接跟模型名", argumentHint: "[模型]" },
+  { name: "effort", description: "本地 · 设置思考强度，可直接跟 low/medium/high/xhigh/max", argumentHint: "[强度]" },
+  { name: "status", description: "本地 · 版本、账号、模型、权限模式等当前状态" },
+  { name: "output-style", description: "本地 · 切换输出风格（简洁、讲解、学习…）" },
+  { name: "agents", description: "本地 · 查看可用的子代理" },
+  { name: "config", description: "本地 · Claude Code 设置（自动压缩、语言、默认模型…）" },
+];
+
+type NativePanel = "usage" | "context" | "model" | "status" | "output-style" | "agents" | "config";
+
+/** ⌘ 菜单里的原生命令面板入口 */
+const PANEL_MENU: [NativePanel, string][] = [
+  ["usage", "用量与额度"],
+  ["context", "上下文占用"],
+  ["model", "模型与思考强度"],
+  ["output-style", "输出风格"],
+  ["agents", "子代理"],
+  ["config", "Claude Code 设置"],
+  ["status", "当前状态"],
 ];
 
 interface Props {
@@ -270,8 +298,9 @@ export function ChatView(props: Props) {
   const chatIdRef = useRef<string | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   sessionIdRef.current = state.sessionId;
-  // 优先用主机的默认工作目录（每台电脑可以设得不同），没设才用家目录
-  const [cwd, setCwd] = useState(host.dir || "~");
+  // 「新标签打开」历史会话时用会话所在目录；否则优先主机的默认工作目录（每台电脑可以设得不同），没设才用家目录
+  const startDir = props.initialSession?.cwd || host.dir || "~";
+  const [cwd, setCwd] = useState(startDir);
   const [model, setModel] = useState("");
   const [mode, setMode] = useState<PermissionMode>("default");
   // 启动进程时读 ref：切换会话后立刻预热，此时 state 还没刷新
@@ -301,14 +330,18 @@ export function ChatView(props: Props) {
     }
   };
   /** 左侧的工作目录：只列这个目录的历史会话，「新对话」也在这里开始；allDirs 时列全部目录 */
-  const [listDir, setListDir] = useState(host.dir || "~");
+  const [listDir, setListDir] = useState(startDir);
   const [allDirs, setAllDirs] = useState(false);
   /** 云端 Claude 最近用过的目录（目录下拉的建议）；还在读为 null */
   const [recentDirs, setRecentDirs] = useState<string[] | null>(null);
   /** 最近一次读取的条件，刷新、删除后按它重读；序号用来丢弃过时的响应 */
-  const listQuery = useRef<{ dir: string | null; seq: number }>({ dir: host.dir || "~", seq: 0 });
+  const listQuery = useRef<{ dir: string | null; seq: number }>({ dir: startDir, seq: 0 });
   const [input, setInput] = useState("");
   const [images, setImages] = useState<string[]>([]);
+  /** 回答进行中发的消息先候补，不插进正在进行的这一轮；中断后暂停，编辑时也先不发 */
+  const [queue, setQueue] = useState<Queued[]>([]);
+  const [queuePaused, setQueuePaused] = useState(false);
+  const [queueEditing, setQueueEditing] = useState<number | null>(null);
   const [completion, setCompletion] = useState<Completion | null>(null);
   const filesRef = useRef<{ cwd: string; files: string[] } | null>(null);
   /** 下次启动进程时带 --fork-session：在新会话里接着当前历史聊 */
@@ -324,6 +357,10 @@ export function ChatView(props: Props) {
   const [showMcp, setShowMcp] = useState(false);
   /** 正在重连/启停的 MCP 服务器 */
   const [mcpPending, setMcpPending] = useState<string | null>(null);
+  /** 打开中的原生命令面板（/usage /context /model /status） */
+  const [panel, setPanel] = useState<NativePanel | null>(null);
+  /** 用户在本窗格选过的会话级设置（思考强度、输出风格）：进程重启（换会话、分叉）后重新应用 */
+  const flagsRef = useRef<Record<string, string>>({});
 
   // 会话有了 id 后，把当前权限模式和模型记到这个会话上（下次继续时恢复）
   useEffect(() => {
@@ -434,8 +471,12 @@ export function ChatView(props: Props) {
 
   // 新内容到达时，若用户本来就在底部则跟随滚动
   const nearBottom = useRef(true);
+  const runningRef = useRef(false);
+  runningRef.current = state.running;
   /** 用户翻到上面时又有了新内容：显示「跳到最新」 */
   const [behind, setBehind] = useState(false);
+  /** 翻上去超过半屏：没有新内容也给一个「回到底部」 */
+  const [away, setAway] = useState(false);
   const toBottom = () => {
     const el = scrollRef.current;
     if (!el) return;
@@ -450,7 +491,8 @@ export function ChatView(props: Props) {
     const follow = () => {
       if (earlierLoaded.current) earlierLoaded.current = false;
       else if (nearBottom.current) el.scrollTop = el.scrollHeight;
-      else setBehind(true);
+      // 只有回答进行中才算「有新内容」；回答完后翻上去展开卡片、图片加载撑高都不算
+      else if (runningRef.current) setBehind(true);
     };
     const mo = new MutationObserver(follow);
     mo.observe(el, { childList: true, subtree: true, characterData: true });
@@ -524,6 +566,10 @@ export function ChatView(props: Props) {
       setMcpPending(null);
       if (e.response.subtype !== "error") write(mcpStatusRequest());
     }
+    // 思考强度设置成功：重读实际生效的值
+    if (e.type === "control_response" && e.response?.subtype !== "error" && String(e.response?.request_id ?? "").startsWith(FLAGS_PREFIX)) {
+      write(settingsRequest());
+    }
     observeQuota(e);
     setState((s) => reduce(s, e));
   };
@@ -548,6 +594,10 @@ export function ChatView(props: Props) {
     chatIdRef.current = id;
     // 和 Agent SDK 一样先发 initialize：不用等第一条消息就能拿到命令列表和可选模型
     await api.chatSend(id, initializeRequest());
+    // 额度不用等第一次回复：启动就查一次（不进对话、不耗 token）；再读实际生效的模型和思考强度
+    if (Object.keys(flagsRef.current).length) await api.chatSend(id, flagsRequest(flagsRef.current));
+    await api.chatSend(id, usageRequest());
+    await api.chatSend(id, settingsRequest());
     return id;
   };
 
@@ -566,9 +616,11 @@ export function ChatView(props: Props) {
 
   /** 本地命令在这里执行，返回 true 表示已处理、不再发给云端 */
   const runLocalCommand = (text: string): boolean => {
-    const m = text.trim().match(/^\/(\w+)\s*([\s\S]*)$/);
+    const m = text.trim().match(/^\/([\w-]+)\s*([\s\S]*)$/);
     if (!m || !LOCAL_COMMANDS.some((c) => c.name === m[1])) return false;
     const arg = m[2].trim();
+    // 带参数的 /agents（让 Claude 新建子代理）和 /config key=value 交给云端原样执行
+    if (arg && (m[1] === "agents" || m[1] === "config")) return false;
     if (m[1] === "resume") {
       setPicker({ q: arg, index: 0 });
       if (sessions === null) loadSessions();
@@ -586,9 +638,43 @@ export function ChatView(props: Props) {
       exportMarkdown();
     } else if (m[1] === "mcp") {
       openMcp();
+    } else if (m[1] === "usage" || m[1] === "context" || m[1] === "status" || m[1] === "agents" || m[1] === "config") {
+      openPanel(m[1]);
+    } else if (m[1] === "output-style") {
+      if (arg) applyFlag("outputStyle", arg);
+      else openPanel("output-style");
+    } else if (m[1] === "model") {
+      if (arg) changeModel(arg === "default" ? "" : arg);
+      else openPanel("model");
+    } else if (m[1] === "effort") {
+      if (arg) changeEffort(arg);
+      else openPanel("model");
     }
     return true;
   };
+
+  /** 打开原生命令面板：每次打开都重新取一次数据（没启动就先启动）；/config 由面板自己经 SSH 读 */
+  const openPanel = (p: NativePanel) => {
+    setPanel(p);
+    if (p === "config") return;
+    const req = p === "usage" ? usageRequest() : p === "context" ? contextRequest() : settingsRequest();
+    ensureStarted()
+      .then(() => write(req))
+      .catch((e) => setState((s) => system(s, `启动云端 claude 失败：${errorText(e)}`, "error")));
+  };
+  const refreshPanel = (p: "usage" | "context") => {
+    setState((s) => ({ ...s, native: { ...s.native, [p]: null } }));
+    write(p === "usage" ? usageRequest() : contextRequest());
+  };
+
+  /** 会话级设置：立即应用，并记下来供进程重启后重新应用 */
+  const applyFlag = (key: "effortLevel" | "outputStyle", value: string) => {
+    flagsRef.current = { ...flagsRef.current, [key]: value };
+    ensureStarted()
+      .then(() => write(flagsRequest({ [key]: value })))
+      .catch((err) => setState((s) => system(s, `启动云端 claude 失败：${errorText(err)}`, "error")));
+  };
+  const changeEffort = (e: string) => applyFlag("effortLevel", e);
 
   const openMcp = () => {
     setShowMcp(true);
@@ -620,6 +706,16 @@ export function ChatView(props: Props) {
     setInput("");
     setImages([]);
     setCompletion(null);
+    if (state.running || queue.length) {
+      setQueue((q) => [...q, queued(text, imgs)]);
+      // 中断暂停后空闲时再发一条：排到队尾，并恢复发送
+      if (!state.running) setQueuePaused(false);
+      return;
+    }
+    dispatch(text, imgs);
+  };
+
+  const dispatch = async (text: string, imgs: string[]) => {
     nearBottom.current = true;
     if (!state.items.length) propsRef.current.onTitle(text.trim().slice(0, 30) || basename(cwd));
     setState((s) => addLocalUser(s, text, imgs));
@@ -629,6 +725,26 @@ export function ChatView(props: Props) {
     } catch (e) {
       setState((s) => system({ ...s, running: false }, `发送失败：${errorText(e)}`, "error"));
     }
+  };
+
+  // 一轮结束就发下一条候补
+  useEffect(() => {
+    if (state.running || queuePaused || queueEditing !== null || !queue.length) return;
+    const [next, ...rest] = queue;
+    setQueue(rest);
+    dispatch(next.text, next.images);
+  }, [state.running, queuePaused, queueEditing, queue]);
+
+  const interrupt = () => {
+    setQueuePaused(true);
+    write(controlRequest({ subtype: "interrupt" }));
+  };
+
+  /** 插队：把这条挪到最前，中断当前回答，回答一停就发它 */
+  const sendNow = (id: number) => {
+    setQueue((q) => [...q.filter((x) => x.id === id), ...q.filter((x) => x.id !== id)]);
+    setQueuePaused(false);
+    if (state.running) write(controlRequest({ subtype: "interrupt" }));
   };
 
   const decide = (req: PermissionRequest, decision: "allow" | "always" | "deny") => {
@@ -648,6 +764,7 @@ export function ChatView(props: Props) {
     lastModel.current = m;
     setModel(m);
     write(controlRequest({ subtype: "set_model", model: m || "default" }));
+    write(settingsRequest());
   };
 
   /** 切换到另一个会话：结束当前进程，按新会话（或 --resume）立刻重新预热 */
@@ -660,6 +777,9 @@ export function ChatView(props: Props) {
     freshRef.current = !next.sessionId && !next.items.length;
     setShownFrom(0);
     setColdArmed(false);
+    setQueue([]);
+    setQueuePaused(false);
+    setQueueEditing(null);
     // 额度是账号级的、窗口大小跟模型走，换会话都不清空
     setState((s) => withSavedUsage(next, { rateLimits: s.rateLimits, contextWindow: s.usage.contextWindow }));
     setCwd(nextCwd);
@@ -1084,7 +1204,7 @@ export function ChatView(props: Props) {
       e.preventDefault();
       send();
     }
-    if (e.key === "Escape" && state.running) write(controlRequest({ subtype: "interrupt" }));
+    if (e.key === "Escape" && state.running) interrupt();
   };
 
   // 粘贴截图作为图片输入
@@ -1157,6 +1277,67 @@ export function ChatView(props: Props) {
           onClose={() => setShowMcp(false)}
         />
       )}
+      {panel === "usage" && (
+        <UsagePanel
+          data={state.native.usage}
+          tz={tz}
+          onRefresh={() => refreshPanel("usage")}
+          onSend={(t) => {
+            setPanel(null);
+            sendText(t);
+          }}
+          onOpenMcp={() => {
+            setPanel(null);
+            openMcp();
+          }}
+          onClose={() => setPanel(null)}
+        />
+      )}
+      {panel === "context" && (
+        <ContextPanel
+          data={state.native.context}
+          running={state.running}
+          onRefresh={() => refreshPanel("context")}
+          onCompact={() => {
+            setPanel(null);
+            sendText("/compact");
+          }}
+          onClose={() => setPanel(null)}
+        />
+      )}
+      {panel === "model" && (
+        <ModelPanel
+          models={state.models}
+          model={model}
+          applied={state.native.applied}
+          onModel={changeModel}
+          onEffort={changeEffort}
+          onClose={() => setPanel(null)}
+        />
+      )}
+      {panel === "status" && <StatusPanel state={state} cwd={cwd} mode={mode} mcpServers={state.mcpServers} onClose={() => setPanel(null)} />}
+      {panel === "output-style" && (
+        <OutputStylePanel
+          hostId={host.id}
+          cwd={cwd}
+          styles={state.native.outputStyles}
+          current={state.native.outputStyle}
+          onPick={(s) => applyFlag("outputStyle", s)}
+          onClose={() => setPanel(null)}
+        />
+      )}
+      {panel === "agents" && (
+        <AgentsPanel
+          agents={state.native.agents}
+          onDraft={(t) => {
+            setPanel(null);
+            setInput(t);
+            inputRef.current?.focus();
+          }}
+          onClose={() => setPanel(null)}
+        />
+      )}
+      {panel === "config" && <ConfigPanel hostId={host.id} cwd={cwd} onClose={() => setPanel(null)} />}
       {picker && (
         <div className="pane-overlay" onMouseDown={(e) => e.target === e.currentTarget && setPicker(null)}>
           <div className="dialog session-picker">
@@ -1410,8 +1591,21 @@ export function ChatView(props: Props) {
                   <span>清空，开新会话</span>
                   <code className="muted">/clear</code>
                 </div>
+                {PANEL_MENU.map(([name, label]) => (
+                  <div
+                    key={name}
+                    className="menu-item"
+                    onClick={() => {
+                      setShowCommands(false);
+                      openPanel(name);
+                    }}
+                  >
+                    <span>{label}</span>
+                    <code className="muted">/{name}</code>
+                  </div>
+                ))}
                 {state.slashCommands
-                  .filter((c) => c.name !== "compact" && c.name !== "clear")
+                  .filter((c) => c.name !== "compact" && c.name !== "clear" && !LOCAL_COMMANDS.some((l) => l.name === c.name))
                   .map((c) => (
                     <div
                       key={c.name}
@@ -1481,6 +1675,7 @@ export function ChatView(props: Props) {
             const el = e.currentTarget;
             nearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
             if (nearBottom.current) setBehind(false);
+            setAway(el.scrollHeight - el.scrollTop - el.clientHeight > el.clientHeight / 2);
             if (el.scrollTop < 40) loadEarlier();
           }}
         >
@@ -1565,7 +1760,7 @@ export function ChatView(props: Props) {
             <div className="chat-working">
               <span className="spinner" /> Claude 正在工作…
               {lastUserAt(state.items) && <Elapsed since={lastUserAt(state.items)!} />}
-              <button className="link" onClick={() => write(controlRequest({ subtype: "interrupt" }))}>
+              <button className="link" onClick={interrupt}>
                 中断（Esc）
               </button>
             </div>
@@ -1581,6 +1776,11 @@ export function ChatView(props: Props) {
               有新内容，跳到最新
             </button>
           </div>
+        )}
+        {!behind && away && (
+          <button className="to-bottom" title="回到底部" onClick={toBottom}>
+            ↓
+          </button>
         )}
         </div>
 
@@ -1646,6 +1846,16 @@ export function ChatView(props: Props) {
               </div>
             </div>
           )}
+          {queue.length > 0 && (
+            <ChatQueue
+              items={queue}
+              paused={queuePaused}
+              onChange={setQueue}
+              onEditing={setQueueEditing}
+              onSendNow={sendNow}
+              onResume={() => setQueuePaused(false)}
+            />
+          )}
           <ChatStatus
             mode={mode}
             onMode={changeMode}
@@ -1653,6 +1863,7 @@ export function ChatView(props: Props) {
             rateLimits={state.rateLimits}
             tz={tz}
             baseContext={baseContext}
+            onOpen={openPanel}
             onHotCompact={
               !state.running &&
               (state.usage.contextUsed ?? 0) > HOT_COMPACT_TOKENS &&
@@ -1667,7 +1878,7 @@ export function ChatView(props: Props) {
             value={input}
             rows={2}
             placeholder={
-              state.running ? "Claude 正在工作，可以继续输入（会排队）" : "给 Claude 发消息（Enter 发送，Shift+Enter 换行，/ 命令，@ 文件）"
+              state.running ? "Claude 正在工作，继续发送的消息会进入候补，本轮结束后依次发出" : "给 Claude 发消息（Enter 发送，Shift+Enter 换行，/ 命令，@ 文件）"
             }
             onChange={(e) => {
               setInput(e.target.value);

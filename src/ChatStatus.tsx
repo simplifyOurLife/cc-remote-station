@@ -68,9 +68,14 @@ function windowView(r: RateLimit | undefined, now: number, tz: HostTz | null): C
 }
 
 /** 切角芯片：底色按比例从左填充，重置倒计时跟在后面 */
-function Chip({ label, v, title }: { label: string; v: ChipView; title?: string }) {
+function Chip({ label, v, title, onClick }: { label: string; v: ChipView; title?: string; onClick?: () => void }) {
   return (
-    <span className={`q-chip ${v.cls}`} style={{ "--fill": `${Math.min(100, Math.max(0, v.fill))}%` } as React.CSSProperties} title={title}>
+    <span
+      className={`q-chip ${v.cls}${onClick ? " clickable" : ""}`}
+      style={{ "--fill": `${Math.min(100, Math.max(0, v.fill))}%` } as React.CSSProperties}
+      title={title}
+      onClick={onClick}
+    >
       <b>{label}</b>
       <span className="q-val">{v.value}</span>
       {v.reset && <span className="q-reset">⟳ {v.reset}</span>}
@@ -86,6 +91,7 @@ export function ChatStatus({
   rateLimits,
   tz,
   baseContext,
+  onOpen,
   onHotCompact,
 }: {
   mode: PermissionMode;
@@ -96,6 +102,8 @@ export function ChatStatus({
   tz: HostTz | null;
   /** 新会话还没回复时用来预估上下文（这台主机上次新会话首轮的大小） */
   baseContext: number | null;
+  /** 点额度芯片打开 /usage 面板，点 CTX 打开 /context 面板 */
+  onOpen: (panel: "usage" | "context") => void;
   /** 上下文很大且缓存还在时给出：点了发 /compact */
   onHotCompact?: () => void;
 }) {
@@ -126,10 +134,10 @@ export function ChatStatus({
   const quotaTitle = list.length
     ? [
         ...list.map((r) => windowView(r, now, tz).line),
-        `数据更新于 ${hostShortTime(Math.max(...list.map((r) => r.updatedAt)) / 1000, tz)}（每次回复后刷新）`,
+        `数据更新于 ${hostShortTime(Math.max(...list.map((r) => r.updatedAt)) / 1000, tz)}（启动对话和每次回复后刷新）`,
         `时间按${tzLabel(tz)}`,
       ].join("\n")
-    : "发一条消息后显示：云端 Claude 每次回复完会报告 5 小时 / 7 天窗口的用量。\n用 API key 按量计费时没有额度，看花费即可。";
+    : "云端 Claude 启动后读取 5 小时 / 7 天窗口的用量。\n用 API key 按量计费时没有额度，看花费即可。";
 
   return (
     <div className="chat-status">
@@ -157,18 +165,19 @@ export function ChatStatus({
       )}
 
       <span className="status-line">
-        <Chip label="5H" v={h5} title={quotaTitle} />
-        <Chip label="7D" v={d7} title={quotaTitle} />
+        <Chip label="5H" v={h5} title={`${quotaTitle}\n点击查看详细用量（/usage）`} onClick={() => onOpen("usage")} />
+        <Chip label="7D" v={d7} title={`${quotaTitle}\n点击查看详细用量（/usage）`} onClick={() => onOpen("usage")} />
         <Chip
           label="CTX"
           v={ctx}
-          title={
+          onClick={() => onOpen("context")}
+          title={`${
             used !== null
               ? `上下文已用 ${used.toLocaleString()} tokens${usage.contextWindow ? ` / 窗口 ${usage.contextWindow.toLocaleString()}` : "（窗口大小在第一轮回复后知道）"}`
               : estPct !== null
                 ? `新会话预估约 ${baseContext!.toLocaleString()} tokens（系统提示 + 工具 + CLAUDE.md），首轮回复后更新为实际值`
                 : "新会话：首轮回复后显示实际上下文大小"
-          }
+          }\n点击查看各部分占用（/context）`}
         />
         {usage.costUsd !== null && (
           <span className="q-cost" title="本会话累计花费（按 API 价格估算，订阅账号不实际扣费）">${usage.costUsd.toFixed(2)}</span>
