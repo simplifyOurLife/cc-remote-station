@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 use russh::ChannelMsg;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
@@ -41,6 +42,8 @@ pub struct StartOptions {
     pub fork: bool,
     pub model: Option<String>,
     pub permission_mode: String,
+    /// 每轮结束后发 prompt_suggestion（预测下一句）
+    pub prompt_suggestions: bool,
 }
 
 /// 启动云端 claude 进程。stdout 每行 JSON 原样推给前端；stderr 包成 {type:"stderr"}；
@@ -68,7 +71,14 @@ pub async fn start(
             args.push_str(" --fork-session");
         }
     }
-    let script = format!("{CLAUDE_PATH_SETUP}cd {} || exit 1; exec {args}", cd_target(&opts.cwd));
+    // 预测下一句：实测（2.1.330）参数和环境变量要同时给才会发 prompt_suggestion
+    let suggest_env = if opts.prompt_suggestions {
+        args.push_str(" --prompt-suggestions true");
+        "export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=1; "
+    } else {
+        ""
+    };
+    let script = format!("{CLAUDE_PATH_SETUP}{suggest_env}cd {} || exit 1; exec {args}", cd_target(&opts.cwd));
     let mut channel = conn.open_channel().await?;
     channel.exec(true, format!("bash -lc {}", shell_quote(&script))).await?;
 
@@ -279,21 +289,179 @@ fn user_text(content: &Value) -> String {
 /// 历史里每段工具输入/输出最多保留的字符数（卡片默认只显示前 3000 字）
 const HISTORY_KEEP_CHARS: usize = 20_000;
 
-/// 读取某个会话的历史（只取最后 3MB，足够显示近期上下文），返回瘦身后的用户/Claude 消息行。
-/// 会话文件大头是工具返回的全文和内部记录：云端 gzip 压缩传输，这里再丢掉界面用不上的部分
-pub async fn history(conn: &Arc<Conn>, file: &str) -> Result<Vec<Value>> {
+/// 第一次读（或缓存对不上）时只取会话文件最后这么多字节，足够显示近期上下文
+const HISTORY_TAIL: u64 = 3_000_000;
+
+/// 本机缓存的一个会话：已读到云端文件的哪个字节（总在行尾），以及该位置之前 4KB 的 sha256（云端算的），
+/// 下次据此确认文件前面没变、只增量拉新增的部分。会话文件只追加（继续聊、改标题、压缩都是追加新行）
+#[derive(Serialize, serde::Deserialize)]
+struct Cached {
+    offset: u64,
+    check: String,
+    lines: Vec<Value>,
+}
+
+fn read_cache(path: &Path) -> Option<Cached> {
+    let file = std::fs::File::open(path).ok()?;
+    let c: Cached = serde_json::from_reader(flate2::read::GzDecoder::new(std::io::BufReader::new(file))).ok()?;
+    // 记一下最近用过，超出容量时按它淘汰
+    let _ = std::fs::File::options().write(true).open(path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    Some(c)
+}
+
+/// 只读本机缓存（不连云端），打开会话时先拿它显示
+pub fn cached_history(path: &Path) -> Option<Vec<Value>> {
+    read_cache(path).map(|c| c.lines)
+}
+
+fn write_cache(path: &Path, c: &Cached) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut gz = flate2::write::GzEncoder::new(std::io::BufWriter::new(std::fs::File::create(&tmp)?), flate2::Compression::fast());
+    serde_json::to_writer(&mut gz, c)?;
+    std::io::Write::flush(&mut gz.finish()?)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// 读取某个会话的历史，返回瘦身后的用户/Claude 消息行。cache 为本机缓存文件：
+/// - 缓存对得上（文件没变小、读到位置前 4KB 的哈希一致）就只拉新增部分，老会话等于直接读本地；
+/// - 否则（没缓存、文件被重建）取最后 3MB 重来。
+/// 云端只交到最后一个完整行为止（正在写的半行留到下次），先滤掉界面用不上的大块内部记录再 gzip 传输。
+/// 输出第一行是「模式 读到的位置 该位置的校验」，后面是 gzip 数据
+pub async fn history(conn: &Arc<Conn>, file: &str, cache: Option<&Path>) -> Result<Vec<Value>> {
     ensure!(!file.contains("..") && file.ends_with(".jsonl"), "非法的会话文件");
-    let cmd = format!(
-        "f=~/.claude/projects/{}; [ -r \"$f\" ] || {{ echo 会话文件不存在 >&2; exit 1; }}; tail -c 3000000 \"$f\" | gzip -1",
-        shell_quote(file)
-    );
-    let out = conn.exec(&cmd, None).await?;
+    let cached = cache.and_then(read_cache).filter(|c| c.check.len() == 64 && c.check.chars().all(|ch| ch.is_ascii_hexdigit()));
+    let (off, check) = cached.as_ref().map_or((0, String::new()), |c| (c.offset, c.check.clone()));
+    let script = r#"
+f=~/.claude/projects/__FILE__
+[ -r "$f" ] || { echo 会话文件不存在 >&2; exit 1; }
+size=$(stat -c %s -- "$f")
+win() { w=$(( $1 < 4096 ? $1 : 4096 )); tail -c +$(( $1 - w + 1 )) -- "$f" | head -c $w | sha256sum | cut -c1-64; }
+off=__OFF__
+if [ $off -gt 0 ] && [ $size -ge $off ] && [ "$(win $off)" = "__CHECK__" ]; then
+  mode=inc; start=$off
+else
+  mode=full; start=$(( size > __TAIL__ ? size - __TAIL__ : 0 ))
+fi
+end=$size
+if [ $end -gt $start ] && [ "$(tail -c +$end -- "$f" | head -c 1 | od -An -tx1 | tr -d ' \n')" != 0a ]; then
+  end=$(( end - $(tail -c +$(( start + 1 )) -- "$f" | head -c $(( end - start )) | tail -n 1 | wc -c) ))
+fi
+printf '%s %s %s\n' $mode $end "$(win $end)"
+tail -c +$(( start + 1 )) -- "$f" | head -c $(( end - start )) \
+  | grep -av '^{"type":"\(api-request-blob\|api-request\|file-history-snapshot\)"' | gzip -1
+"#
+    .replace("__FILE__", &shell_quote(file))
+    .replace("__OFF__", &off.to_string())
+    .replace("__CHECK__", &check)
+    .replace("__TAIL__", &HISTORY_TAIL.to_string());
+    let out = conn.exec(&format!("bash -c {}", shell_quote(&script)), None).await?;
     ensure!(out.code == 0, "读取会话失败：{}", String::from_utf8_lossy(&out.stderr).trim());
+    let nl = out.stdout.iter().position(|&b| b == b'\n').context("读取会话失败：云端输出格式不对")?;
+    let head = String::from_utf8_lossy(&out.stdout[..nl]).to_string();
+    let mut parts = head.split(' ');
+    let (mode, end, new_check) = (parts.next().unwrap_or(""), parts.next().and_then(|s| s.parse::<u64>().ok()), parts.next().unwrap_or(""));
+    let end = end.context("读取会话失败：云端输出格式不对")?;
     let mut raw = Vec::new();
-    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&out.stdout[..]), &mut raw).context("解压会话历史失败")?;
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&out.stdout[nl + 1..]), &mut raw).context("解压会话历史失败")?;
     let text = String::from_utf8_lossy(&raw);
-    // tail 可能从半行开始，解析失败的行直接跳过
-    Ok(text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter_map(slim_line).collect())
+    // 从文件中间开始读时第一行是半行，解析失败的行直接跳过
+    let fresh = text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter_map(slim_line);
+    let lines: Vec<Value> = match (mode, cached) {
+        ("inc", Some(c)) => c.lines.into_iter().chain(fresh).collect(),
+        _ => fresh.collect(),
+    };
+    if let Some(path) = cache {
+        let c = Cached { offset: end, check: new_check.to_string(), lines };
+        // 写缓存失败（磁盘满、目录没权限）不影响这次显示
+        if let Err(e) = write_cache(path, &c) {
+            log::warn!("写会话缓存失败 {}: {e:#}", path.display());
+        }
+        return Ok(c.lines);
+    }
+    Ok(lines)
+}
+
+/// 会话缓存的容量上限，超出时按最久没打开的先删
+const CACHE_CAP: u64 = 500 * 1024 * 1024;
+
+fn safe_segment(s: &str) -> String {
+    s.chars().map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).collect()
+}
+
+/// 会话缓存文件：<缓存目录>/<主机 id>/<会话文件路径>.json.gz（路径里的 / 换成 __）
+pub fn cache_path(root: &Path, host_id: &str, file: &str) -> PathBuf {
+    root.join(safe_segment(host_id)).join(format!("{}.json.gz", safe_segment(&file.replace('/', "__"))))
+}
+
+/// 缓存目录里本应用写的文件（只认主机子目录下的 *.json.gz，用户选的目录里别的东西不碰）：路径、大小、最近使用时间
+fn cache_files(root: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    for host in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        if !host.path().is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(host.path()).into_iter().flatten().flatten() {
+            let p = f.path();
+            if !p.to_string_lossy().ends_with(".json.gz") {
+                continue;
+            }
+            if let Ok(m) = f.metadata() {
+                out.push((p, m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
+            }
+        }
+    }
+    out
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheInfo {
+    pub dir: String,
+    pub default_dir: String,
+    pub bytes: u64,
+    pub sessions: usize,
+}
+
+pub fn cache_info(root: &Path, default_root: &Path) -> CacheInfo {
+    let files = cache_files(root);
+    CacheInfo {
+        dir: root.display().to_string(),
+        default_dir: default_root.display().to_string(),
+        bytes: files.iter().map(|f| f.1).sum(),
+        sessions: files.len(),
+    }
+}
+
+/// 超出容量就从最久没打开的删起
+pub fn cache_prune(root: &Path) {
+    let mut files = cache_files(root);
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    if total <= CACHE_CAP {
+        return;
+    }
+    files.sort_by_key(|f| f.2);
+    for (p, len, _) in files {
+        if total <= CACHE_CAP * 9 / 10 {
+            break;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            total -= len;
+        }
+    }
+}
+
+/// 清空缓存：只删本应用写的缓存文件和随之变空的主机子目录
+pub fn cache_clear(root: &Path) {
+    for (p, _, _) in cache_files(root) {
+        let _ = std::fs::remove_file(&p);
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::remove_dir(dir); // 非空时失败，正好不删
+        }
+    }
 }
 
 /// 只留前端 fromHistory 用到的字段；工具输入/输出截短，工具结果里的图片只留占位

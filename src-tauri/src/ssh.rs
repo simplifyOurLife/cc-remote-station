@@ -23,8 +23,9 @@ pub struct Conn {
     _jump: Option<Box<Conn>>,
     /// 探测失败、已判定断开（TCP 可能还没关，is_closed 看不出来）
     dead: AtomicBool,
-    /// 最近一次确认连接活着的时间
-    checked: Mutex<Instant>,
+    /// 最近一次确认连接活着的时间：开通道成功、探测有回应，或收到任何通道数据（Client::data 更新）。
+    /// 收数据也算：大块输出回传时 ping 的回应排在数据后面，高延迟链路上会超时，不能因此判死、掐断正在传的数据
+    checked: Arc<Mutex<Instant>>,
 }
 
 /// 这么久内确认过活着的连接直接复用，不再探测
@@ -106,16 +107,22 @@ impl Conn {
             ch.data(data).await?;
         }
         ch.eof().await?;
-        let (mut code, mut stdout, mut stderr) = (None, Vec::new(), Vec::new());
+        let (mut code, mut stdout, mut stderr, mut eof) = (None, Vec::new(), Vec::new(), false);
         while let Some(msg) = ch.wait().await {
             match msg {
                 ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
                 ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
                 ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
-                ChannelMsg::Close => break,
+                ChannelMsg::Eof => eof = true,
+                ChannelMsg::Close => {
+                    eof = true;
+                    break;
+                }
                 _ => {}
             }
         }
+        // 服务器常在输出发完之前就先报退出码：通道没等到 EOF/关闭就断了，说明输出不完整，不能当结果用
+        ensure!(eof, "连接中断，远端命令的输出不完整，请重试");
         let code = code.context("远端命令未返回退出码")?;
         Ok(ExecOutput { code, stdout, stderr })
     }
@@ -253,6 +260,8 @@ pub struct Client {
     targets: HashMap<u32, (String, u16)>,
     /// 这条连接属于哪台主机，转发进来的连接登记到 PEERS
     host_id: String,
+    /// 与 Conn::checked 共用：收到数据就刷新
+    checked: Arc<Mutex<Instant>>,
 }
 
 /// 经反向转发接进本机的连接：本机一侧的源端口 → 主机 id。
@@ -266,6 +275,16 @@ pub fn peer_host(port: u16) -> Option<String> {
 
 impl client::Handler for Client {
     type Error = anyhow::Error;
+
+    async fn data(&mut self, _channel: russh::ChannelId, _data: &[u8], _session: &mut client::Session) -> Result<()> {
+        *self.checked.lock().unwrap() = Instant::now();
+        Ok(())
+    }
+
+    async fn extended_data(&mut self, _channel: russh::ChannelId, _ext: u32, _data: &[u8], _session: &mut client::Session) -> Result<()> {
+        *self.checked.lock().unwrap() = Instant::now();
+        Ok(())
+    }
 
     async fn server_channel_open_forwarded_tcpip(
         &mut self,
@@ -375,7 +394,9 @@ pub async fn connect(
     forwards: Vec<Forward>,
 ) -> Result<Conn> {
     let unknown = Arc::new(Mutex::new(None));
+    let checked = Arc::new(Mutex::new(Instant::now()));
     let handler = Client {
+        checked: checked.clone(),
         host: host.host.clone(),
         port: host.port,
         known_hosts: known_hosts.to_path_buf(),
@@ -434,7 +455,7 @@ pub async fn connect(
             error,
         });
     }
-    Ok(Conn { handle, forwards: states, _jump: jump, dead: AtomicBool::new(false), checked: Mutex::new(Instant::now()) })
+    Ok(Conn { handle, forwards: states, _jump: jump, dead: AtomicBool::new(false), checked })
 }
 
 /// 密码/口令优先用弹窗里刚输入的，其次是凭据管理器里保存的；都没有或不对就返回 NeedSecret

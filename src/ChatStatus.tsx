@@ -3,7 +3,7 @@ import { PermissionMode } from "./api";
 import { RateLimit, Usage } from "./chatModel";
 import { hostShortTime, HostTz, tzLabel } from "./hostTime";
 import { PopupMenu } from "./PopupMenu";
-import { estimatePct, pctText } from "./quota";
+import { hotCompactPct, pctText } from "./quota";
 
 export const MODES: { value: PermissionMode; label: string; hint: string }[] = [
   { value: "default", label: "逐条审批", hint: "改文件、跑命令前都问你" },
@@ -47,6 +47,13 @@ interface ChipView {
   line: string | null;
 }
 
+/** 已用比例分四档：绿 ok → 黄 mid → 橙 warn → 红 crit（用尽另有闪烁的 bad）；steps 是进入后三档的阈值 */
+const QUOTA_STEPS: [number, number, number] = [50, 80, 95];
+const CTX_STEPS: [number, number, number] = [50, 70, 85];
+function level(pct: number, [mid, warn, crit]: [number, number, number]): string {
+  return pct >= crit ? "crit" : pct >= warn ? "warn" : pct >= mid ? "mid" : "ok";
+}
+
 /** 一个额度窗口的芯片：已用比例、重置倒计时、悬浮详情里的一行 */
 function windowView(r: RateLimit | undefined, now: number, tz: HostTz | null): ChipView {
   if (!r) return { cls: "idle", fill: 0, value: "—", reset: null, line: null };
@@ -58,8 +65,10 @@ function windowView(r: RateLimit | undefined, now: number, tz: HostTz | null): C
   const reset = remain !== null ? left(remain) : null;
   if (r.status === "rejected") return { cls: "bad", fill: 100, value: "用尽", reset, line: `${name}：已用尽${at ? `，${at} 恢复` : ""}` };
   const pct = r.usedPct;
+  const lv = level(pct ?? 0, QUOTA_STEPS);
   return {
-    cls: r.status === "allowed_warning" || (pct ?? 0) >= 80 ? "warn" : "ok",
+    // CLI 报「接近上限」时至少按橙色
+    cls: r.status === "allowed_warning" && (lv === "ok" || lv === "mid") ? "warn" : lv,
     fill: pct ?? 0,
     value: pct !== null ? `${pct}%` : "—",
     reset,
@@ -93,7 +102,10 @@ export function ChatStatus({
   baseContext,
   onOpen,
   onHotCompact,
+  model,
 }: {
+  /** 估算额度用的模型（各模型价格不同） */
+  model: string | null;
   mode: PermissionMode;
   onMode: (m: PermissionMode) => void;
   usage: Usage;
@@ -123,7 +135,7 @@ export function ChatStatus({
   const estPct = used === null && baseContext && usage.contextWindow ? Math.round((baseContext / usage.contextWindow) * 100) : null;
   const ctx: ChipView =
     used !== null
-      ? { cls: pct === null ? "ok" : pct >= 85 ? "bad" : pct >= 60 ? "warn" : "ok", fill: pct ?? 0, value: pct !== null ? `${pct}%` : kTokens(used), reset: null, line: null }
+      ? { cls: pct === null ? "ok" : level(pct, CTX_STEPS), fill: pct ?? 0, value: pct !== null ? `${pct}%` : kTokens(used), reset: null, line: null }
       : estPct !== null
         ? { cls: "idle est", fill: estPct, value: `~${estPct}%`, reset: null, line: null }
         : { cls: "idle", fill: 0, value: "—", reset: null, line: null };
@@ -188,7 +200,7 @@ export function ChatStatus({
           className="hot-compact"
           onClick={onHotCompact}
           title={`上下文已超过 200k，缓存还在（上次回复不到 1 小时），现在 /compact 最便宜${
-            estimatePct(used / 10) !== null ? `，预计约消耗 5 小时额度的 ${pctText(estimatePct(used / 10)!)}` : ""
+            hotCompactPct(used, model) !== null ? `，预计约消耗 5 小时额度的 ${pctText(hotCompactPct(used, model)!)}` : ""
           }。\n隔久了再压缩，要按完整上下文重新计费一次。`}
         >
           趁热压缩

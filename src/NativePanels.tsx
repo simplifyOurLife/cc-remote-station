@@ -6,6 +6,7 @@ import { ReactNode, useEffect, useState } from "react";
 import { api, ClaudeConfig, errorText, PermissionMode } from "./api";
 import { Select } from "./Select";
 import { Loading } from "./Loading";
+import { RefreshButton } from "./RefreshButton";
 import { ChatState, McpServer, ModelOption, NativeInfo } from "./chatModel";
 import { hostShortTime, HostTz, tzLabel } from "./hostTime";
 import { MODES } from "./ChatStatus";
@@ -21,7 +22,16 @@ const isoSec = (s: string | null | undefined) => {
   return isNaN(t) ? null : t / 1000;
 };
 
-function Panel(p: { title: ReactNode; className: string; onClose: () => void; onRefresh?: () => void; children: ReactNode }) {
+/** onRefresh 返回 Promise 就等它；数据靠控制请求回执推回来的传 data，等它从 null 变回来 */
+function Panel(p: {
+  title: ReactNode;
+  className: string;
+  onClose: () => void;
+  onRefresh?: () => unknown;
+  data?: Record<string, any> | null;
+  children: ReactNode;
+}) {
+  const [round, setRound] = useState(0);
   return (
     <div
       className="pane-overlay"
@@ -33,12 +43,18 @@ function Panel(p: { title: ReactNode; className: string; onClose: () => void; on
           <h3>{p.title}</h3>
           <div className="grow" />
           {p.onRefresh && (
-            <button className="link" onClick={p.onRefresh}>
-              刷新
-            </button>
+            <RefreshButton
+              className="link"
+              onClick={p.onRefresh}
+              busy={p.data === undefined ? undefined : p.data === null}
+              result={() => !p.data?.error && undefined}
+              onDone={() => setRound((n) => n + 1)}
+            />
           )}
         </div>
-        {p.children}
+        <div key={round} className={round ? "refreshed" : undefined}>
+          {p.children}
+        </div>
         <div className="dialog-actions">
           <button onClick={p.onClose}>关闭</button>
         </div>
@@ -145,6 +161,7 @@ export function UsagePanel(p: {
       }
       className="usage-panel"
       onRefresh={p.onRefresh}
+      data={d}
       onClose={p.onClose}
     >
       {!ok && <Failed data={d} what="用量" />}
@@ -274,6 +291,7 @@ export function ContextPanel(p: { data: NativeInfo["context"]; running: boolean;
       }
       className="context-panel"
       onRefresh={p.onRefresh}
+      data={d}
       onClose={p.onClose}
     >
       {!ok && <Failed data={d} what="上下文" />}
@@ -686,8 +704,14 @@ export function ConfigPanel(p: { hostId: string; cwd: string; onClose: () => voi
     setError(null);
     return api
       .claudeConfigRead(p.hostId, p.cwd)
-      .then(setCfg)
-      .catch((e) => setError(errorText(e)));
+      .then((c) => {
+        setCfg(c);
+        return true;
+      })
+      .catch((e) => {
+        setError(errorText(e));
+        return false as const;
+      });
   };
   useEffect(() => {
     load();
@@ -711,7 +735,7 @@ export function ConfigPanel(p: { hostId: string; cwd: string; onClose: () => voi
   const behavior = items.filter((i) => BEHAVIOR_KEYS.has(i.key));
   const terminal = items.filter((i) => !BEHAVIOR_KEYS.has(i.key));
   return (
-    <Panel title="Claude Code 设置" className="config-panel" onRefresh={() => (setCfg(null), load())} onClose={p.onClose}>
+    <Panel title="Claude Code 设置" className="config-panel" onRefresh={() => (setCfg(null), load().then((ok) => ok && undefined))} onClose={p.onClose}>
       <p className="muted small-text">
         写入云主机的 Claude Code 设置（~/.claude/settings.json 等，输出风格写到当前目录），之后新开的对话和终端里的 claude 都生效。
         当前对话的模型、权限模式、输出风格请用对应的面板或输入框上方的切换。

@@ -224,6 +224,18 @@ export interface ChatSession {
   mtime: number;
 }
 
+/** 历史会话的本机缓存 */
+export interface ChatCacheInfo {
+  /** 当前使用的目录 */
+  dir: string;
+  defaultDir: string;
+  bytes: number;
+  sessions: number;
+}
+
+/** 在终端里接着聊这个会话的命令：-p 跑出的会话不出现在 claude --resume 的列表里，要在会话目录下按 id 恢复 */
+export const resumeCommand = (s: ChatSession) => `cd '${s.cwd.replace(/'/g, `'\\''`)}' && claude --resume ${s.sessionId}`;
+
 export type PermissionMode = "default" | "acceptEdits" | "plan" | "bypassPermissions";
 
 export interface ChatStartArgs {
@@ -234,6 +246,8 @@ export interface ChatStartArgs {
   fork: boolean;
   model: string | null;
   permissionMode: PermissionMode;
+  /** 每轮结束后预测下一句（prompt_suggestion 事件） */
+  promptSuggestions: boolean;
 }
 
 export type CmdError =
@@ -312,6 +326,7 @@ export const api = {
   claudeConfigRead: (hostId: string, dir: string) => invoke<ClaudeConfig>("claude_config_read", { hostId, dir }),
   claudeConfigSet: (hostId: string, dir: string, key: string, value: string) =>
     invoke<string>("claude_config_set", { hostId, dir, key, value }),
+  quotaLog: (hostId: string, lines: string) => invoke<void>("quota_log", { hostId, lines }),
   uiPrefsGet: () => invoke<Record<string, unknown>>("ui_prefs_get"),
   uiPrefsSet: (prefs: unknown) => invoke<void>("ui_prefs_set", { prefs }),
   sshConfigRead: () => invoke<string>("ssh_config_read"),
@@ -331,6 +346,10 @@ export const api = {
   /** 云端 Claude 最近用过的工作目录（新的在前） */
   chatDirs: (hostId: string) => invoke<string[]>("chat_dirs", { hostId }),
   chatHistory: (hostId: string, file: string) => invoke<Record<string, any>[]>("chat_history", { hostId, file }),
+  chatHistoryCached: (hostId: string, file: string) => invoke<Record<string, any>[] | null>("chat_history_cached", { hostId, file }),
+  chatCacheInfo: () => invoke<ChatCacheInfo>("chat_cache_info"),
+  chatCacheSetDir: (dir: string | null) => invoke<ChatCacheInfo>("chat_cache_set_dir", { dir }),
+  chatCacheClear: () => invoke<ChatCacheInfo>("chat_cache_clear"),
   chatFiles: (hostId: string, cwd: string) => invoke<string[]>("chat_files", { hostId, cwd }),
   chatDelete: (hostId: string, file: string) => invoke<void>("chat_delete", { hostId, file }),
   saveText: (path: string, text: string) => invoke<void>("save_text", { path, text }),

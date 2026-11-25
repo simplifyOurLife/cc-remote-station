@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { ask, ModalHost } from "./modal";
+import { ChatCachePanel, ChatPrefsPanel } from "./ChatCachePanel";
 import { listen } from "@tauri-apps/api/event";
 import { DeviceSettings } from "./AccessSettings";
 import { ActivityPanel, summarize } from "./ActivityPanel";
 import { ChatView } from "./ChatView";
-import { api, AuditEntry, ChatSession, errorText, forwardState, Host, hostToolbox, McpHostStatus, Settings } from "./api";
+import { api, AuditEntry, ChatSession, errorText, forwardState, Host, hostToolbox, McpHostStatus, resumeCommand, Settings } from "./api";
 import { HostForm } from "./HostForm";
 import { HostsPage } from "./HostsPage";
 import { HostMcpDialog, McpTab } from "./HostMcpDialog";
@@ -22,7 +23,7 @@ import { SshPromptHost } from "./SshPrompt";
 import { CommandConfirmHost } from "./CommandConfirm";
 import { Launchpad } from "./Launchpad";
 import { useOnboarding } from "./onboarding";
-import { UpdateDialog, UpdatePanel, useUpdater } from "./Update";
+import { UpdateDialog, UpdatePanel, UpdateToast, useUpdater } from "./Update";
 import { kbd, modKey } from "./platform";
 import { ShortcutsPanel } from "./ShortcutsPanel";
 import { ContextMenuHost, openMenu } from "./ContextMenu";
@@ -34,8 +35,12 @@ interface Pane {
   kind?: "chat";
   /** 接回已有 tmux 会话时的会话名 */
   session?: string;
+  /** 终端窗格：连上后自动执行的命令 */
+  command?: string;
   /** 对话窗格：打开时要继续的历史会话 */
   chatSession?: ChatSession;
+  /** 对话窗格：新对话的工作目录（从已有对话里点「新对话」时带过来） */
+  chatDir?: string;
   /** 对话窗格当前的会话 id（同一会话只允许开一处） */
   chatId?: string | null;
 }
@@ -163,9 +168,24 @@ export default function App() {
     return true;
   };
 
+  /**
+   * 在终端里用 claude --resume 接着聊对话里的会话（-p 跑出的会话不出现在 claude --resume 的列表里，只能按 id 恢复）。
+   * 同一会话不能两个进程同时写：别的对话窗格开着它就先确认、关掉那个窗格；本窗格开着的由 ChatView 自己先放开
+   */
+  const resumeInTerminal = async (from: Tab, paneKey: string, s: ChatSession) => {
+    for (const t of tabs) {
+      const p = t.host.id === from.host.id && t.panes.find((x) => x.kind === "chat" && x.chatId === s.sessionId && x.key !== paneKey);
+      if (!p) continue;
+      if (!(await ask("这个会话正在另一个对话窗格中打开，两边同时写会弄乱记录。关掉那个窗格并在终端中继续？", { title: "在终端中继续", okLabel: "关掉并继续" })))
+        return;
+      closePane(t, p.key);
+    }
+    openTab(from.host, undefined, undefined, undefined, resumeCommand(s));
+  };
+
   /** 新开标签并切到工作区；第一次打开时记下，引导第 2 步打勾 */
-  const openTab = (host: Host, session?: string, kind?: "chat", chatSession?: ChatSession) => {
-    const pane: Pane = { key: newKey(), session, kind, chatSession };
+  const openTab = (host: Host, session?: string, kind?: "chat", chatSession?: ChatSession, command?: string, chatDir?: string) => {
+    const pane: Pane = { key: newKey(), session, kind, chatSession, command, chatDir };
     const tab: Tab = {
       key: newKey(),
       host,
@@ -518,10 +538,12 @@ export default function App() {
             <header className="page-head">
               <div>
                 <h1>设置</h1>
-                <p className="muted">在线升级，以及终端的外观和快捷命令（保存后立即作用到所有已打开的终端）。</p>
+                <p className="muted">在线升级、对话偏好、会话缓存，以及终端的外观和快捷命令（保存后立即作用到所有已打开的终端）。</p>
               </div>
             </header>
             <UpdatePanel updater={updater} onShow={() => setShowUpdate(true)} />
+            <ChatPrefsPanel />
+            <ChatCachePanel />
             <PrefsPanel prefs={prefs} onSave={savePrefs} />
           </div>
         )}
@@ -688,8 +710,11 @@ export default function App() {
                       onTitle={(title) => patchTab(t.key, { title })}
                       onAttention={() => (t.key !== activeKey || page !== "workspace") && patchTab(t.key, { attention: true })}
                       initialSession={p.chatSession}
+                      initialDir={p.chatDir}
+                      onNewChat={(dir) => openTab(t.host, undefined, "chat", undefined, undefined, dir)}
                       onSession={(chatId) => setPaneChatId(t.key, p.key, chatId)}
                       onOpenSession={(s, newTab) => openChatSession(t, p.key, s, newTab)}
+                      onResumeInTerminal={(s) => resumeInTerminal(t, p.key, s)}
                     />
                   ) : (
                     <TerminalView
@@ -697,6 +722,7 @@ export default function App() {
                       host={t.host}
                       paneKey={p.key}
                       session={p.session}
+                      command={p.command}
                       visible={page === "workspace" && t.key === activeKey}
                       focused={p.key === t.activePane}
                       prefs={prefs.terminal}
@@ -735,6 +761,7 @@ export default function App() {
       <ModalHost />
       <SshPromptHost />
       <CommandConfirmHost />
+      {!showUpdate && updater.info && <UpdateToast info={updater.info} onShow={() => setShowUpdate(true)} />}
       {showUpdate && updater.info && <UpdateDialog info={updater.info} openTabs={tabs.length} onClose={() => setShowUpdate(false)} />}
       <TooltipLayer />
       <ContextMenuHost />

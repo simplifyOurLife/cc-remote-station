@@ -27,6 +27,9 @@ pub struct Settings {
     /// MCP 工具箱：本机其他 MCP 服务，挂在内置服务的 /mcp/<name> 下一起转发给云端
     #[serde(default)]
     pub toolbox: Vec<ToolboxItem>,
+    /// 历史会话的本机缓存目录；None 用应用数据目录下的 chat-cache
+    #[serde(default)]
+    pub chat_cache_dir: Option<String>,
 }
 
 /// 云端执行本机命令的管控模式
@@ -145,6 +148,7 @@ impl Settings {
             device: String::new(),
             builtin_alias: String::new(),
             toolbox: vec![],
+            chat_cache_dir: None,
         };
         settings.save(path)?;
         Ok(settings)

@@ -45,6 +45,8 @@ interface Props {
   paneKey: string;
   /** 接回已有 tmux 会话时指定会话名 */
   session?: string;
+  /** 第一次连上后自动输入并执行的命令（如「在终端中继续」对话的 claude --resume）；重连不再执行 */
+  command?: string;
   /** 所在标签是否在前台 */
   visible: boolean;
   /** 是否是标签内当前窗格 */
@@ -79,6 +81,7 @@ export function TerminalView(props: Props) {
   const propsRef = useRef(props);
   propsRef.current = props;
   const retryRef = useRef({ count: 0, timer: 0 });
+  const commandSent = useRef(false);
   const [status, setStatus] = useState<Status>({ kind: "connecting" });
   const [attempt, setAttempt] = useState(0);
   /** 连续连接失败次数和最近一次的时间：同一个错误反复出现时，用户也能看出重连确实试过了 */
@@ -343,6 +346,12 @@ export function TerminalView(props: Props) {
         setFails({ n: 0, at: 0 });
         setStatus({ kind: "connected" });
         if (propsRef.current.focused) term.focus();
+        // shell 还没起来也没关系：输入先进 PTY 缓冲，shell 就绪后读到
+        const cmd = propsRef.current.command;
+        if (cmd && !commandSent.current) {
+          commandSent.current = true;
+          api.terminalWrite(id, new TextEncoder().encode(cmd + "\r"));
+        }
       })
       .catch((e: CmdError) => {
         if (cancelled) return;

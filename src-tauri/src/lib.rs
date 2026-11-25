@@ -28,6 +28,8 @@ pub struct AppState {
     settings_path: PathBuf,
     /// 前端界面偏好（终端外观、快捷命令等），原样存取的 JSON
     ui_prefs_path: PathBuf,
+    /// 历史会话缓存的默认目录（设置里没指定时用）
+    cache_default: PathBuf,
     /// 内置 MCP 服务在本机监听的端口
     mcp_port: u16,
     /// MCP 的白名单/审计/备份，界面用它查看记录和恢复备份
@@ -741,6 +743,20 @@ async fn claude_config_set(state: State<'_, AppState>, host_id: String, dir: Str
     Ok(run_remote(&conn, &script).await.context("云端执行 /config 失败")?)
 }
 
+/// 额度估算的埋点：追加到远端 ~/.cache/cc-workstation/quota.jsonl（一行一条 JSON），超过 1MB 只留后一半。
+/// 放在云主机上，云端 Claude 排查估算问题时可以直接读
+#[tauri::command]
+async fn quota_log(state: State<'_, AppState>, host_id: String, lines: String) -> CmdResult<()> {
+    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
+    let cmd = "f=\"$HOME/.cache/cc-workstation/quota.jsonl\"; mkdir -p \"${f%/*}\" && cat >> \"$f\" && \
+               if [ \"$(wc -c < \"$f\")\" -gt 1048576 ]; then tail -c 524288 \"$f\" | tail -n +2 > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; fi";
+    let out = conn.exec(cmd, Some(lines.as_bytes())).await?;
+    if out.code != 0 {
+        return Err(anyhow!("写额度埋点失败：{}", String::from_utf8_lossy(&out.stderr).trim()).into());
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HostCheck {
@@ -783,6 +799,8 @@ struct ChatStartArgs {
     fork: bool,
     model: Option<String>,
     permission_mode: String,
+    #[serde(default)]
+    prompt_suggestions: bool,
 }
 
 /// 启动云端 claude（stream-json），返回 chat id；事件逐行推到 on_event
@@ -801,6 +819,7 @@ async fn chat_start(
         fork: args.fork,
         model: args.model,
         permission_mode: args.permission_mode,
+        prompt_suggestions: args.prompt_suggestions,
     };
     let tx = chat::start(app, id.clone(), conn, opts, on_event).await?;
     state.chats.lock().unwrap().insert(id.clone(), chat::ChatHandle { tx });
@@ -872,16 +891,67 @@ async fn chat_dirs(state: State<'_, AppState>, host_id: String) -> CmdResult<Vec
     Ok(chat::recent_dirs(&conn).await?)
 }
 
+impl AppState {
+    fn cache_root(&self) -> PathBuf {
+        self.settings.read().unwrap().chat_cache_dir.as_deref().map_or_else(|| self.cache_default.clone(), PathBuf::from)
+    }
+}
+
+/// 读历史会话：有本机缓存就只增量拉新增部分，读完更新缓存
 #[tauri::command]
 async fn chat_history(state: State<'_, AppState>, host_id: String, file: String) -> CmdResult<Vec<Value>> {
     let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
-    Ok(chat::history(&conn, &file).await?)
+    let root = state.cache_root();
+    let lines = chat::history(&conn, &file, Some(&chat::cache_path(&root, &host_id, &file))).await?;
+    tauri::async_runtime::spawn_blocking(move || chat::cache_prune(&root));
+    Ok(lines)
+}
+
+/// 只读本机缓存（不连云端）：打开会话时先显示，再用 chat_history 补上新增的部分；没缓存返回 None
+#[tauri::command]
+async fn chat_history_cached(state: State<'_, AppState>, host_id: String, file: String) -> CmdResult<Option<Vec<Value>>> {
+    let path = chat::cache_path(&state.cache_root(), &host_id, &file);
+    Ok(tauri::async_runtime::spawn_blocking(move || chat::cached_history(&path)).await.context("读取会话缓存失败")?)
 }
 
 #[tauri::command]
 async fn chat_delete(state: State<'_, AppState>, host_id: String, file: String) -> CmdResult<()> {
     let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
-    Ok(chat::delete_session(&conn, &file).await?)
+    chat::delete_session(&conn, &file).await?;
+    let _ = std::fs::remove_file(chat::cache_path(&state.cache_root(), &host_id, &file));
+    Ok(())
+}
+
+#[tauri::command]
+fn chat_cache_info(state: State<AppState>) -> chat::CacheInfo {
+    chat::cache_info(&state.cache_root(), &state.cache_default)
+}
+
+/// 换缓存目录（None 恢复默认）。原目录里的缓存留在原地，不搬也不删
+#[tauri::command]
+fn chat_cache_set_dir(state: State<AppState>, dir: Option<String>) -> CmdResult<chat::CacheInfo> {
+    let dir = dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
+    if let Some(d) = &dir {
+        let p = std::path::Path::new(d);
+        if !p.is_absolute() {
+            return Err(anyhow::anyhow!("请填写完整路径，如 D:\\cc-cache").into());
+        }
+        std::fs::create_dir_all(p).with_context(|| format!("无法创建目录 {d}"))?;
+    }
+    {
+        let mut s = state.settings.write().unwrap();
+        let mut next = s.clone();
+        next.chat_cache_dir = dir;
+        next.save(&state.settings_path)?;
+        *s = next;
+    }
+    Ok(chat_cache_info(state))
+}
+
+#[tauri::command]
+fn chat_cache_clear(state: State<AppState>) -> chat::CacheInfo {
+    chat::cache_clear(&state.cache_root());
+    chat_cache_info(state)
 }
 
 /// 把用户在「打开」对话框里选的本机文件传到云主机，返回远端路径（对话附件用，Claude 用 Read 读取）
@@ -1062,6 +1132,7 @@ pub fn run() {
                 settings,
                 settings_path,
                 ui_prefs_path: dir.join("ui.json"),
+                cache_default: app.path().app_local_data_dir()?.join("chat-cache"),
                 mcp_port,
                 guard,
                 toolbox,
@@ -1081,6 +1152,7 @@ pub fn run() {
             claude_mcp_apply,
             claude_config_read,
             claude_config_set,
+            quota_log,
             command_confirm_answer,
             host_check,
             update::update_check,
@@ -1117,6 +1189,10 @@ pub fn run() {
             chat_dirs,
             host_timezone,
             chat_history,
+            chat_history_cached,
+            chat_cache_info,
+            chat_cache_set_dir,
+            chat_cache_clear,
             chat_files,
             chat_delete,
             chat_upload,

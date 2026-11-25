@@ -25,3 +25,6 @@ dist-ssr
 
 # 本地参考源码与临时 mingw 工具链，不入库
 .ref/
+
+# Claude Code 本地说明，不入库
+CLAUDE.md

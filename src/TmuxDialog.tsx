@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Loading } from "./Loading";
+import { RefreshButton } from "./RefreshButton";
 import { hostDateTime, tzLabel, useHostTz } from "./hostTime";
 import { api, errorText, Host, TmuxSession } from "./api";
 
@@ -18,14 +19,26 @@ export function TmuxDialog({
   /** 会话跑在云主机上，最后活动时间按主机时区显示 */
   const tz = useHostTz(host.id);
 
+  /** 每次刷新完 +1，作列表 key 让条目重播闪入动画 */
+  const [round, setRound] = useState(0);
+
   const load = () =>
     api
       .tmuxSessions(host.id)
-      .then(setSessions)
-      .catch((e) => setError(errorText(e)));
+      .then((list) => {
+        setSessions(list);
+        setError("");
+        return list;
+      })
+      .catch((e) => {
+        setError(errorText(e));
+        return null;
+      });
   useEffect(() => {
     load();
   }, []);
+
+  const refresh = () => load().then((list) => (list ? `> 已刷新 · ${list.length} 个会话` : false));
 
   const kill = async (name: string) => {
     await api.tmuxKill(host.id, name).catch((e) => setError(errorText(e)));
@@ -39,10 +52,14 @@ export function TmuxDialog({
         <p className="muted">关掉应用或断网后仍在云主机上运行的会话，可以接回继续用。</p>
         {error && <p className="form-error">{error}</p>}
         {sessions === null && !error && <Loading text="正在读取保持的会话" />}
-        {sessions?.length === 0 && <p className="muted">没有保持中的会话</p>}
-        <ul className="root-list">
-          {sessions?.map((s) => (
-            <li key={s.name}>
+        {sessions?.length === 0 && (
+          <p key={round} className={`muted ${round ? "refreshed" : ""}`}>
+            没有保持中的会话
+          </p>
+        )}
+        <ul className="root-list" key={round}>
+          {sessions?.map((s, i) => (
+            <li key={s.name} className={round ? "refreshed" : undefined} style={{ animationDelay: `${i * 40}ms` }}>
               <span>
                 <code>{s.name}</code>
                 <span className="muted">
@@ -58,7 +75,7 @@ export function TmuxDialog({
           ))}
         </ul>
         <div className="dialog-actions">
-          <button onClick={load}>刷新</button>
+          <RefreshButton onClick={refresh} onDone={() => setRound((n) => n + 1)} />
           <button onClick={onClose}>关闭</button>
         </div>
       </div>

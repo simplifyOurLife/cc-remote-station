@@ -47,6 +47,23 @@ export function mergePrefs(raw: Record<string, unknown>): UiPrefs {
   };
 }
 
+/** 对话的「下一步预测」开关（存本机，默认开）：开着时云端 claude 带 --prompt-suggestions 启动，每轮多一次小请求 */
+const SUGGEST_KEY = "ccws.promptSuggestions";
+export function promptSuggestionsOn(): boolean {
+  try {
+    return localStorage.getItem(SUGGEST_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+export function setPromptSuggestions(on: boolean) {
+  try {
+    localStorage.setItem(SUGGEST_KEY, on ? "1" : "0");
+  } catch {
+    // 存不下就按默认
+  }
+}
+
 export const themes: Record<TerminalPrefs["theme"], ITheme> = {
   // 与界面同一套夜间配色：紫黑底、青电光标、洋红选区，ANSI 色调成霓虹但保证在深底上可读
   neon: {

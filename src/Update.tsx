@@ -7,6 +7,9 @@ import { api, errorText, UpdateInfo, UpdateProgress } from "./api";
 /** 发布页：在线升级失败时给用户手动下载；仓库地址和 tauri.conf.json 的 updater.endpoints 保持一致 */
 export const RELEASES_URL = "https://github.com/simplifyOurLife/cc-remote-station/releases/latest";
 const PROXY_KEY = "ccws-update-proxy";
+/** 提示条点过「×」的版本：同一版本不再弹，侧栏「新版本」徽标照常显示 */
+const DISMISSED_KEY = "ccws-update-dismissed";
+const RECHECK_MS = 4 * 3600_000;
 
 function loadProxy(): string {
   try {
@@ -72,7 +75,12 @@ export function useUpdater(): Updater {
     // 开发模式没有发布版可比，不自动查
     if (import.meta.env.DEV) return;
     const t = setTimeout(check, 5000);
-    return () => clearTimeout(t);
+    // 应用常常一开好几天：之后每隔几小时再查一次
+    const every = setInterval(check, RECHECK_MS);
+    return () => {
+      clearTimeout(t);
+      clearInterval(every);
+    };
   }, [check]);
 
   return { current, info, checking, status, error, checkedAt, proxy, setProxy, check };
@@ -149,6 +157,47 @@ export function UpdateDialog({ info, openTabs, onClose }: { info: UpdateInfo; op
   );
 }
 
+/** 发现新版本时右下角的提示条：点「查看」打开详情升级，点「×」这个版本不再弹 */
+export function UpdateToast({ info, onShow }: { info: UpdateInfo; onShow: () => void }) {
+  const [dismissed, setDismissed] = useState(() => {
+    try {
+      return localStorage.getItem(DISMISSED_KEY);
+    } catch {
+      return null;
+    }
+  });
+  if (dismissed === info.version) return null;
+  const dismiss = () => {
+    setDismissed(info.version);
+    try {
+      localStorage.setItem(DISMISSED_KEY, info.version);
+    } catch {
+      // 存不下只是下次启动还会弹
+    }
+  };
+  return (
+    <div className="update-toast" role="status">
+      <span className="modal-mark">↑</span>
+      <span className="grow">
+        发现新版本 <b>v{info.version}</b>
+        <span className="muted small">当前 v{info.current}</span>
+      </span>
+      <button
+        className="primary"
+        onClick={() => {
+          dismiss();
+          onShow();
+        }}
+      >
+        查看
+      </button>
+      <button className="icon" title="这个版本不再提示（侧栏「设置」旁的徽标仍可点开）" onClick={dismiss}>
+        ×
+      </button>
+    </div>
+  );
+}
+
 /** 终端风报错块：红色切角面板 + 扫描线，出现时信号撕裂一下 */
 function UpdateAlert({ title, message, hint }: { title: string; message: string; hint?: string }) {
   return (
@@ -219,6 +268,8 @@ function CheckButton({ checking, onCheck }: { checking: boolean; onCheck: () => 
 /** 设置页里的「在线升级」：当前版本、手动检查、下载代理 */
 export function UpdatePanel({ updater, onShow }: { updater: Updater; onShow: () => void }) {
   const { current, info, checking, status, error, checkedAt, proxy, setProxy, check } = updater;
+  // 只按打开设置页那一刻决定是否展开，输入时清空也不会突然收起
+  const [proxyOpen] = useState(() => !!proxy.trim());
   const readout = checking
     ? { cls: "scan", text: "正在连接发布源 github.com" }
     : status === "latest"
@@ -249,11 +300,16 @@ export function UpdatePanel({ updater, onShow }: { updater: Updater; onShow: () 
         <CheckButton checking={checking} onCheck={check} />
       </div>
       {status === "error" && !checking && <UpdateAlert key={checkedAt} title="检查更新失败" message={error} />}
-      <label>
-        下载代理：
-        <input value={proxy} placeholder="留空跟随系统代理，如 http://127.0.0.1:7890" spellCheck={false} onChange={(e) => setProxy(e.target.value)} />
-        <span className="muted small">新版本发布在 GitHub，直连不通时填本机代理地址（http 代理）。也可以到发布页手动下载安装包覆盖安装，配置不会丢。</span>
-      </label>
+      {/* 大多数人用不到：默认收起，填过代理或检查失败时展开 */}
+      <details className="update-proxy" open={proxyOpen || status === "error"}>
+        <summary>
+          下载代理 <span className="muted small">· {proxy.trim() ? proxy.trim() : "连不上 GitHub 时才需要"}</span>
+        </summary>
+        <label>
+          <input value={proxy} placeholder="留空跟随系统代理，如 http://127.0.0.1:7890" spellCheck={false} onChange={(e) => setProxy(e.target.value)} />
+          <span className="muted small">新版本发布在 GitHub，直连不通时填本机代理地址（http 代理）。也可以到发布页手动下载安装包覆盖安装，配置不会丢。</span>
+        </label>
+      </details>
     </section>
   );
 }

@@ -9,7 +9,7 @@ import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { ask } from "./modal";
 import { PlanCard, QuestionCard } from "./InteractiveCards";
-import { api, ChatSession, errorText, Host, PermissionMode } from "./api";
+import { api, ChatSession, errorText, Host, PermissionMode, resumeCommand } from "./api";
 import {
   addLocalUser,
   ChatState,
@@ -40,6 +40,7 @@ import {
 } from "./chatModel";
 import { Markdown } from "./Markdown";
 import { AgentsPanel, ConfigPanel, ContextPanel, ModelPanel, OutputStylePanel, StatusPanel, UsagePanel } from "./NativePanels";
+import { RefreshButton } from "./RefreshButton";
 import { McpPanel } from "./McpPanel";
 import { Combo } from "./Select";
 import { PopupMenu } from "./PopupMenu";
@@ -51,7 +52,8 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { ChatStatus, nextMode } from "./ChatStatus";
 import { PermissionCard, ToolCard } from "./ToolCard";
 import { kbd, modKey } from "./platform";
-import { coldPct, observeQuota, pctText } from "./quota";
+import { coldEstimate, observeQuota, rangeText, startCold } from "./quota";
+import { promptSuggestionsOn } from "./prefs";
 
 /**
  * 缓存有效期：超过就按完整上下文重新计费。订阅账号下 CLI 和 stream-json 模式写的都是 1 小时缓存
@@ -206,10 +208,16 @@ interface Props {
   onAttention: () => void;
   /** 打开时直接继续的历史会话（「新标签打开」） */
   initialSession?: ChatSession;
+  /** 新对话的工作目录（从别的对话点「新对话」开过来的） */
+  initialDir?: string;
+  /** 本窗格已有对话时点「新对话」：新开对话标签，本窗格不动 */
+  onNewChat: (dir: string) => void;
   /** 当前会话 id 变了：上报给标签页，用来发现同一会话已在别处打开 */
   onSession: (sessionId: string | null) => void;
   /** 打开历史会话：已在别的窗格打开就切过去、newTab 时开新标签，这两种返回 true；返回 false 则在本窗格继续 */
   onOpenSession: (s: ChatSession, newTab: boolean) => boolean;
+  /** 新开终端标签，用 claude --resume 接着聊这个会话 */
+  onResumeInTerminal: (s: ChatSession) => void;
 }
 
 interface Completion {
@@ -299,7 +307,7 @@ export function ChatView(props: Props) {
   const sessionIdRef = useRef<string | null>(null);
   sessionIdRef.current = state.sessionId;
   // 「新标签打开」历史会话时用会话所在目录；否则优先主机的默认工作目录（每台电脑可以设得不同），没设才用家目录
-  const startDir = props.initialSession?.cwd || host.dir || "~";
+  const startDir = props.initialSession?.cwd || props.initialDir || host.dir || "~";
   const [cwd, setCwd] = useState(startDir);
   const [model, setModel] = useState("");
   const [mode, setMode] = useState<PermissionMode>("default");
@@ -524,17 +532,19 @@ export function ChatView(props: Props) {
     listQuery.current = { dir, seq };
     // 先显示上次的列表，云端结果回来再替换（高延迟链路上要等好几个来回）
     setSessions(cachedSessions(host.id, dir));
-    api
+    return api
       .chatSessions(host.id, dir)
       .then((list) => {
         if (listQuery.current.seq !== seq) return;
         setSessions(list);
         cacheSessions(host.id, dir, list);
+        return `> 已刷新 · ${list.length} 个会话`;
       })
       .catch((e) => {
         if (listQuery.current.seq !== seq) return;
         setSessions([]);
         setState((s) => system(s, `读取历史会话失败：${errorText(e)}`, "error"));
+        return false as const;
       });
   };
 
@@ -570,7 +580,12 @@ export function ChatView(props: Props) {
     if (e.type === "control_response" && e.response?.subtype !== "error" && String(e.response?.request_id ?? "").startsWith(FLAGS_PREFIX)) {
       write(settingsRequest());
     }
-    observeQuota(e);
+    // 下一步预测：本轮结束后两三秒才到；中途关了开关就不再显示
+    if (e.type === "prompt_suggestion" && typeof e.suggestion === "string" && promptSuggestionsOn()) setSuggestion(e.suggestion.trim() || null);
+    // 压缩完没有新回复，上下文大小要主动查（reduce 已把旧值清空，回执会填上）
+    if (e.type === "system" && e.subtype === "compact_boundary") write(contextRequest());
+    // 冷启动这轮刚结束：马上查一次额度，作为实测的「发送后」
+    if (observeQuota(e, chatIdRef.current, propsRef.current.host.id)) write(usageRequest());
     setState((s) => reduce(s, e));
   };
 
@@ -588,6 +603,7 @@ export function ChatView(props: Props) {
         fork,
         model: modelRef.current || null,
         permissionMode: modeRef.current,
+        promptSuggestions: promptSuggestionsOn(),
       },
       channel,
     );
@@ -598,6 +614,8 @@ export function ChatView(props: Props) {
     if (Object.keys(flagsRef.current).length) await api.chatSend(id, flagsRequest(flagsRef.current));
     await api.chatSend(id, usageRequest());
     await api.chatSend(id, settingsRequest());
+    // 继续的会话最后是压缩点时记录里没有压缩后的用量：查一次补上（只在 contextUsed 为空时生效）
+    if (sessionIdRef.current) await api.chatSend(id, contextRequest());
     return id;
   };
 
@@ -688,8 +706,8 @@ export function ChatView(props: Props) {
     write(mcpActionRequest(name, enabled));
   };
 
-  const send = async () => {
-    const text = input;
+  /** text 缺省为输入框内容；输入框为空时按 Enter 发预测，就传预测文字 */
+  const send = async (text = input) => {
     const imgs = images;
     if (!text.trim() && !imgs.length) return;
     if (!imgs.length && runLocalCommand(text)) {
@@ -700,7 +718,7 @@ export function ChatView(props: Props) {
     // 缓存冷了：第一次按发送只拦下提醒（消息留在输入框），再按一次才真发
     if (coldTokens() !== null) {
       if (!coldArmed) return setColdArmed(true);
-      setColdAck(state.lastActive);
+      ackCold();
     }
     setColdArmed(false);
     setInput("");
@@ -717,6 +735,7 @@ export function ChatView(props: Props) {
 
   const dispatch = async (text: string, imgs: string[]) => {
     nearBottom.current = true;
+    setSuggestion(null);
     if (!state.items.length) propsRef.current.onTitle(text.trim().slice(0, 30) || basename(cwd));
     setState((s) => addLocalUser(s, text, imgs));
     try {
@@ -777,6 +796,7 @@ export function ChatView(props: Props) {
     freshRef.current = !next.sessionId && !next.items.length;
     setShownFrom(0);
     setColdArmed(false);
+    setSuggestion(null);
     setQueue([]);
     setQueuePaused(false);
     setQueueEditing(null);
@@ -824,14 +844,51 @@ export function ChatView(props: Props) {
     if (state.running || !at || coldAck === at || ctx <= COLD_WARN_TOKENS) return null;
     return Date.now() - at > CACHE_TTL_MS ? ctx : null;
   };
+  /** 云端预测的下一句（--prompt-suggestions）：发消息、换会话时清掉 */
+  const [suggestion, setSuggestion] = useState<string | null>(null);
+  /** 只在输入框空着、没在回复、没弹补全时显示 */
+  const shownSuggestion = () => (suggestion && !input && !images.length && !state.running && !completion ? suggestion : null);
+  /** 估价用的模型：云端实际在用的，进程还没起来就用本窗格选的 */
+  const priceModel = state.model ?? (model || null);
+  /** 用户确认按冷启动发出：开始实测这一轮。进程已在跑就先查一次额度当「发送前」（新进程启动时本来就会查） */
+  const ackCold = () => {
+    const ctx = coldTokens()!;
+    const est = coldEstimate(ctx, priceModel);
+    setColdAck(state.lastActive);
+    startCold(host.id, ctx, { session: state.sessionId, model: priceModel, idleMin: Math.round((Date.now() - state.lastActive!) / 60_000), est });
+    write(usageRequest());
+  };
   const resumeSeq = useRef(0);
+
+  /**
+   * 先显示了本机缓存：云端结果回来后有新增就补上。期间用户已经发了消息、或又切走了，就不动界面
+   * （缓存在后端已经更新，下次打开就是新的）。云端失败只提示一句，缓存内容照常可看
+   */
+  const refreshFromCloud = (seq: number, remote: Promise<Record<string, any>[]>, shown: ChatState, shownLines: number) =>
+    remote.then(
+      (lines) => {
+        if (seq !== resumeSeq.current || lines.length === shownLines) return;
+        const h = fromHistory(lines);
+        setState((st) =>
+          st.items === shown.items ? { ...st, items: h.items, lastActive: h.lastActive, usage: { ...st.usage, contextUsed: h.usage.contextUsed } } : st,
+        );
+      },
+      (e) => {
+        if (seq === resumeSeq.current) setState((st) => system(st, `无法从云端更新这个会话，当前显示的是本机缓存：${errorText(e)}`, "error"));
+      },
+    );
 
   const resume = async (s: ChatSession) => {
     const seq = ++resumeSeq.current;
     setLoadingSession(s);
     try {
       const t0 = performance.now();
-      const lines = await api.chatHistory(host.id, s.file);
+      // 有本机缓存就先用它立即显示，云端只补新增的部分（下面 refresh）；没有就等云端
+      const cached = await api.chatHistoryCached(host.id, s.file).catch(() => null);
+      if (seq !== resumeSeq.current) return;
+      const remote = api.chatHistory(host.id, s.file);
+      remote.catch(() => {}); // 先显示缓存时由 refreshFromCloud 处理失败
+      const lines = cached ?? (await remote);
       if (seq !== resumeSeq.current) return;
       const t1 = performance.now();
       nearBottom.current = true;
@@ -852,11 +909,15 @@ export function ChatView(props: Props) {
       requestAnimationFrame(() =>
         setTimeout(() =>
           console.info(
-            `[历史会话] ${s.title.slice(0, 20)}：读取 ${Math.round(t1 - t0)}ms（${lines.length} 行）· 解析 ${Math.round(t2 - t1)}ms · 渲染 ${Math.round(performance.now() - t2)}ms（${hist.items.length} 条，先渲染最近 ${Math.min(PAGE, hist.items.length)} 条）`,
+            `[历史会话] ${s.title.slice(0, 20)}：${cached ? "本机缓存" : "云端"}读取 ${Math.round(t1 - t0)}ms（${lines.length} 行）· 解析 ${Math.round(t2 - t1)}ms · 渲染 ${Math.round(performance.now() - t2)}ms（${hist.items.length} 条，先渲染最近 ${Math.min(PAGE, hist.items.length)} 条）`,
           ),
         ),
       );
       propsRef.current.onTitle(s.title.slice(0, 30));
+      if (cached) {
+        setLoadingSession(null);
+        refreshFromCloud(seq, remote, hist, cached.length);
+      }
     } catch (e) {
       if (seq === resumeSeq.current) setState((st) => system(st, `读取会话失败：${errorText(e)}`, "error"));
       // 新标签首次载入失败就不会再唤醒，收掉唤醒屏让人看到报错
@@ -869,6 +930,20 @@ export function ChatView(props: Props) {
   /** 同一会话不能两个进程同时写：已在别处打开就切过去，否则按 newTab 开新标签或在本窗格继续 */
   const openSession = (s: ChatSession, newTab: boolean) => {
     if (!propsRef.current.onOpenSession(s, newTab)) resume(s);
+  };
+
+  /** 「新对话」按钮：本窗格还空着（没发过消息）或 inPlace（Shift+点击）就在这里开始，否则新开标签，免得打断当前对话 */
+  const newChat = (inPlace: boolean) => {
+    const dir = listDir.trim() || "~";
+    const empty = !state.sessionId && !state.running && !state.items.some((i) => i.kind === "user");
+    if (inPlace || empty) switchTo(emptyState, dir);
+    else propsRef.current.onNewChat(dir);
+  };
+
+  /** 在终端中继续：本窗格正开着这个会话就先切到新对话、结束进程，免得两个进程同时写一个会话 */
+  const resumeInTerminal = (s: ChatSession) => {
+    if (s.sessionId === state.sessionId) switchTo(emptyState, cwd);
+    propsRef.current.onResumeInTerminal(s);
   };
 
   const removePermission = (req: PermissionRequest) =>
@@ -895,8 +970,9 @@ export function ChatView(props: Props) {
   const sendText = async (text: string) => {
     setShowCommands(false);
     // 直接点的命令（如提醒卡上的 /compact）算用户已知情
-    if (coldTokens() !== null) setColdAck(state.lastActive);
+    if (coldTokens() !== null) ackCold();
     setColdArmed(false);
+    setSuggestion(null);
     nearBottom.current = true;
     setState((s) => addLocalUser(s, text, []));
     try {
@@ -1200,9 +1276,17 @@ export function ChatView(props: Props) {
       }
       if (e.key === "Escape") return setCompletion(null);
     }
+    // 输入框空着、有下一步预测：Tab 填进来再改，Enter 直接发（同 Claude Code 命令行）
+    const hint = shownSuggestion();
+    if (hint && e.key === "Tab") {
+      e.preventDefault();
+      setInput(hint);
+      setSuggestion(null);
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
-      send();
+      send(hint ?? input);
     }
     if (e.key === "Escape" && state.running) interrupt();
   };
@@ -1401,7 +1485,11 @@ export function ChatView(props: Props) {
               placeholder="工作目录，如 ~/project"
               title="只显示这个目录的历史会话，「新对话」也在这个目录开始"
             />
-            <button className="primary" onClick={() => switchTo(emptyState, listDir.trim() || "~")}>
+            <button
+              className="primary"
+              onClick={(e) => newChat(e.shiftKey)}
+              title={"在左侧的工作目录开始新对话。\n本窗格已有对话时新开一个对话标签，当前对话不受影响；按住 Shift 点击则在本窗格开始（会结束当前对话进程）"}
+            >
               新对话
             </button>
           </div>
@@ -1430,6 +1518,8 @@ export function ChatView(props: Props) {
                       openMenu(e, [
                         { label: "打开", onClick: () => openSession(s, false) },
                         { label: "在新标签打开", hint: kbd("Ctrl+点击"), onClick: () => openSession(s, true) },
+                        { label: "在终端中继续", hint: "claude --resume", onClick: () => resumeInTerminal(s) },
+                        { label: "复制恢复命令", onClick: () => copyText(resumeCommand(s), "恢复命令") },
                         "sep",
                         { label: "重命名", onClick: () => setRenaming({ id: s.sessionId, value: titles[s.sessionId] ?? s.title }) },
                         { label: "删除", danger: true, onClick: () => deleteSession(s) },
@@ -1475,6 +1565,18 @@ export function ChatView(props: Props) {
                         </button>
                         <button
                           className="icon"
+                          title="在终端中继续（新开终端标签执行 claude --resume）"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            resumeInTerminal(s);
+                          }}
+                        >
+                          <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M4 5h16v14H4zM7 9l3 3-3 3M12 15h5" />
+                          </svg>
+                        </button>
+                        <button
+                          className="icon"
                           title="重命名"
                           onClick={(e) => {
                             e.stopPropagation();
@@ -1505,9 +1607,7 @@ export function ChatView(props: Props) {
             ))}
           </div>
           <div className="row chat-sessions-foot">
-            <button className="link" onClick={() => loadSessions()}>
-              刷新
-            </button>
+            <RefreshButton className="link" onClick={() => loadSessions()} />
             <div className="grow" />
             {allDirs ? (
               <button className="link" onClick={() => showDir(listDir)}>
@@ -1822,11 +1922,16 @@ export function ChatView(props: Props) {
               <div className="cold-text">
                 {coldTokens()! >= COLD_HEAVY_TOKENS && <div className="cold-head">⚠ 大会话冷启动：下一条消息会把整段上下文重新写入缓存</div>}
                 此会话上下文约 <b>{Math.round(coldTokens()! / 1000)}k</b> tokens，已闲置 {idleText(Date.now() - state.lastActive!)}，缓存已过期
-                {coldPct(coldTokens()!) !== null && (
-                  <>
-                    （预计约消耗 5 小时额度的 <b>{pctText(coldPct(coldTokens()!)!)}</b>）
-                  </>
-                )}
+                {(() => {
+                  const est = coldEstimate(coldTokens()!, priceModel);
+                  return (
+                    est && (
+                      <span title={est.measured ? "按此前冷启动的实测（整轮，含后续工具调用重读上下文）" : "按价格估算：低值是直接回复，高值是还要调用约 10 次工具（每次都重读整段上下文）。实测几次冷启动后会更准"}>
+                        （这一轮预计约消耗 5 小时额度的 <b>{rangeText(est)}</b>）
+                      </span>
+                    )
+                  );
+                })()}
                 。发送消息或执行 /compact 都会按完整上下文重新计费一次。只是追问一两句就直接发；还要继续很多轮，先 /compact
                 更省；不需要旧上下文的话，新开会话不消耗额度。
                 {coldArmed && <div className="cold-armed">⚠ 消息还没发出。再按一次发送（Enter）就按冷启动计费发出去。</div>}
@@ -1863,6 +1968,7 @@ export function ChatView(props: Props) {
             rateLimits={state.rateLimits}
             tz={tz}
             baseContext={baseContext}
+            model={priceModel}
             onOpen={openPanel}
             onHotCompact={
               !state.running &&
@@ -1877,10 +1983,16 @@ export function ChatView(props: Props) {
             ref={inputRef}
             value={input}
             rows={2}
+            className={shownSuggestion() ? "has-suggestion" : undefined}
             placeholder={
-              state.running ? "Claude 正在工作，继续发送的消息会进入候补，本轮结束后依次发出" : "给 Claude 发消息（Enter 发送，Shift+Enter 换行，/ 命令，@ 文件）"
+              state.running
+                ? "Claude 正在工作，继续发送的消息会进入候补，本轮结束后依次发出"
+                : (shownSuggestion() ?? "给 Claude 发消息（Enter 发送，Shift+Enter 换行，/ 命令，@ 文件）")
             }
+            title={shownSuggestion() ? "预测的下一步：Tab 填入后可修改，Enter 直接发送，打字即忽略" : undefined}
             onChange={(e) => {
+              // 开始打字就丢掉预测（同命令行）
+              if (e.target.value) setSuggestion(null);
               setInput(e.target.value);
               updateCompletion(e.target.value, e.target.selectionStart);
             }}
@@ -1891,7 +2003,7 @@ export function ChatView(props: Props) {
             <button title="从本机选择文件，上传到云主机后把路径插入输入框" disabled={uploading} onClick={attachFiles}>
               {uploading ? "上传中…" : "⊕ 附件"}
             </button>
-            <button className="primary" disabled={!input.trim() && !images.length} onClick={send}>
+            <button className="primary" disabled={!input.trim() && !images.length} onClick={() => send()}>
               发送
             </button>
           </div>

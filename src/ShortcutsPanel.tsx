@@ -27,6 +27,7 @@ const GROUPS: { title: string; items: [string, string][] }[] = [
       ["Enter / Shift+Enter", "发送 / 换行"],
       ["Shift+Tab", "轮换权限模式"],
       ["Esc", "中断 Claude"],
+      ["点「新对话」/ Shift+点击", "已有对话时新开对话标签 / 在本窗格开始"],
     ],
   },
   {

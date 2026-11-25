@@ -255,6 +255,8 @@ export function addLocalUser(s: ChatState, text: string, images: string[]): Chat
   return { ...s, running: true, items: [...s.items, { kind: "user", key: key(), blocks, at: Date.now() }] };
 }
 
+const afterCompact = (s: ChatState): ChatState => ({ ...s, usage: { ...s.usage, contextUsed: null } });
+
 function compactNote(preTokens: unknown): string {
   const k = typeof preTokens === "number" ? `（压缩前约 ${Math.round(preTokens / 1000)}k tokens）` : "";
   return `上下文已压缩${k}，更早的细节 Claude 可能记不清了`;
@@ -282,7 +284,8 @@ export function reduce(s: ChatState, e: Record<string, any>): ChatState {
           tools: e.tools ?? s.tools,
         };
       }
-      if (e.subtype === "compact_boundary") return system(s, compactNote(e.compact_metadata?.pre_tokens));
+      // 压缩不产生 assistant 回复，上下文大小不会自己更新：先清空，ChatView 随即查 get_context_usage 补上实际值
+      if (e.subtype === "compact_boundary") return system(afterCompact(s), compactNote(e.compact_metadata?.pre_tokens));
       return s;
     case "stream_event": {
       // 子代理的流式片段不显示在主对话里
@@ -461,7 +464,8 @@ export function fromHistory(lines: Record<string, any>[]): ChatState {
         lastReply = null;
       }
     } else if (l.type === "system" && l.subtype === "compact_boundary") {
-      s = system(s, compactNote(l.preTokens));
+      // 压缩点之后若没有回复，记录里最后一条用量还是压缩前的
+      s = system(afterCompact(s), compactNote(l.compactMetadata?.preTokens ?? l.preTokens));
     } else if (l.type === "assistant") {
       if (t) lastReply = t;
       // 历史里的 assistant 记录带着当时的用量，取最后一条就是继续会话时的上下文大小

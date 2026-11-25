@@ -166,6 +166,43 @@ button.copy-flash-fail {
     box-shadow: 0 0 0 1px var(--red), 0 0 16px rgb(255 84 112 / 0.6);
   }
 }
+/* 设置页「会话缓存」（ChatCachePanel.tsx） */
+.cache-row {
+  align-items: center;
+  gap: 12px;
+  margin: 4px 0 10px;
+}
+.cache-dir {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 刷新按钮（RefreshButton.tsx）：刷新中青字转圈；刷新完内容闪入用 .refreshed */
+button.refresh-btn:disabled {
+  opacity: 1;
+  cursor: progress;
+  color: var(--cyan);
+}
+button.refresh-btn .spinner {
+  margin-left: 10px;
+  margin-right: 5px;
+  vertical-align: -1px;
+}
+.refreshed {
+  animation: refreshed 0.45s ease-out both;
+}
+@keyframes refreshed {
+  0% {
+    opacity: 0;
+    transform: translateX(-6px);
+    background: rgb(45 226 255 / 0.18);
+  }
+  40% {
+    opacity: 1;
+    transform: none;
+  }
+}
 /* 保存按钮：乱码解码 + HUD 回执（SaveButton.tsx） */
 .save-wrap {
   position: relative;
@@ -1576,9 +1613,22 @@ button.activity-line:hover:not(:disabled)::after {
   font-size: 10.5px;
   color: var(--dim);
 }
-.q-chip.warn {
+/* 已用比例四档：绿 < 黄 < 橙 < 红（阈值见 ChatStatus.tsx 的 QUOTA_STEPS / CTX_STEPS） */
+.q-chip.ok {
+  --c: var(--mint);
+  --c-rgb: 92 242 176;
+}
+.q-chip.mid {
   --c: var(--amber);
   --c-rgb: 255 193 77;
+}
+.q-chip.warn {
+  --c: #ff8a3d;
+  --c-rgb: 255 138 61;
+}
+.q-chip.crit {
+  --c: var(--red);
+  --c-rgb: 255 84 112;
 }
 .q-chip.bad {
   --c: var(--red);
@@ -3140,6 +3190,37 @@ button.select:focus-visible {
   color: var(--void);
   background: var(--magenta);
   box-shadow: 0 0 8px rgb(255 61 154 / 0.6);
+}
+/* 输入框里的下一步预测：比普通占位提示更醒目一点，看得出是可以直接用的内容 */
+textarea.has-suggestion::placeholder {
+  color: var(--cyan);
+  opacity: 0.55;
+}
+/* 发现新版本：右下角提示条，切角面板 + 品红顶边 */
+.update-toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 340px;
+  padding: 10px 12px;
+  background: var(--deck);
+  border-top: 2px solid var(--magenta);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.5), 0 0 12px rgb(255 61 154 / 0.25);
+  clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut));
+}
+.update-toast .muted {
+  margin-left: 8px;
+}
+.update-proxy summary {
+  cursor: pointer;
+  font-size: 13px;
+}
+.update-proxy[open] summary {
+  margin-bottom: 6px;
 }
 .update-row {
   display: flex;

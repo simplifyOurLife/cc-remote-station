@@ -21,6 +21,14 @@ export function PrefsPanel({ prefs, onSave }: { prefs: UiPrefs; onSave: (p: UiPr
   const patchSnippet = (id: string, p: Partial<Snippet>) => {
     setSnippets((list) => list.map((s) => (s.id === id ? { ...s, ...p } : s)));
   };
+  /** 调整顺序（⚡ 菜单按这个顺序列出） */
+  const moveSnippet = (from: number, to: number) => {
+    setSnippets((list) => {
+      const next = [...list];
+      next.splice(to, 0, next.splice(from, 1)[0]);
+      return next;
+    });
+  };
 
   const save = () => {
     // 丢掉没填命令的空行
@@ -116,7 +124,7 @@ export function PrefsPanel({ prefs, onSave }: { prefs: UiPrefs; onSave: (p: UiPr
         <h3>快捷命令</h3>
         <p className="muted">在工作区标签栏的 ⚡ 里一键发送到当前终端。</p>
         <div className="snippet-list">
-          {snippets.map((s) => (
+          {snippets.map((s, i) => (
             <div key={s.id} className="row snippet-row">
               <input value={s.name} placeholder="名称" onChange={(e) => patchSnippet(s.id, { name: e.target.value })} />
               <input
@@ -129,6 +137,12 @@ export function PrefsPanel({ prefs, onSave }: { prefs: UiPrefs; onSave: (p: UiPr
                 <input type="checkbox" checked={s.run} onChange={(e) => patchSnippet(s.id, { run: e.target.checked })} />
                 回车
               </label>
+              <button className="icon" title="上移" disabled={i === 0} onClick={() => moveSnippet(i, i - 1)}>
+                ↑
+              </button>
+              <button className="icon" title="下移" disabled={i === snippets.length - 1} onClick={() => moveSnippet(i, i + 1)}>
+                ↓
+              </button>
               <button
                 className="icon"
                 title="删除"
