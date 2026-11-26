@@ -17,6 +17,8 @@ const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const DEFAULT_READ_LINES: usize = 2000;
 const MAX_OUTPUT_CHARS: usize = 30_000;
+/// 前台命令最多等这么久，没结束就转后台（MCP 客户端常见 60 秒请求超时，留出余量）
+const FOREGROUND_SECS: u64 = 50;
 /// read_file 单次输出上限：只防极端文件（压缩 js、超长日志），别把普通文件切碎——多一轮就多读一遍整段上下文
 const READ_BUDGET: usize = 50_000;
 const MAX_LINE_CHARS: usize = 2000;
@@ -83,12 +85,13 @@ pub fn list() -> Value {
         },
         {
             "name": "edit_file",
-            "description": "精确字符串替换。old_string 必须在文件中唯一（或传 replace_all）；多处匹配会报出各处行号，找不到会给出最相似的行。保留文件原有编码和换行风格，修改前自动备份。",
+            "description": "精确字符串替换。old_string 必须在文件中唯一（或传 replace_all / expect_count）；多处匹配会报出各处行号，找不到会指出差别（空白、全角半角、多一层转义）或最相似的行。保留文件原有编码和换行风格，修改前自动备份。",
             "inputSchema": { "type": "object", "required": ["path", "old_string", "new_string"], "properties": {
                 "path": path,
                 "old_string": { "type": "string" },
                 "new_string": { "type": "string" },
-                "replace_all": { "type": "boolean" }
+                "replace_all": { "type": "boolean" },
+                "expect_count": { "type": "integer", "description": "预期匹配次数：相符才全部替换，不符则不写入并报出各处行号" }
             } }
         },
         {
@@ -126,12 +129,12 @@ pub fn list() -> Value {
         {
             "name": "run_command",
             "description": format!("{RUN_HINT}。受用户管控：可能未开启、只放行白名单，或需要用户在本机弹窗确认（会等待最多 60 秒）；\
-一条命令只做一件事，不要用 & | > 等拼接，拼接的命令总是要确认。工作目录必须在允许的目录内。\
-构建、跑测试等长任务请传 background=true，立即返回任务 id，再用 command_output 取输出。前台命令超时会结束整个进程树。"),
+一条命令只做一件事，不要用 & | > 等拼接，拼接的命令总是要确认；要换目录用 cwd 参数（以「cd 绝对路径 &&」开头的会自动换成 cwd）。工作目录必须在允许的目录内。\
+前台最多等 50 秒，没结束会自动转为后台任务（不会被结束）并返回任务 id，再用 command_output 取输出；明知很长的任务可直接传 background=true。"),
             "inputSchema": { "type": "object", "required": ["command"], "properties": {
                 "command": { "type": "string" },
                 "cwd": { "type": "string", "description": "工作目录，默认第一个允许的目录" },
-                "timeout_secs": { "type": "integer", "description": "前台超时秒数，默认 120，最大 600" },
+                "timeout_secs": { "type": "integer", "description": "只在需要到点强制结束时传（≤50 秒，超时结束整个进程树）；不传则 50 秒后转后台" },
                 "background": { "type": "boolean", "description": "后台运行，不受超时限制" },
                 "include": { "type": "string", "description": "只保留匹配此正则的输出行" },
                 "exclude": { "type": "string", "description": "去掉匹配此正则的输出行" },
@@ -140,11 +143,12 @@ pub fn list() -> Value {
         },
         {
             "name": "command_output",
-            "description": "取后台任务的输出和状态。传上次返回的 next_offset 只取新增部分；wait_secs 可等待新输出或任务结束（最多 50 秒）。构建/测试输出大时用 include/exclude/tail_lines 只取报错等关键行。不传 task_id 则列出所有任务。",
+            "description": "取后台任务的输出和状态。传上次返回的 next_offset 只取新增部分；wait_secs 可等待新输出或任务结束（最多 50 秒）；until 等到某行匹配正则（如 Finished|error、Listening on）或任务结束再返回，比按秒轮询省调用。构建/测试输出大时用 include/exclude/tail_lines 只取报错等关键行。不传 task_id 则列出所有任务。",
             "inputSchema": { "type": "object", "properties": {
                 "task_id": { "type": "string" },
                 "offset": { "type": "integer" },
-                "wait_secs": { "type": "integer" },
+                "wait_secs": { "type": "integer", "description": "最多等待秒数，最大 50；传了 until 时默认 50" },
+                "until": { "type": "string", "description": "正则：offset 之后出现匹配的行或任务结束时返回" },
                 "until_done": { "type": "boolean", "description": "只在任务结束时返回（在 wait_secs 内）" },
                 "include": { "type": "string", "description": "只保留匹配此正则的输出行" },
                 "exclude": { "type": "string", "description": "去掉匹配此正则的输出行" },
@@ -220,8 +224,9 @@ pub async fn call(st: &McpState, name: &str, args: &Value, host: Option<&Host>) 
             let old = str_arg(args, "old_string")?.to_string();
             let new = str_arg(args, "new_string")?.to_string();
             let all = args["replace_all"].as_bool().unwrap_or(false);
+            let expect = args["expect_count"].as_u64().map(|n| n as usize);
             st.guard.backup(&path, name)?;
-            blocking(move || edit_file(&path, &old, &new, all)).await?
+            blocking(move || edit_file(&path, &old, &new, all, expect)).await?
         }
         "delete_file" => {
             let path = st.guard.check(str_arg(args, "path")?)?;
@@ -450,7 +455,8 @@ fn read_file(path: &Path, offset: usize, limit: usize) -> Result<String> {
     Ok(out)
 }
 
-fn edit_file(path: &Path, old: &str, new: &str, all: bool) -> Result<String> {
+/// expect：预期匹配次数，相符才替换（全部），不符不写入
+fn edit_file(path: &Path, old: &str, new: &str, all: bool, expect: Option<usize>) -> Result<String> {
     ensure!(!old.is_empty(), "old_string 不能为空");
     let (text, enc) = read_text(path)?;
     // Claude 传来的片段是 LF，文件是 CRLF 时统一成 LF 匹配，写回时还原
@@ -458,19 +464,53 @@ fn edit_file(path: &Path, old: &str, new: &str, all: bool) -> Result<String> {
     let text = if crlf { text.replace("\r\n", "\n") } else { text };
     let count = text.matches(old).count();
     ensure!(count > 0, "未在文件中找到 old_string。{}", near_miss(&text, old));
-    if !all && count > 1 {
-        let lines: Vec<String> =
-            text.match_indices(old).take(20).map(|(b, _)| (text[..b].matches('\n').count() + 1).to_string()).collect();
-        bail!("old_string 出现了 {count} 次（第 {} 行），请带上更多上下文使其唯一，或传 replace_all", lines.join("、"));
+    let lines = || -> String {
+        let l: Vec<String> = text.match_indices(old).take(20).map(|(b, _)| (text[..b].matches('\n').count() + 1).to_string()).collect();
+        l.join("、")
+    };
+    if let Some(n) = expect {
+        ensure!(count == n, "old_string 实际出现 {count} 次（第 {} 行），与 expect_count={n} 不符，未写入", lines());
+    } else if !all && count > 1 {
+        bail!("old_string 出现了 {count} 次（第 {} 行），请带上更多上下文使其唯一，或传 replace_all", lines());
     }
+    let all = all || expect.is_some();
     let updated = if all { text.replace(old, new) } else { text.replacen(old, new, 1) };
     let updated = if crlf { updated.replace('\n', "\r\n") } else { updated };
     write_text(path, &updated, enc)?;
     Ok(format!("已修改 {}（替换 {} 处）", path.display(), if all { count } else { 1 }))
 }
 
-/// 找不到 old_string 时给线索：第一行非空内容只是空白不同，或文件里最长前缀匹配的行
+/// 全角 ASCII、全角空格、中文引号折成半角，用来判断「只差全角/半角」。逐字符一对一，行号不变
+fn fold_width(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            '\u{3000}' => ' ',
+            '“' | '”' => '"',
+            '‘' | '’' => '\'',
+            '、' => ',',
+            '。' => '.',
+            _ => c,
+        })
+        .collect()
+}
+
+/// 找不到 old_string 时给线索：多了一层转义、只差全角半角、第一行只是空白不同，或文件里最长前缀匹配的行
 fn near_miss(text: &str, old: &str) -> String {
+    let line_of = |t: &str, b: usize| t[..b].matches('\n').count() + 1;
+    // JSON 转义没去干净（\" \\ \n 原样进了参数）
+    let unescaped = old.replace("\\\"", "\"").replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\");
+    if unescaped != old
+        && let Some(b) = text.find(&unescaped)
+    {
+        return format!("去掉一层转义（\\\" \\\\ \\n）后在第 {} 行能对上，old_string 请按文件原文传", line_of(text, b));
+    }
+    let (ft, fo) = (fold_width(text), fold_width(old));
+    if (ft != text || fo != old)
+        && let Some(b) = ft.find(&fo)
+    {
+        return format!("全角/半角或中英文标点不同，折成半角后在第 {} 行能对上，请用 read_file 读这几行后照原文复制", line_of(&ft, b));
+    }
     let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let Some(first) = old.lines().map(str::trim).find(|l| !l.is_empty()) else { return String::new() };
     let target = norm(first);
@@ -618,12 +658,31 @@ fn clip_around(line: &str, re: &regex::Regex) -> String {
     format!("{head}{body}{tail}（本行共 {total} 字符）")
 }
 
+/// 以 `cd <绝对路径> && …` 开头的命令拆成（目录, 后面的命令）。相对路径、带变量或 ~ 的不推断
+fn split_leading_cd(command: &str) -> Option<(&str, &str)> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)^\s*cd\s+(?:/d\s+)?(?:"([^"]+)"|([^\s&;|"]+))\s*(?:&&|&|;)\s*(\S.*)$"#).unwrap()
+    });
+    let c = RE.captures(command)?;
+    let dir = c.get(1).or(c.get(2))?.as_str();
+    let plain = !dir.contains(['%', '$', '~', '`']) && Path::new(dir).is_absolute();
+    plain.then(|| (dir, c.get(3).unwrap().as_str()))
+}
+
 /// host：发起的主机，用它单独设的管控模式；没设或本机其他程序直连时用全局模式
 async fn run_command(st: &McpState, args: &Value, host: Option<&Host>) -> Result<String> {
-    let command = str_arg(args, "command")?;
+    let mut command = str_arg(args, "command")?;
     let cwd = match args["cwd"].as_str() {
         Some(c) => st.guard.check(c)?,
-        None => st.guard.roots().into_iter().next().context("未配置允许的目录")?,
+        // 没传 cwd 但以 cd 绝对路径开头：换成 cwd，剩下的命令单独走审批（不然算拼接命令，总要弹窗确认）。
+        // 目录不在允许范围内就不推断，原样当拼接命令处理
+        None => match split_leading_cd(command).and_then(|(dir, rest)| Some((st.guard.check(dir).ok()?, rest))) {
+            Some((dir, rest)) => {
+                command = rest;
+                dir
+            }
+            None => st.guard.roots().into_iter().next().context("未配置允许的目录")?,
+        },
     };
     let filter = OutFilter::from_args(args)?;
     let (global, allowlist) = {
@@ -643,13 +702,26 @@ async fn run_command(st: &McpState, args: &Value, host: Option<&Host>) -> Result
             task.id, task.id
         ));
     }
-    let timeout = args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600);
-    task.wait(0, Duration::from_secs(timeout), true).await;
+    // 显式给了不超过 FOREGROUND_SECS 的超时：到点结束整个进程树；否则最多等 FOREGROUND_SECS，没完就转后台继续跑，
+    // 不再杀掉——长构建被杀只能重跑，又费时间又费 token
+    let limit = args["timeout_secs"].as_u64().filter(|&t| t <= FOREGROUND_SECS).map(|t| t.max(1));
+    task.wait(0, Duration::from_secs(limit.unwrap_or(FOREGROUND_SECS)), true).await;
     if !task.is_done() {
-        task.kill();
-        task.wait(0, Duration::from_secs(5), true).await;
+        if let Some(t) = limit {
+            task.kill();
+            task.wait(0, Duration::from_secs(5), true).await;
+            let chunk = task.read_from(0);
+            bail!("命令超时（{t} 秒），已结束整个进程树。已产生的输出：\n{}", filter.apply(&chunk.text));
+        }
         let chunk = task.read_from(0);
-        bail!("命令超时（{timeout} 秒），已结束整个进程树。长任务请用 background=true。已产生的输出：\n{}", filter.apply(&chunk.text));
+        let recent = OutFilter { tail_lines: filter.tail_lines.or(Some(5)), ..filter }.apply(&chunk.text);
+        return Ok(format!(
+            "仍在运行（已 {} 秒），已转为后台任务 {id}，没有被结束。用 command_output（task_id={id}，offset={}）取后续输出，\
+可传 until（如 Finished|error）等到关键行出现再返回；stop_command 停止。\n最近输出：\n{recent}",
+            task.elapsed_secs(),
+            chunk.next_offset,
+            id = task.id
+        ));
     }
     let chunk = task.read_from(0);
     Ok(format!("退出码：{}\n{}", exit_text(chunk.exit), filter.apply(&chunk.text)))
@@ -678,10 +750,19 @@ async fn command_output(st: &McpState, args: &Value) -> Result<String> {
     let task: std::sync::Arc<Task> = st.tasks.get(id).context("任务不存在（可能已被清理）")?;
     let filter = OutFilter::from_args(args)?;
     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-    let wait = args["wait_secs"].as_u64().unwrap_or(0).min(50);
-    task.wait(offset, Duration::from_secs(wait), args["until_done"].as_bool().unwrap_or(false)).await;
+    let until = args["until"].as_str().map(regex::Regex::new).transpose().context("until 不是合法正则")?;
+    // 给了 until 没给 wait_secs 时默认等满 50 秒，否则 until 等于没用
+    let wait = Duration::from_secs(args["wait_secs"].as_u64().unwrap_or(if until.is_some() { 50 } else { 0 }).min(50));
+    let missed = match &until {
+        Some(re) => !task.wait_match(offset, wait, re).await,
+        None => {
+            task.wait(offset, wait, args["until_done"].as_bool().unwrap_or(false)).await;
+            false
+        }
+    };
     let chunk = task.read_from(offset);
     let state = match chunk.exit {
+        None if missed => format!("运行中（已 {} 秒），等待时间内没出现 until 匹配的行", task.elapsed_secs()),
         None => format!("运行中（已 {} 秒）", task.elapsed_secs()),
         Some(code) => format!("已结束，退出码 {}", exit_text(Some(code))),
     };
@@ -746,4 +827,32 @@ fn tail(text: &str) -> String {
     }
     let tail: String = text.chars().skip(chars - MAX_OUTPUT_CHARS).collect();
     format!("{CAPPED}输出共 {chars} 字符，仅保留末尾 {MAX_OUTPUT_CHARS}（可用 include/exclude/tail_lines 只取需要的行）\n…{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn leading_cd() {
+        assert_eq!(split_leading_cd(r"cd D:\a\b && cargo check"), Some((r"D:\a\b", "cargo check")));
+        assert_eq!(split_leading_cd(r#"cd /d "D:\my dir" & npm test"#), Some((r"D:\my dir", "npm test")));
+        assert_eq!(split_leading_cd(r"cd src && dir"), None);
+        assert_eq!(split_leading_cd(r"cd %USERPROFILE% && dir"), None);
+        assert_eq!(split_leading_cd(r"cd D:\a"), None);
+    }
+
+    #[test]
+    fn mixed_console_encoding() {
+        let mut bytes = "编译完成\n".as_bytes().to_vec();
+        bytes.extend(encoding_rs::GBK.encode("系统找不到指定的路径。\n").0.iter());
+        assert_eq!(super::super::tasks::decode_console(&bytes), "编译完成\n系统找不到指定的路径。\n");
+    }
+
+    #[test]
+    fn near_miss_hints() {
+        assert!(near_miss("let s = \"a\";\n", r#"let s = \"a\";"#).contains("转义"));
+        assert!(near_miss("提示：完成\n", "提示:完成").contains("全角"));
+    }
 }

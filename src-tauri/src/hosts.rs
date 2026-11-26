@@ -19,9 +19,15 @@ pub struct Host {
     /// 用远端 tmux 托底：断线后会话不死，重连自动接回
     #[serde(default)]
     pub tmux: bool,
+    /// 主机上装了 Claude Code；没装的只当 SSH 主机用，不提供对话和 MCP 转发
+    #[serde(default = "yes")]
+    pub claude: bool,
     /// 允许该主机上的 Claude Code 经反向转发使用本机 MCP 服务
     #[serde(default)]
     pub mcp: bool,
+    /// 打开应用就建立端口映射；否则等第一次连这台主机时再建
+    #[serde(default)]
+    pub mcp_autostart: bool,
     /// 这台主机转发的工具箱条目（含内置的 ccws）及在这台主机上改过的云端端口；None 表示只转发内置工具
     #[serde(default)]
     pub tools: Option<Vec<HostTool>>,
@@ -35,6 +41,10 @@ pub struct Host {
     /// 主机配置存在本机，所以家里和公司的电脑可以对同一台云主机设不同目录
     #[serde(default)]
     pub dir: Option<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// 主机转发的一个工具：名字指向工具箱条目，云端端口可在这台主机上单独改。

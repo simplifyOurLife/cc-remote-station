@@ -1,4 +1,5 @@
 mod chat;
+mod forward;
 mod hosts;
 mod mcp;
 mod settings;
@@ -36,8 +37,10 @@ pub struct AppState {
     guard: Arc<mcp::Guard>,
     /// MCP 工具箱：管理本机 stdio 子进程、测试连接
     toolbox: Arc<mcp::Toolbox>,
-    /// 按主机复用连接：同一台主机的多个终端和 MCP 转发走同一条 SSH 连接
+    /// 按主机复用连接：同一台主机的终端、对话走同一条 SSH 连接
     conns: tokio::sync::Mutex<HashMap<String, Arc<Conn>>>,
+    /// 工具箱端口映射：每台主机一个后台任务，能单独登录的走自己的连接
+    forwarders: forward::Forwarders,
     /// 每台主机一把「正在建连接」的锁：同一台不重复连，不同主机互不阻塞
     connecting: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 登录中途的验证码等输入：弹窗问用户
@@ -110,9 +113,11 @@ async fn get_or_connect(
         return Ok((c, false));
     }
     let host = state.hosts.get(host_id)?;
-    let forwards = host_forwards(state, &host);
-    let conn = Arc::new(ssh::connect(&state.hosts, &state.known_hosts, &host, trust, creds, &state.prompter, forwards).await?);
+    let conn = Arc::new(ssh::connect(&state.hosts, &state.known_hosts, &host, trust, creds, Some(&state.prompter)).await?);
     state.conns.lock().await.insert(host_id.to_string(), conn.clone());
+    if host.mcp {
+        state.forwarders.ensure(host_id);
+    }
     Ok((conn, true))
 }
 
@@ -189,13 +194,15 @@ fn hosts_list(state: State<AppState>) -> CmdResult<Vec<Host>> {
 }
 
 /// secret：None 不改；空串删除；否则写入系统凭据管理器（密码或私钥口令）。
-/// 保存后从连接池移除该主机：新开的标签按新设置重连，已开的标签继续用旧连接直到关闭
+/// 保存后从连接池移除该主机：新开的标签按新设置重连，已开的标签继续用旧连接直到关闭。
+/// 端口映射按新设置重建
 #[tauri::command]
 async fn host_save(state: State<'_, AppState>, host: Host, secret: Option<String>) -> CmdResult<Host> {
     if host.mcp {
         check_host_tools(&state.settings.read().unwrap(), &host)?;
     }
     let host = state.hosts.upsert(host)?;
+    state.forwarders.restart(&host).await;
     state.conns.lock().await.remove(&host.id);
     match secret.as_deref() {
         None => {}
@@ -207,15 +214,9 @@ async fn host_save(state: State<'_, AppState>, host: Host, secret: Option<String
 
 #[tauri::command]
 async fn host_delete(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    state.forwarders.halt(&id).await;
     state.conns.lock().await.remove(&id);
     Ok(state.hosts.delete(&id)?)
-}
-
-#[derive(Serialize)]
-struct OpenResult {
-    id: String,
-    /// 连接成功但有附带问题（如 MCP 转发失败），前端在终端里提示
-    notice: Option<String>,
 }
 
 /// secrets：弹窗里刚输入的密码/口令（按主机 id）；remember 为 true 时认证成功后保存
@@ -231,20 +232,17 @@ async fn terminal_open(
     remember: bool,
     session: Option<String>,
     on_data: Channel<InvokeResponseBody>,
-) -> CmdResult<OpenResult> {
+) -> CmdResult<String> {
     if let Some(name) = &session {
         check_session_name(name)?;
     }
     let creds = Credentials { secrets: secrets.unwrap_or_default(), remember };
-    let (conn, fresh) = get_or_connect(&state, &host_id, trust.as_ref(), &creds).await?;
-    // 只在新建连接时提示一次转发失败，复用连接的标签不重复提醒
-    let failed: Vec<String> = conn.forwards.iter().filter_map(|f| f.error.as_ref().map(|e| format!("{}：{e}", f.name))).collect();
-    let notice = (fresh && !failed.is_empty()).then(|| failed.join("\n"));
+    let (conn, _) = get_or_connect(&state, &host_id, trust.as_ref(), &creds).await?;
     let id = uuid::Uuid::new_v4().to_string();
     let dir = state.hosts.get(&host_id)?.dir;
     let tx = terminal::open(app, id.clone(), conn.clone(), cols, rows, session.as_deref(), dir.as_deref(), on_data).await?;
     state.terminals.lock().unwrap().insert(id.clone(), TermHandle { tx, conn, session });
-    Ok(OpenResult { id, notice })
+    Ok(id)
 }
 
 fn send(state: &AppState, id: &str, input: Input) {
@@ -382,6 +380,10 @@ fn settings_save(state: State<AppState>, patch: SettingsPatch) -> CmdResult<Sett
     next.builtin_alias = patch.builtin_alias.trim().to_string();
     next.check_cloud_names()?;
     next.save(&state.settings_path)?;
+    // 内置工具的云端端口变了，端口映射要重建
+    if next.remote_port != s.remote_port {
+        state.forwarders.restart_all();
+    }
     *s = next;
     Ok(s.clone())
 }
@@ -416,6 +418,10 @@ fn toolbox_save(state: State<AppState>, items: Vec<ToolboxItem>) -> CmdResult<Ve
         next.toolbox = items.into_iter().map(|i| ToolboxItem { alias: i.alias.trim().to_string(), ..i }).collect();
         next.check_cloud_names()?;
         next.save(&state.settings_path)?;
+        // 条目的端口、地址或启停变了，端口映射按新配置重建
+        if next.toolbox != s.toolbox {
+            state.forwarders.restart_all();
+        }
         *s = next;
     }
     state.toolbox.prune();
@@ -485,19 +491,14 @@ fn backup_restore(state: State<AppState>, id: String) -> CmdResult<String> {
 #[serde(rename_all = "camelCase")]
 struct McpHostStatus {
     host_id: String,
-    /// 这台主机上每条工具箱端口映射的建立结果
-    forwards: Vec<ssh::ForwardState>,
+    #[serde(flatten)]
+    status: forward::Status,
 }
 
-/// 当前在线连接上的工具箱反向转发状态；未连接或没有转发的主机不列出
+/// 各主机工具箱端口映射的状态；还没启动映射的主机不列出
 #[tauri::command]
-async fn mcp_status(state: State<'_, AppState>) -> CmdResult<Vec<McpHostStatus>> {
-    let conns = state.conns.lock().await;
-    Ok(conns
-        .iter()
-        .filter(|(_, c)| !c.handle.is_closed() && !c.forwards.is_empty())
-        .map(|(id, c)| McpHostStatus { host_id: id.clone(), forwards: c.forwards.clone() })
-        .collect())
+fn mcp_status(state: State<AppState>) -> Vec<McpHostStatus> {
+    state.forwarders.status().into_iter().map(|(host_id, status)| McpHostStatus { host_id, status }).collect()
 }
 
 /// 读取 ~/.ssh/config 原文（不存在返回空串），由前端解析后让用户勾选导入
@@ -515,8 +516,8 @@ struct McpSpec {
     headers: Vec<String>,
 }
 
-/// 按连接上实际建立的转发算出每个工具应配的地址（端口以连接时为准）；转发失败的给出原因
-fn mcp_specs(state: &AppState, conn: &Conn) -> Vec<(String, Result<McpSpec, String>)> {
+/// 算出这台主机每个工具在云端应配的地址；端口映射失败的给出原因
+fn mcp_specs(state: &AppState, host: &Host) -> Vec<(String, Result<McpSpec, String>)> {
     let (token, items) = {
         let s = state.settings.read().unwrap();
         (s.token.clone(), s.toolbox.clone())
@@ -537,9 +538,14 @@ fn mcp_specs(state: &AppState, conn: &Conn) -> Vec<(String, Result<McpSpec, Stri
             },
         })
     };
-    conn.forwards
+    // 端口按当前配置算；端口映射申请失败的带上原因
+    let status = state.forwarders.status().into_iter().find(|(id, _)| *id == host.id).map(|(_, s)| s.forwards).unwrap_or_default();
+    host_forwards(state, host)
         .iter()
-        .map(|f| (f.name.clone(), f.error.clone().map_or_else(|| spec(&f.name, f.remote_port), Err)))
+        .map(|f| {
+            let error = status.iter().find(|s| s.remote_port == f.remote_port).and_then(|s| s.error.clone()).filter(|e| !e.is_empty());
+            (f.name.clone(), error.map_or_else(|| spec(&f.name, f.remote_port), Err))
+        })
         .collect()
 }
 
@@ -615,7 +621,7 @@ async fn claude_mcp_state(state: State<'_, AppState>, host_id: String, dir: Opti
     projects.sort();
     let project = dir.as_ref().map(|d| server_map(&config["projects"][d]["mcpServers"])).unwrap_or_default();
     let settings = state.settings.read().unwrap().clone();
-    let wanted = mcp_specs(&state, &conn)
+    let wanted = mcp_specs(&state, &state.hosts.get(&host_id)?)
         .into_iter()
         .map(|(name, spec)| {
             let default_name = settings.cloud_name(&name);
@@ -655,7 +661,7 @@ async fn claude_mcp_apply(
     }
     let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
     let scope = if dir.is_some() { "local" } else { "user" };
-    let specs = mcp_specs(&state, &conn);
+    let specs = mcp_specs(&state, &state.hosts.get(&host_id)?);
     // 移除的名字来自云端已有配置，可能带任意字符，一律加引号
     let mut steps: Vec<String> = add
         .iter()
@@ -1137,11 +1143,17 @@ pub fn run() {
                 guard,
                 toolbox,
                 conns: Default::default(),
+                forwarders: forward::Forwarders::new(app.handle().clone()),
                 connecting: Default::default(),
                 prompter: ssh::Prompter::new(app.handle().clone()),
                 terminals: Default::default(),
                 chats: Default::default(),
             });
+            // 设了「打开应用就建立」的主机，现在就把端口映射建起来
+            let state = app.state::<AppState>();
+            for h in state.hosts.list()?.into_iter().filter(|h| h.mcp && h.mcp_autostart) {
+                state.forwarders.ensure(&h.id);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

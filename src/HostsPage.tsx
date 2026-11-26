@@ -46,8 +46,8 @@ export function HostsPage(p: Props) {
       <article
         key={h.id}
         className={`host-card ${state === "ok" ? "live" : ""}`}
-        // 双击卡片空白处开对话；双击在按钮上（如快速点两下「打开终端」）不算
-        onDoubleClick={(e) => !(e.target as HTMLElement).closest("button") && p.onChat(h)}
+        // 双击卡片空白处开对话（没装 Claude Code 的开终端）；双击在按钮上（如快速点两下「打开终端」）不算
+        onDoubleClick={(e) => !(e.target as HTMLElement).closest("button") && (h.claude ? p.onChat(h) : p.onTerminal(h))}
       >
         <header className="host-card-head">
           <span className="host-card-name">{h.name}</span>
@@ -79,10 +79,12 @@ export function HostsPage(p: Props) {
                     <span className="muted menu-hint">接回断线前的终端</span>
                   </div>
                 )}
-                <div className="menu-item" onClick={() => p.onSetupClaude(h)}>
-                  <span>MCP 工具</span>
-                  <span className="muted menu-hint">端口转发、注册到云端 Claude</span>
-                </div>
+                {h.claude && (
+                  <div className="menu-item" onClick={() => p.onSetupClaude(h)}>
+                    <span>MCP 工具</span>
+                    <span className="muted menu-hint">端口转发、注册到云端 Claude</span>
+                  </div>
+                )}
                 <div className="menu-item danger" onClick={() => p.onDelete(h)}>
                   删除主机
                 </div>
@@ -98,19 +100,27 @@ export function HostsPage(p: Props) {
           {h.dir && <span title="默认工作目录">{h.dir}</span>}
           {h.jump && <span>经跳板机</span>}
           {h.tmux && <span>保持会话</span>}
-          <button
-            className={`tag-access tag-button ${h.mcp ? "" : "off"}`}
-            title={h.mcp ? `连接时转发的工具：${hostToolbox(h).map(toolLabel).join("、") || "无"}\n点击修改` : "未转发 MCP 工具，点击配置"}
-            onClick={() => p.onTools(h)}
-          >
-            ⇄ MCP 转发 {h.mcp ? hostToolbox(h).length : "未开"}
-          </button>
+          {h.claude ? (
+            <button
+              className={`tag-access tag-button ${h.mcp ? "" : "off"}`}
+              title={h.mcp ? `连接时转发的工具：${hostToolbox(h).map(toolLabel).join("、") || "无"}\n点击修改` : "未转发 MCP 工具，点击配置"}
+              onClick={() => p.onTools(h)}
+            >
+              ⇄ MCP 转发 {h.mcp ? hostToolbox(h).length : "未开"}
+            </button>
+          ) : (
+            <span title="未安装 Claude Code，只提供终端；装好后在「编辑主机」里勾选">仅终端</span>
+          )}
         </div>
         <footer className="host-card-actions">
-          <button className="primary" onClick={() => p.onChat(h)}>
-            开始对话
+          {h.claude && (
+            <button className="primary" onClick={() => p.onChat(h)}>
+              开始对话
+            </button>
+          )}
+          <button className={h.claude ? "" : "primary"} onClick={() => p.onTerminal(h)}>
+            打开终端
           </button>
-          <button onClick={() => p.onTerminal(h)}>打开终端</button>
         </footer>
       </article>
     );

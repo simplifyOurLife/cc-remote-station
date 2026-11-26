@@ -2,9 +2,11 @@
 //! 超时或停止时结束整个进程树（cmd 启动的 mvn / npm 等子进程也一起结束）。
 
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -13,12 +15,16 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 const MAX_BUFFER: usize = 8 * 1024 * 1024;
 /// 最多保留的已结束任务数
 const KEEP_FINISHED: usize = 20;
+/// 输出没被取过的已结束任务至少保留这么久
+const UNREAD_KEEP: Duration = Duration::from_secs(30 * 60);
 
 pub struct Task {
     pub id: String,
     pub command: String,
     pid: Option<u32>,
     started: Instant,
+    /// 输出被取过（前台命令返回、command_output）；没取过的结果清理时多留一会
+    read: AtomicBool,
     state: Mutex<TaskState>,
 }
 
@@ -46,11 +52,18 @@ impl Task {
     }
 
     pub fn read_from(&self, offset: usize) -> Chunk {
+        self.read.store(true, Ordering::Relaxed);
         let st = self.state.lock().unwrap();
-        let start = offset.max(st.base);
-        let end = st.base + st.output.len();
-        let bytes = &st.output[(start - st.base).min(st.output.len())..];
-        Chunk { text: decode_console(bytes), next_offset: end, exit: st.exit, skipped: start > offset }
+        let from = (offset.max(st.base) - st.base).min(st.output.len());
+        let start = st.base + from;
+        let mut bytes = &st.output[from..];
+        // 还在运行时只交到最后一个换行：半行（可能半个多字节字）留到下次，避免按 GBK 误解码成乱码
+        if st.exit.is_none()
+            && let Some(i) = bytes.iter().rposition(|&b| b == b'\n')
+        {
+            bytes = &bytes[..=i];
+        }
+        Chunk { text: decode_console(bytes), next_offset: start + bytes.len(), exit: st.exit, skipped: st.base > offset }
     }
 
     pub fn elapsed_secs(&self) -> u64 {
@@ -66,6 +79,32 @@ impl Task {
                 if st.exit.is_some() || (!only_done && st.base + st.output.len() > offset) {
                     return;
                 }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// 等到 offset 之后的某一整行匹配 re，或任务结束、超时；返回是否匹配到
+    pub async fn wait_match(&self, offset: usize, timeout: Duration, re: &regex::Regex) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut scanned = offset;
+        loop {
+            let done = {
+                let st = self.state.lock().unwrap();
+                let start = scanned.max(st.base);
+                let bytes = &st.output[(start - st.base).min(st.output.len())..];
+                // 任务结束时最后半行也算；否则只看完整的行
+                let upto = if st.exit.is_some() { Some(bytes.len()) } else { bytes.iter().rposition(|&b| b == b'\n').map(|i| i + 1) };
+                if let Some(n) = upto {
+                    if decode_console(&bytes[..n]).lines().any(|l| re.is_match(l)) {
+                        return true;
+                    }
+                    scanned = start + n;
+                }
+                st.exit.is_some()
+            };
+            if done || Instant::now() >= deadline {
+                return false;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -94,6 +133,7 @@ impl Tasks {
             command: command.to_string(),
             pid: child.id(),
             started: Instant::now(),
+            read: AtomicBool::new(false),
             state: Mutex::new(TaskState { output: Vec::new(), base: 0, exit: None }),
         });
         let stdout = child.stdout.take().context("无法读取输出")?;
@@ -118,11 +158,16 @@ impl Tasks {
         list
     }
 
-    /// 登记新任务，并把已结束的旧任务裁剪到 KEEP_FINISHED 个
+    /// 登记新任务，并把已结束的旧任务裁剪到 KEEP_FINISHED 个。
+    /// 结果还没被取过的（如自动转后台后云端还没来取）至少留 UNREAD_KEEP，不被一串前台小命令挤掉
     fn register(&self, task: Arc<Task>) {
         let mut map = self.map.lock().unwrap();
         map.insert(task.id.clone(), task);
-        let mut finished: Vec<_> = map.values().filter(|t| t.is_done()).map(|t| (t.started, t.id.clone())).collect();
+        let mut finished: Vec<_> = map
+            .values()
+            .filter(|t| t.is_done() && (t.read.load(Ordering::Relaxed) || t.started.elapsed() > UNREAD_KEEP))
+            .map(|t| (t.started, t.id.clone()))
+            .collect();
         if finished.len() > KEEP_FINISHED {
             finished.sort();
             for (_, id) in &finished[..finished.len() - KEEP_FINISHED] {
@@ -187,10 +232,14 @@ pub(super) fn kill_tree(pid: u32) {
     let _ = std::process::Command::new("kill").args(["-KILL", "--", &group]).output();
 }
 
-/// 中文 Windows 控制台程序多输出 GBK，先试 UTF-8 再退回 GB18030
+/// 中文 Windows 控制台程序多输出 GBK。逐行判断：UTF-8 的行原样保留，其余按 GB18030 解码——
+/// 同一段输出里常混着两种（cargo/node 输出 UTF-8，夹着 cmd 的 GBK 报错），整段一起退回 GBK 会把 UTF-8 部分弄成乱码
 pub fn decode_console(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => encoding_rs::GB18030.decode(bytes).0.into_owned(),
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
     }
+    bytes
+        .split_inclusive(|&b| b == b'\n')
+        .map(|l| std::str::from_utf8(l).map(Cow::Borrowed).unwrap_or_else(|_| encoding_rs::GB18030.decode(l).0))
+        .collect()
 }

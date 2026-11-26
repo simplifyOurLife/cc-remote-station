@@ -5,6 +5,10 @@ import "@fontsource/chakra-petch/600.css";
 import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/600.css";
 import App from "./App";
+import { installTitleRedirect } from "./Tooltip";
+
+// 在 React 第一次渲染前：title 一律改存 data-tip，不出系统白框提示
+installTitleRedirect();
 
 // 不用 StrictMode：开发态的双重 effect 会多建一条 SSH 会话
 // 主按钮点击时扫过一道光带：重新挂上 class 让动画每次都从头播

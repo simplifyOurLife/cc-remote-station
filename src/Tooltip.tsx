@@ -4,18 +4,51 @@ import { createPortal } from "react-dom";
 const DELAY = 350;
 const GAP = 8;
 const EDGE = 8;
+/** 有提示文字的元素（空的 data-tip 不算） */
+const HAS_TIP = '[data-tip]:not([data-tip=""])';
 
 /**
- * 全局悬停提示：接管所有带 title 的元素。悬停时把 title 挪到 data-tip（压掉系统自带的提示），
- * 延迟一下显示赛博风的提示框。各处继续写普通的 title 即可。
+ * 让 HTML 元素的 title 根本不落到 DOM 上：setAttribute/removeAttribute("title") 和 el.title 都改写成 data-tip，
+ * 系统自带的白框提示就永远不会出现，统一由 TooltipLayer 显示赛博风提示。各处继续写普通的 title 即可。
  *
- * 系统提示只看「光标下的元素此刻有没有 title」，所以只要鼠标还在元素上，title 就一直不能还回去：
- * - 只有真正离开（mouseout 到外面、鼠标移出窗口）才还 title；
- * - 点击、按键、滚动、窗口失焦只收起提示框（离开前不再弹），不还 title。
- *   以前这些情况会还 title：Claude 回复时消息区不停自动滚动，悬停中的额度、历史会话、耗时标签就被还回
- *   title，鼠标不动也不会再有 mouseover，系统提示就冲出来了；
- * - React 重新渲染会写回 title、甚至把光标下的元素整个换掉（新元素带着 title）：
- *   全局 MutationObserver 在每批 DOM 变化后（微任务里，浏览器更新系统提示之前）重新看光标下是谁并接管，
+ * 以前是悬停时才把光标下元素的 title 挪走、离开时还回去，和 React 的更新有竞态：React 删 title 时属性早被挪走，
+ * 没有变化记录，data-tip 里留着旧文字，离开时又把旧 title 还了回去，之后漏接一次就冒出系统提示。
+ * 要在 React 第一次渲染前调用（main.tsx）。SVG 元素不改（它的 title 属性不出提示）
+ */
+export function installTitleRedirect() {
+  const proto = Element.prototype;
+  const setAttr = proto.setAttribute;
+  const removeAttr = proto.removeAttribute;
+  proto.setAttribute = function (name: string, value: string) {
+    if (this instanceof HTMLElement && name.toLowerCase() === "title") this.dataset.tip = String(value);
+    else setAttr.call(this, name, value);
+  };
+  proto.removeAttribute = function (name: string) {
+    if (this instanceof HTMLElement && name.toLowerCase() === "title") delete this.dataset.tip;
+    else removeAttr.call(this, name);
+  };
+  Object.defineProperty(HTMLElement.prototype, "title", {
+    configurable: true,
+    get(this: HTMLElement) {
+      return this.dataset.tip ?? "";
+    },
+    set(this: HTMLElement, v: string) {
+      this.dataset.tip = String(v);
+    },
+  });
+  // index.html 里写死的
+  document.querySelectorAll<HTMLElement>("[title]").forEach((el) => {
+    if (!(el instanceof HTMLElement)) return;
+    el.dataset.tip = el.getAttribute("title") ?? "";
+    removeAttr.call(el, "title");
+  });
+}
+
+/**
+ * 全局悬停提示：光标停在带 data-tip（即写了 title）的元素上，延迟一下显示提示框。
+ * - 只有真正离开（mouseout 到外面、鼠标移出窗口）才放开当前元素；
+ * - 点击、按键、滚动、窗口失焦只收起提示框，离开前不再弹（对话自动滚动不影响额度、历史列表上的提示）；
+ * - React 重新渲染会改提示文字、甚至把光标下的元素整个换掉：MutationObserver 在每批 DOM 变化后重新看光标下是谁，
  *   滚动后也同样重新看一次。
  */
 export function TooltipLayer() {
@@ -43,41 +76,24 @@ export function TooltipLayer() {
       shown = false;
       suppressed = true;
     };
-    /** 把 title 还给当前元素并放开它 */
+    /** 放开当前元素 */
     const release = () => {
       clearTimeout(timer);
-      if (target) {
-        if (!target.hasAttribute("title") && target.dataset.tip !== undefined) target.setAttribute("title", target.dataset.tip);
-        delete target.dataset.tip;
-        target = null;
-      }
+      target = null;
       if (shown) setTip(null);
       shown = false;
       suppressed = false;
-    };
-    /** 把元素当前的 title 挑走存到 data-tip */
-    const take = (el: HTMLElement) => {
-      const text = el.getAttribute("title");
-      if (text == null) return;
-      el.dataset.tip = text;
-      el.removeAttribute("title");
     };
     /** 接管光标下的元素；正在显示提示时（如元素被重新渲染换掉了）直接接着显示 */
     const adopt = (el: HTMLElement) => {
       if (el === target) return;
       const wasShown = shown;
       release();
-      take(el);
-      if (!el.dataset.tip?.trim()) {
-        delete el.dataset.tip;
-        return;
-      }
       target = el;
       if (wasShown) show();
       else timer = setTimeout(show, DELAY);
     };
-    /** 从某个节点往上找带提示的元素（当前接管的元素 title 已经挪到 data-tip 了） */
-    const owner = (node: Element | null) => node?.closest?.("[title], [data-tip]") as HTMLElement | null;
+    const owner = (node: Element | null) => node?.closest?.(HAS_TIP) as HTMLElement | null;
     /** 重新看光标下是谁 */
     const sync = () => {
       if (!pos) return;
@@ -87,14 +103,11 @@ export function TooltipLayer() {
     };
 
     const watch = new MutationObserver((records) => {
-      // 当前元素的 title 被 React 写回来（内容变了）：再挑走，提示文字跟着更新
-      if (target && records.some((r) => r.type === "attributes" && r.target === target) && target.hasAttribute("title")) {
-        take(target);
-        if (shown) show();
-      }
+      // 当前元素的提示文字变了：正在显示就跟着更新（变空的由下面 sync 放开）
+      if (target && shown && target.dataset.tip && records.some((r) => r.type === "attributes" && r.target === target)) show();
       sync();
     });
-    watch.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["title"] });
+    watch.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ["data-tip"] });
 
     const move = (e: MouseEvent) => {
       pos = { x: e.clientX, y: e.clientY };

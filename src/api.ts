@@ -12,8 +12,12 @@ export interface Host {
   jump: string | null;
   /** 远端 tmux 托底：断线后会话不死，重连自动接回 */
   tmux: boolean;
+  /** 主机上装了 Claude Code；false 时只当 SSH 主机用：不提供对话，也不转发 MCP */
+  claude: boolean;
   /** 允许该主机上的 Claude Code 经反向转发使用本机 MCP */
   mcp: boolean;
+  /** 打开应用就建立端口映射；否则第一次连这台主机时再建 */
+  mcpAutostart?: boolean;
   /** 这台主机转发的工具及在这台主机上改过的云端端口；null 表示只转发内置工具 */
   tools?: HostTool[] | null;
   /** 侧栏分组名，null 表示未分组 */
@@ -182,20 +186,28 @@ export interface ForwardState {
 
 export interface McpHostStatus {
   hostId: string;
+  /** own：独立的转发连接；shared：借用终端/对话的连接；空串：还没连上 */
+  mode: "own" | "shared" | "";
+  /** 没连上时的原因 */
+  note: string | null;
   forwards: ForwardState[];
 }
 
-/** 主机的转发总体状态：有一条失败就算 error；未连接为 null */
-export function forwardState(st: McpHostStatus | undefined): "ok" | "error" | null {
+/** 主机的转发总体状态：有一条失败就算 error；还没连上为 wait；没启动映射为 null */
+export function forwardState(st: McpHostStatus | undefined): "ok" | "error" | "wait" | null {
   if (!st) return null;
+  if (!st.mode) return "wait";
   return st.forwards.some((f) => f.error) ? "error" : "ok";
 }
 
 /** 逐条列出映射，用于提示文字 */
 export function describeForwards(st: McpHostStatus): string {
-  return st.forwards
-    .map((f) => `${f.error ? "✕" : "✓"} ${f.name}：云端 127.0.0.1:${f.remotePort} → 本机 ${f.target}${f.error ? `\n   ${f.error}` : ""}`)
-    .join("\n");
+  if (!st.mode) return st.note ?? "正在连接";
+  const via = st.mode === "own" ? "走独立连接" : "借用终端/对话的连接";
+  const lines = st.forwards.map(
+    (f) => `${f.error ? "✕" : "✓"} ${f.name}：云端 127.0.0.1:${f.remotePort} → 本机 ${f.target}${f.error ? `\n   ${f.error}` : ""}`,
+  );
+  return [via, ...lines].join("\n");
 }
 
 /** 图形版 /config：可设的键（CLI 用法说明原文）和几份配置文件的内容（读不到为 null） */
@@ -282,7 +294,7 @@ export const api = {
   hostSave: (host: Host, secret?: string) => invoke<Host>("host_save", { host, secret }),
   hostDelete: (id: string) => invoke<void>("host_delete", { id }),
   terminalOpen: (hostId: string, cols: number, rows: number, opts: OpenOptions, onData: Channel<ArrayBuffer>) =>
-    invoke<{ id: string; notice: string | null }>("terminal_open", { hostId, cols, rows, ...opts, onData }),
+    invoke<string>("terminal_open", { hostId, cols, rows, ...opts, onData }),
   terminalWrite: (id: string, data: Uint8Array) =>
     invoke<void>("terminal_write", { id, data: Array.from(data) }),
   terminalResize: (id: string, cols: number, rows: number) =>

@@ -18,8 +18,8 @@ use crate::hosts::{Auth, Host, HostStore, secret_get, secret_set};
 /// 一条已认证的 SSH 连接。经跳板机时必须持有跳板机连接，否则隧道会被一起关掉。
 pub struct Conn {
     pub handle: Handle<Client>,
-    /// 工具箱的反向转发（每个勾选的工具一条）及其建立结果
-    pub forwards: Vec<ForwardState>,
+    /// 这条连接上已申请的反向转发（与 Client 共用）
+    targets: Targets,
     _jump: Option<Box<Conn>>,
     /// 探测失败、已判定断开（TCP 可能还没关，is_closed 看不出来）
     dead: AtomicBool,
@@ -82,6 +82,27 @@ impl Conn {
         tokio::spawn(async move {
             let _ = conn.handle.disconnect(russh::Disconnect::ByApplication, "no response", "").await;
         });
+    }
+
+    /// 让云主机在 127.0.0.1:remote_port 上监听并转发到本机目标。先登记目标：云端一连进来就查得到
+    pub async fn forward(&self, f: &Forward) -> Result<()> {
+        let port = u32::from(f.remote_port);
+        self.targets.lock().unwrap().insert(port, (f.target_host.clone(), f.target_port));
+        let result = match tokio::time::timeout(OPEN_TIMEOUT, self.handle.tcpip_forward("127.0.0.1", port)).await {
+            Ok(r) => r.map(|_| ()).map_err(Into::into),
+            Err(_) => Err(anyhow::anyhow!("云主机 {} 秒无响应", OPEN_TIMEOUT.as_secs())),
+        };
+        if result.is_err() {
+            self.targets.lock().unwrap().remove(&port);
+        }
+        result
+    }
+
+    /// 撤掉一条反向转发，云端端口随即空出来
+    pub async fn unforward(&self, remote_port: u16) {
+        let port = u32::from(remote_port);
+        self.targets.lock().unwrap().remove(&port);
+        let _ = tokio::time::timeout(PROBE_TIMEOUT, self.handle.cancel_tcpip_forward("127.0.0.1", port)).await;
     }
 
     /// 开会话通道，超时就判定连接已断
@@ -182,6 +203,18 @@ impl std::fmt::Display for NeedSecret {
 
 impl std::error::Error for NeedSecret {}
 
+/// 登录要用户现场输入（验证码等），而这次连接不能弹窗
+#[derive(Debug)]
+pub struct NeedPrompt;
+
+impl std::fmt::Display for NeedPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("登录需要输入验证码")
+    }
+}
+
+impl std::error::Error for NeedPrompt {}
+
 /// 登录过程中服务器要的额外输入（验证码、动态口令等）：发 ssh-prompt 事件让前端弹窗，
 /// 握手停在这里等用户回答（ssh_prompt_answer）。不重新连接，验证码不会因为重连而作废
 pub struct Prompter {
@@ -256,13 +289,16 @@ pub struct Client {
     known_hosts: PathBuf,
     trust: Option<TrustedKey>,
     unknown: Arc<Mutex<Option<String>>>,
-    /// 云端端口 → 本机目标；云端经反向转发进来的连接按端口接到对应目标
-    targets: HashMap<u32, (String, u16)>,
+    /// 云端经反向转发进来的连接按端口接到对应目标
+    targets: Targets,
     /// 这条连接属于哪台主机，转发进来的连接登记到 PEERS
     host_id: String,
     /// 与 Conn::checked 共用：收到数据就刷新
     checked: Arc<Mutex<Instant>>,
 }
+
+/// 云端端口 → 本机目标 host:port
+type Targets = Arc<Mutex<HashMap<u32, (String, u16)>>>;
 
 /// 经反向转发接进本机的连接：本机一侧的源端口 → 主机 id。
 /// 内置服务据此认出请求来自哪台主机（源端口由本机分配，云端伪造不了）
@@ -296,7 +332,8 @@ impl client::Handler for Client {
         reply: ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<()> {
-        let Some((host, port)) = self.targets.get(&connected_port).cloned() else {
+        let target = self.targets.lock().unwrap().get(&connected_port).cloned();
+        let Some((host, port)) = target else {
             return Ok(()); // 丢弃 reply 即拒绝
         };
         reply.accept().await;
@@ -383,18 +420,18 @@ fn config() -> Arc<client::Config> {
 }
 
 /// 连接并认证一台主机；配了跳板机就先递归连跳板机，再通过 direct-tcpip 隧道连目标。
-/// forwards 在目标主机上逐条建立反向转发；转发失败不影响登录，只记在 Conn::forwards 里。
+/// prompter 为 None 表示不能打扰用户（后台的转发连接）：服务器要验证码时返回 NeedPrompt。
 pub async fn connect(
     store: &HostStore,
     known_hosts: &Path,
     host: &Host,
     trust: Option<&TrustedKey>,
     creds: &Credentials,
-    prompter: &Prompter,
-    forwards: Vec<Forward>,
+    prompter: Option<&Prompter>,
 ) -> Result<Conn> {
     let unknown = Arc::new(Mutex::new(None));
     let checked = Arc::new(Mutex::new(Instant::now()));
+    let targets = Targets::default();
     let handler = Client {
         checked: checked.clone(),
         host: host.host.clone(),
@@ -402,7 +439,7 @@ pub async fn connect(
         known_hosts: known_hosts.to_path_buf(),
         trust: trust.cloned(),
         unknown: unknown.clone(),
-        targets: forwards.iter().map(|f| (f.remote_port.into(), (f.target_host.clone(), f.target_port))).collect(),
+        targets: targets.clone(),
         host_id: host.id.clone(),
     };
 
@@ -415,7 +452,7 @@ pub async fn connect(
             let jump_host = store.get(jump_id)?;
             // NeedSecret / UnknownHostKey 要原样传给前端弹窗，不能被 context 包住后丢掉类型——
             // anyhow 的 downcast 能穿透 context，这里照常加提示
-            let jump = Box::pin(connect(store, known_hosts, &jump_host, trust, creds, prompter, vec![]))
+            let jump = Box::pin(connect(store, known_hosts, &jump_host, trust, creds, prompter))
                 .await
                 .with_context(|| format!("跳板机 {} 连接失败", jump_host.name))?;
             let channel = jump
@@ -439,27 +476,11 @@ pub async fn connect(
     };
 
     authenticate(&mut handle, host, creds, prompter).await?;
-    let mut states = Vec::new();
-    for f in forwards {
-        let error = match handle.tcpip_forward("127.0.0.1", f.remote_port.into()).await {
-            Ok(_) => None,
-            Err(e) => Some(format!(
-                "云端端口 {} 反向转发失败：{e}。可能被占用（比如另一台电脑正连着这台主机、用了同一个端口，可在「MCP 工具箱 → 这台电脑」里换端口），或服务器禁止转发",
-                f.remote_port
-            )),
-        };
-        states.push(ForwardState {
-            name: f.name,
-            remote_port: f.remote_port,
-            target: format!("{}:{}", f.target_host, f.target_port),
-            error,
-        });
-    }
-    Ok(Conn { handle, forwards: states, _jump: jump, dead: AtomicBool::new(false), checked })
+    Ok(Conn { handle, targets, _jump: jump, dead: AtomicBool::new(false), checked })
 }
 
 /// 密码/口令优先用弹窗里刚输入的，其次是凭据管理器里保存的；都没有或不对就返回 NeedSecret
-async fn authenticate(handle: &mut Handle<Client>, host: &Host, creds: &Credentials, prompter: &Prompter) -> Result<()> {
+async fn authenticate(handle: &mut Handle<Client>, host: &Host, creds: &Credentials, prompter: Option<&Prompter>) -> Result<()> {
     let user = host.user.as_str();
     let supplied = creds.secrets.get(&host.id).cloned();
     let secret = match &supplied {
@@ -525,7 +546,7 @@ struct Auth2fa<'a> {
     handle: &'a mut Handle<Client>,
     user: &'a str,
     host_name: &'a str,
-    prompter: &'a Prompter,
+    prompter: Option<&'a Prompter>,
     /// 已有的登录密码：密码类提示直接用它回答，不再弹窗
     password: Option<String>,
     /// 是否弹窗问过用户（失败时据此提示验证码问题）
@@ -554,7 +575,7 @@ impl Auth2fa<'_> {
                 None => {
                     self.asked = true;
                     let field = PromptField { text: "密码：".into(), echo: false };
-                    let mut a = self.prompter.ask(self.host_name, "", "服务器要求再输入登录密码", vec![field]).await?;
+                    let mut a = self.prompter.ok_or(NeedPrompt)?.ask(self.host_name, "", "服务器要求再输入登录密码", vec![field]).await?;
                     a.remove(0)
                 }
             };
@@ -584,7 +605,7 @@ impl Auth2fa<'_> {
                     if !ask.is_empty() {
                         self.asked = true;
                         let fields = ask.iter().map(|&i| PromptField { text: prompts[i].prompt.clone(), echo: prompts[i].echo }).collect();
-                        let got = self.prompter.ask(self.host_name, &name, &instructions, fields).await?;
+                        let got = self.prompter.ok_or(NeedPrompt)?.ask(self.host_name, &name, &instructions, fields).await?;
                         for (i, a) in ask.into_iter().zip(got) {
                             answers[i] = Some(a);
                         }

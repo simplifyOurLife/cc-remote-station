@@ -82,6 +82,7 @@ export function ImportDialog({ hosts, onDone, onClose }: { hosts: Host[]; onDone
           auth: e.identityFile ? { kind: "key", path: e.identityFile } : { kind: "agent" },
           jump: e.proxyJump ? ids.get(e.proxyJump) ?? null : null,
           tmux: false,
+          claude: true,
           mcp: true,
           group: "ssh config",
           dir: null,

@@ -104,7 +104,7 @@ export function Checklist({
 
 /** 环境检查：选一台主机，查 claude / 登录 / tmux，缺什么就给出命令 */
 function EnvCheck({ hosts, onTerminal }: { hosts: Host[]; onTerminal: (h: Host) => void }) {
-  const [hostId, setHostId] = useState(hosts[0].id);
+  const [hostId, setHostId] = useState((hosts.find((h) => h.claude) ?? hosts[0]).id);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<HostCheck | null>(null);
   const [error, setError] = useState("");

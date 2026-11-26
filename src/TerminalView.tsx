@@ -337,11 +337,10 @@ export function TerminalView(props: Props) {
     };
     api
       .terminalOpen(host.id, term.cols, term.rows, { trust, secrets, remember, session }, channel)
-      .then(({ id, notice }) => {
+      .then((id) => {
         if (cancelled) return api.terminalClose(id);
         idRef.current = id;
         quietUntil.current = performance.now() + 5000;
-        if (notice) term.write(`\x1b[33m[${notice}]\x1b[0m\r\n`);
         retryRef.current.count = 0;
         setFails({ n: 0, at: 0 });
         setStatus({ kind: "connected" });

@@ -67,9 +67,13 @@ export function TmuxDialog({
                   {s.attached ? "已有终端连着" : "未连接"} · 最后活动 <span title={tzLabel(tz)}>{hostDateTime(s.activity, tz)}</span>
                 </span>
               </span>
-              <span className="row">
-                <button onClick={() => onAttach(s.name)}>接回</button>
-                <button onClick={() => kill(s.name)}>结束</button>
+              <span className="row tmux-actions">
+                <button className="primary" onClick={() => onAttach(s.name)}>
+                  接回
+                </button>
+                <button className="danger" onClick={() => kill(s.name)}>
+                  结束
+                </button>
               </span>
             </li>
           ))}

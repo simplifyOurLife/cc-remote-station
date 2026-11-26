@@ -360,14 +360,55 @@ button.danger:hover:not(:disabled) {
   background: #ff7088;
   box-shadow: 0 0 12px rgb(255 84 112 / 0.55);
 }
+/* 图标按钮：至少 24×24 的点击区，悬停时青色底 + 内描边，看得出是可点的按钮（原来只变字色，太小不显眼） */
 button.icon {
+  display: inline-grid;
+  place-items: center;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0 6px;
+  font-size: 14px;
+  line-height: 1;
   background: none;
   border: none;
-  padding: 0 5px;
   color: var(--dim);
 }
 button.icon:hover:not(:disabled) {
   color: var(--cyan);
+  background: rgb(45 226 255 / 0.1);
+  box-shadow: inset 0 0 0 1px rgb(45 226 255 / 0.45);
+}
+button.icon.danger:hover:not(:disabled),
+button.icon.del:hover:not(:disabled) {
+  color: var(--red);
+  background: rgb(255 84 112 / 0.12);
+  box-shadow: inset 0 0 0 1px rgb(255 84 112 / 0.5);
+}
+/* 带文字的操作按钮（对话顶栏的搜索/导出/分叉、标签栏的分屏/快捷命令）：图标 + 文字，等宽字；
+ * 悬停青色描边，打开中的常亮。窗格/窗口窄时只留图标（见各处的容器查询/媒体查询） */
+button.act-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  padding: 3px 9px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--dim);
+  background: transparent;
+  border-color: var(--wire);
+}
+button.act-btn i {
+  font-style: normal;
+  font-size: 14px;
+  line-height: 1;
+}
+button.act-btn:hover:not(:disabled),
+button.act-btn.on {
+  color: var(--cyan);
+  border-color: var(--cyan);
+  background: rgb(45 226 255 / 0.06);
+  text-shadow: 0 0 6px rgb(45 226 255 / 0.5);
 }
 /*
  * 文字链接式按钮（刷新、查看全部目录、管理工具箱…）：等宽字 + 暗色方括号；
@@ -967,6 +1008,20 @@ button.activity-line:hover:not(:disabled)::after {
 }
 .mcp-dot.error {
   background: var(--red);
+}
+/* 映射还没连上（正在连接 / 等终端连接）：琥珀色慢闪 */
+.mcp-dot.wait {
+  background: var(--amber);
+  animation: lost-blink 1.4s ease-in-out infinite;
+}
+/* 工具箱页：映射走的是独立连接还是借用终端连接 */
+.fwd-via {
+  margin-right: 8px;
+  padding: 0 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--cyan);
+  box-shadow: inset 0 0 0 1px rgb(45 226 255 / 0.35);
 }
 
 .main {
@@ -2104,6 +2159,41 @@ button.activity-line:hover:not(:disabled)::after {
   clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
   box-shadow: inset 0 -2px 0 var(--magenta);
 }
+/* 对话运行中：底部一束青光来回扫，标签底色微微泛青；切走了也一眼看得到 */
+.tab.running {
+  position: relative;
+  color: var(--ink);
+  background: linear-gradient(180deg, transparent 40%, rgb(45 226 255 / 0.08));
+}
+.tab.running.active {
+  background: linear-gradient(180deg, var(--void) 40%, rgb(45 226 255 / 0.1));
+}
+.tab.running::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--cyan), #fff, var(--cyan), transparent) -70% 0 / 40% 2px no-repeat;
+  filter: drop-shadow(0 0 4px var(--cyan));
+  animation: tab-scan 1.6s linear infinite;
+  pointer-events: none;
+}
+@keyframes tab-scan {
+  to {
+    background-position: 170% 0;
+  }
+}
+.tab-kind.running {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px 0 9px;
+  color: var(--cyan);
+  border-color: var(--cyan);
+  box-shadow: 0 0 6px rgb(45 226 255 / 0.35);
+}
 .tab-title {
   max-width: 280px;
   overflow: hidden;
@@ -2120,13 +2210,18 @@ button.activity-line:hover:not(:disabled)::after {
 .tab-tools {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 6px;
   padding: 0 8px;
   border-left: 1px solid var(--wire);
 }
-.tab-tools button.icon {
-  font-size: 14px;
-  padding: 3px 7px;
+.tab-tools button.act-btn {
+  padding: 2px 8px;
+}
+/* 窗口窄时标签栏的操作只留图标，给标签让位 */
+@media (max-width: 1180px) {
+  .tab-tools button.act-btn span {
+    display: none;
+  }
 }
 
 /* ---------- 菜单 ---------- */
@@ -2317,9 +2412,9 @@ button.activity-line:hover:not(:disabled)::after {
   color: var(--dim);
 }
 .pane-bar button.icon {
+  min-height: 22px;
   padding: 0 6px;
-  font-size: 12px;
-  line-height: 22px;
+  font-size: 13px;
 }
 .pane-bar button.pane-close:hover:not(:disabled) {
   color: var(--red);
@@ -3620,6 +3715,13 @@ button.update-check-btn.fail {
   background: var(--void);
   border-left: 2px solid var(--wire-hi);
 }
+/* 保持会话列表（TmuxDialog）：左边信息长时换行，按钮区不被挤成竖排 */
+.tmux-actions {
+  flex-shrink: 0;
+}
+.tmux-actions button {
+  white-space: nowrap;
+}
 .token-row {
   align-items: center;
 }
@@ -3881,6 +3983,18 @@ button.update-check-btn.fail {
 }
 .chat-toolbar .select {
   width: auto;
+}
+/* 对话顶栏的操作按钮（act-btn）：窗格窄时（分屏）只留图标 */
+.chat-main {
+  container-type: inline-size;
+}
+@container (max-width: 680px) {
+  .chat-toolbar button.act-btn span {
+    display: none;
+  }
+  .chat-toolbar button.act-btn {
+    padding: 3px 7px;
+  }
 }
 .chat-model {
   width: 140px;
@@ -4300,6 +4414,24 @@ button.mcp-badge.warn:hover:not(:disabled) {
   text-align: center;
   white-space: nowrap;
   font-family: var(--font-mono);
+}
+/* 搜索框里的开关（区分大小写 / 仅提问）：关时暗色等宽字，开时青色描边发光 */
+button.search-opt {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--dim);
+  background: transparent;
+  border-color: var(--wire);
+}
+button.search-opt.on,
+button.search-opt.on:hover:not(:disabled) {
+  color: var(--cyan);
+  border-color: var(--cyan);
+  background: rgb(45 226 255 / 0.08);
+  box-shadow: 0 0 10px rgb(45 226 255 / 0.25);
+  text-shadow: 0 0 6px rgb(45 226 255 / 0.6);
 }
 .chat-search {
   display: flex;
@@ -5346,6 +5478,10 @@ button.outline-item.hit .outline-no {
   position: absolute;
   top: -7px;
   right: -7px;
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  font-size: 12px;
   background: var(--deck-3);
 }
 /* 候补消息队列：洋红 = 你的操作，左侧编号即拖动把手 */

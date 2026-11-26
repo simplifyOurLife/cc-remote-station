@@ -69,6 +69,8 @@ const COLD_HEAVY_TOKENS = 150_000;
 const HOT_COMPACT_TOKENS = 200_000;
 /** 历史会话每批渲染的消息数 */
 const PAGE = 60;
+/** 输入框删空后，下一步预测隔这么久再出现 */
+const SUGGEST_QUIET_MS = 2000;
 const MODELS = ["", "opus", "sonnet", "haiku"];
 const SESSIONS_KEY = "ccws.chatSessionsOpen";
 
@@ -168,6 +170,19 @@ function withSavedUsage(s: ChatState, u: Omit<SavedUsage, "baseContext">): ChatS
   return { ...s, rateLimits: u.rateLimits, usage: { ...s.usage, contextWindow: s.usage.contextWindow ?? u.contextWindow } };
 }
 
+/** 分叉的起点：原会话 id 和截至分叉时的消息、目录、模型和权限模式 */
+export interface ChatFork {
+  sessionId: string;
+  items: ChatState["items"];
+  /** 工具结果和子代理步骤：不带的话分叉标签里的工具卡片全显示 RUN */
+  results: ChatState["results"];
+  subs: ChatState["subs"];
+  cwd: string;
+  title: string;
+  mode: PermissionMode;
+  model: string;
+}
+
 /** 本地实现的斜杠命令：CLI 的 -p 模式不提供这些（它们依赖交互界面），发送前在本地拦截执行 */
 const LOCAL_COMMANDS: SlashCommand[] = [
   { name: "resume", description: "本地 · 选择一个历史会话继续，可跟关键词过滤" },
@@ -206,12 +221,18 @@ interface Props {
   onFocus: () => void;
   onTitle: (title: string) => void;
   onAttention: () => void;
+  /** 本轮开始/结束运行，顶部标签据此显示运行特效 */
+  onRunning: (running: boolean) => void;
   /** 打开时直接继续的历史会话（「新标签打开」） */
   initialSession?: ChatSession;
   /** 新对话的工作目录（从别的对话点「新对话」开过来的） */
   initialDir?: string;
   /** 本窗格已有对话时点「新对话」：新开对话标签，本窗格不动 */
   onNewChat: (dir: string) => void;
+  /** 从别的窗格分叉过来：带着那边的消息，第一次启动用 --fork-session 开新会话 */
+  initialFork?: ChatFork;
+  /** 分叉：新开标签接着聊，本窗格的会话不动 */
+  onFork: (fork: ChatFork) => void;
   /** 当前会话 id 变了：上报给标签页，用来发现同一会话已在别处打开 */
   onSession: (sessionId: string | null) => void;
   /** 打开历史会话：已在别的窗格打开就切过去、newTab 时开新标签，这两种返回 true；返回 false 则在本窗格继续 */
@@ -357,6 +378,8 @@ export function ChatView(props: Props) {
   const [titles, setTitles] = useState<Record<string, string>>(loadTitles);
   const [sessionFilter, setSessionFilter] = useState("");
   const [search, setSearch] = useState<{ q: string; index: number } | null>(null);
+  /** 搜索开关：区分大小写、只搜我的提问（关掉搜索框后保留） */
+  const [searchOpt, setSearchOpt] = useState({ cs: false, mine: false });
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [showCommands, setShowCommands] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -433,7 +456,21 @@ export function ChatView(props: Props) {
       .chatDirs(host.id)
       .then(setRecentDirs)
       .catch(() => setRecentDirs([]));
-    if (props.initialSession) resume(props.initialSession);
+    const f = props.initialFork;
+    if (f) {
+      // 分叉标签：沿用原会话的消息和设置，第一次启动带 --fork-session，之后发的消息都进新会话
+      forkRef.current = true;
+      setMode(f.mode);
+      setModel(f.model);
+      modeRef.current = f.mode;
+      modelRef.current = f.model;
+      lastModel.current = f.model;
+      nearBottom.current = true;
+      switchTo({ ...emptyState, sessionId: f.sessionId, items: f.items, results: f.results, subs: f.subs }, f.cwd);
+      setShownFrom(Math.max(0, f.items.length - PAGE));
+      setState((s) => system(s, `分叉自「${f.title}」：这里发的消息存到新会话，原会话不受影响`));
+      propsRef.current.onTitle(`⑂ ${f.title.slice(0, 28)}`);
+    } else if (props.initialSession) resume(props.initialSession);
     else warm();
     return () => {
       if (chatIdRef.current) api.chatStop(chatIdRef.current);
@@ -555,6 +592,14 @@ export function ChatView(props: Props) {
     setAllDirs(false);
     if (d !== listQuery.current.dir) loadSessions(d);
   };
+
+  // 运行状态报给顶部标签；窗格关掉时撤掉
+  useEffect(() => {
+    propsRef.current.onRunning(state.running);
+    return () => {
+      if (state.running) propsRef.current.onRunning(false);
+    };
+  }, [state.running]);
 
   /** 用户没在看这个对话时（失焦或切走了）提醒 */
   const notify = (body: string) => {
@@ -846,8 +891,18 @@ export function ChatView(props: Props) {
   };
   /** 云端预测的下一句（--prompt-suggestions）：发消息、换会话时清掉 */
   const [suggestion, setSuggestion] = useState<string | null>(null);
+  /** 打字不丢预测：输入框清空后静默一会儿再显示（同命令行），删字过程中不闪 */
+  const [suggestQuiet, setSuggestQuiet] = useState(false);
+  const quietTimer = useRef(0);
+  const quietSuggestion = () => {
+    clearTimeout(quietTimer.current);
+    setSuggestQuiet(true);
+    quietTimer.current = window.setTimeout(() => setSuggestQuiet(false), SUGGEST_QUIET_MS);
+  };
+  useEffect(() => () => clearTimeout(quietTimer.current), []);
   /** 只在输入框空着、没在回复、没弹补全时显示 */
-  const shownSuggestion = () => (suggestion && !input && !images.length && !state.running && !completion ? suggestion : null);
+  const shownSuggestion = () =>
+    suggestion && !suggestQuiet && !input && !images.length && !state.running && !completion ? suggestion : null;
   /** 估价用的模型：云端实际在用的，进程还没起来就用本窗格选的 */
   const priceModel = state.model ?? (model || null);
   /** 用户确认按冷启动发出：开始实测这一轮。进程已在跑就先查一次额度当「发送前」（新进程启动时本来就会查） */
@@ -870,7 +925,10 @@ export function ChatView(props: Props) {
         if (seq !== resumeSeq.current || lines.length === shownLines) return;
         const h = fromHistory(lines);
         setState((st) =>
-          st.items === shown.items ? { ...st, items: h.items, lastActive: h.lastActive, usage: { ...st.usage, contextUsed: h.usage.contextUsed } } : st,
+          // 工具结果和子代理步骤也要换成新的，否则新增部分的工具卡片找不到结果，一直显示 RUN
+          st.items === shown.items
+            ? { ...st, items: h.items, results: h.results, subs: h.subs, lastActive: h.lastActive, usage: { ...st.usage, contextUsed: h.usage.contextUsed } }
+            : st,
         );
       },
       (e) => {
@@ -1001,13 +1059,28 @@ export function ChatView(props: Props) {
     }
   };
 
-  /** 分叉：结束当前进程，下一条消息在新会话里接着当前历史聊，原会话保持不变 */
-  const fork = () => {
-    if (chatIdRef.current) api.chatStop(chatIdRef.current);
-    chatIdRef.current = null;
-    forkRef.current = true;
-    setState((s) => system({ ...s, running: false }, "已分叉：接下来在新会话里继续，原会话保持不变"));
-    warm();
+  /** 分叉：先说明并确认，再新开标签带着当前消息在新会话里接着聊；本窗格的会话和正在进行的回答都不动 */
+  const fork = async () => {
+    if (!state.sessionId) return;
+    const ok = await ask(
+      "分叉会新开一个对话标签，带着当前为止的全部消息，在一个新会话里接着聊。\n\n" +
+        "· 原会话留在这个标签里，不受影响，可以继续用\n" +
+        "· 新标签里发的消息只存到新会话，适合试另一种方案、问一个岔开的问题\n" +
+        (state.running ? "· 当前回答还没结束：新会话只带上已经保存的部分\n" : "") +
+        "\n第一次发送时会重新载入上下文，消耗和打开历史会话差不多。",
+      { title: "分叉对话", okLabel: "新开标签分叉" },
+    );
+    if (!ok) return;
+    propsRef.current.onFork({
+      sessionId: state.sessionId,
+      items: state.items,
+      results: state.results,
+      subs: state.subs,
+      cwd,
+      title: currentTitle(),
+      mode,
+      model,
+    });
   };
 
   const currentTitle = () =>
@@ -1077,19 +1150,29 @@ export function ChatView(props: Props) {
 
   // ---- 对话内搜索 ----
 
-  const matches = useMemo(() => {
-    const q = search?.q.trim().toLowerCase();
-    if (!q) return [];
-    return state.items.filter((it) => itemText(it).toLowerCase().includes(q)).map((it) => it.key);
-  }, [search?.q, state.items]);
-  const currentMatch = search && matches.length ? matches[search.index % matches.length] : null;
+  /** 搜索的查询词按开关折叠大小写 */
+  const fold = (s: string) => (searchOpt.cs ? s : s.toLowerCase());
+  /** 每一处出现：所在消息 + 是该消息里的第几处（按纯文字计数，跳转时对应到渲染出的第几处） */
+  const occ = useMemo(() => {
+    const q = search ? fold(search.q.trim()) : "";
+    const list: { key: string; n: number }[] = [];
+    if (!q) return list;
+    for (const it of state.items) {
+      if (searchOpt.mine && it.kind !== "user") continue;
+      const t = fold(itemText(it));
+      for (let i = t.indexOf(q), n = 0; i >= 0; i = t.indexOf(q, i + q.length), n++) list.push({ key: it.key, n });
+    }
+    return list;
+  }, [search?.q, state.items, searchOpt]);
+  const matches = useMemo(() => [...new Set(occ.map((o) => o.key))], [occ]);
+  const curOcc = search && occ.length ? occ[search.index % occ.length] : null;
+  const currentMatch = curOcc?.key ?? null;
 
   useEffect(() => {
     if (search) searchInputRef.current?.focus();
   }, [search !== null]);
-  /** 要滚到的消息（搜索当前命中、缩略导航点击） */
+  /** 要滚到的消息（搜索命中所在消息还没渲染、缩略导航点击） */
   const [reveal, setReveal] = useState<string | null>(null);
-  useEffect(() => setReveal(currentMatch), [currentMatch]);
   useEffect(() => {
     if (!reveal) return;
     // 在还没渲染的更早部分：先展开到那里，渲染后本效果会再跑一次
@@ -1103,35 +1186,58 @@ export function ChatView(props: Props) {
   }, [reveal, shownFrom]);
 
   const stepMatch = (back: boolean) => {
-    if (!search || !matches.length) return;
-    const n = matches.length;
+    if (!search || !occ.length) return;
+    const n = occ.length;
     setSearch({ ...search, index: (search.index + (back ? n - 1 : 1)) % n });
   };
 
-  // 关键词高亮：用 CSS Custom Highlight 给命中的文字上色，不改 DOM（Markdown 是 innerHTML，插标签会被重渲染冲掉）
+  // 关键词高亮：用 CSS Custom Highlight 给命中的文字上色，不改 DOM（Markdown 是 innerHTML，插标签会被重渲染冲掉）。
+  // 当前这一处用亮色并滚到它所在的位置；同一处只滚一次，流式输出重渲染时不抢滚动
   const hlId = useRef(`p${Math.random().toString(36).slice(2)}`).current;
+  const scrolledTo = useRef("");
   useEffect(() => {
-    const q = search?.q.trim().toLowerCase();
+    const q = search ? fold(search.q.trim()) : "";
     const root = scrollRef.current;
     const hits: Range[] = [];
-    const cur: Range[] = [];
+    let cur: Range | null = null;
     if (q && root) {
+      const hitKeys = new Set(matches);
+      const inCur: Range[] = [];
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
       for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-        const text = n.nodeValue!.toLowerCase();
+        const text = fold(n.nodeValue!);
         let i = text.indexOf(q);
         if (i < 0) continue;
-        const inCur = !!currentMatch && n.parentElement?.closest<HTMLElement>("[data-key]")?.dataset.key === currentMatch;
+        const key = n.parentElement?.closest<HTMLElement>("[data-key]")?.dataset.key;
+        if (!key || !hitKeys.has(key)) continue;
         for (; i >= 0; i = text.indexOf(q, i + q.length)) {
           const r = new Range();
           r.setStart(n, i);
           r.setEnd(n, i + q.length);
-          (inCur ? cur : hits).push(r);
+          (key === currentMatch ? inCur : hits).push(r);
+        }
+      }
+      // 渲染后的处数可能和纯文字不同（Markdown 转换），按序号就近对应
+      cur = curOcc && inCur.length ? inCur[Math.min(curOcc.n, inCur.length - 1)] : null;
+      hits.push(...inCur.filter((r) => r !== cur));
+      const target = curOcc ? `${q}|${search!.index}|${searchOpt.cs}|${searchOpt.mine}` : "";
+      if (curOcc && scrolledTo.current !== target) {
+        const node = root.querySelector<HTMLElement>(`[data-key="${curOcc.key}"]`);
+        if (!node) setReveal(curOcc.key); // 在更早还没渲染的部分：先展开，渲染后本效果再跑
+        else {
+          scrolledTo.current = target;
+          if (cur) {
+            // 命中在折叠的思考/工具块里：展开它
+            for (let d = cur.startContainer.parentElement?.closest("details"); d; d = d.parentElement?.closest("details")) d.open = true;
+            const box = root.getBoundingClientRect();
+            root.scrollTop += cur.getBoundingClientRect().top - box.top - root.clientHeight / 2;
+          } else node.scrollIntoView({ block: "center" });
         }
       }
     }
-    setHighlights(hlId, hits, cur);
-  }, [search?.q, currentMatch, state.items, shownFrom]);
+    if (!curOcc) scrolledTo.current = "";
+    setHighlights(hlId, hits, cur ? [cur] : []);
+  }, [search?.q, search?.index, curOcc, matches, shownFrom]);
   useEffect(() => () => setHighlights(hlId, [], []), []);
 
   /** 把文字以 Markdown 引用插到输入框末尾 */
@@ -1281,7 +1387,6 @@ export function ChatView(props: Props) {
     if (hint && e.key === "Tab") {
       e.preventDefault();
       setInput(hint);
-      setSuggestion(null);
       return;
     }
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -1671,8 +1776,14 @@ export function ChatView(props: Props) {
             </button>
           )}
           <div className="menu-anchor">
-            <button ref={commandsBtn} className="icon" title="常用命令" onClick={() => setShowCommands(!showCommands)}>
-              ⌘
+            <button
+              ref={commandsBtn}
+              className={`act-btn${showCommands ? " on" : ""}`}
+              title="常用命令：压缩上下文、用量、模型、设置等（输入框打 / 也能用）"
+              onClick={() => setShowCommands(!showCommands)}
+            >
+              <i>⌘</i>
+              <span>命令</span>
             </button>
             {showCommands && (
               // 挂到 body 上并按窗口边界定位：原来右对齐向左长，说明一长就把左半边顶出窗格被裁掉
@@ -1725,14 +1836,26 @@ export function ChatView(props: Props) {
               </PopupMenu>
             )}
           </div>
-          <button className="icon" title={kbd("搜索对话（Ctrl+F，F3 / Shift+F3 下一个 / 上一个）")} onClick={() => setSearch((s) => s ?? { q: "", index: 0 })}>
-            ⌕
+          <button
+            className={`act-btn${search ? " on" : ""}`}
+            title={kbd("搜索对话（Ctrl+F，F3 / Shift+F3 下一个 / 上一个）")}
+            onClick={() => setSearch((s) => s ?? { q: "", index: 0 })}
+          >
+            <i>⌕</i>
+            <span>搜索</span>
           </button>
-          <button className="icon" title="导出为 Markdown" disabled={!state.items.length} onClick={exportMarkdown}>
-            ⇧
+          <button className="act-btn" title="把当前对话导出为 Markdown 文件" disabled={!state.items.length} onClick={exportMarkdown}>
+            <i>⇩</i>
+            <span>导出</span>
           </button>
-          <button className="icon" title="分叉：在新会话里接着聊，原会话不变" disabled={!state.sessionId} onClick={fork}>
-            ⑂
+          <button
+            className="act-btn"
+            title={state.sessionId ? "分叉：新开标签，在新会话里接着当前对话聊，原会话不变（会先确认）" : "发过消息后才能分叉"}
+            disabled={!state.sessionId}
+            onClick={fork}
+          >
+            <i>⑂</i>
+            <span>分叉</span>
           </button>
         </div>
         {search && (
@@ -1747,13 +1870,29 @@ export function ChatView(props: Props) {
                 if (e.key === "Enter") stepMatch(e.shiftKey);
               }}
             />
-            <span className="search-count muted small-text">
-              {matches.length ? `${(search.index % matches.length) + 1} / ${matches.length}` : search.q ? "无结果" : ""}
+            <button
+              className={`search-opt${searchOpt.cs ? " on" : ""}`}
+              title="区分大小写"
+              aria-pressed={searchOpt.cs}
+              onClick={() => (setSearchOpt((o) => ({ ...o, cs: !o.cs })), setSearch({ ...search, index: 0 }))}
+            >
+              Aa
+            </button>
+            <button
+              className={`search-opt${searchOpt.mine ? " on" : ""}`}
+              title="只搜我的提问"
+              aria-pressed={searchOpt.mine}
+              onClick={() => (setSearchOpt((o) => ({ ...o, mine: !o.mine })), setSearch({ ...search, index: 0 }))}
+            >
+              仅提问
+            </button>
+            <span className="search-count muted small-text" title={matches.length ? `共 ${occ.length} 处，分布在 ${matches.length} 条消息里` : undefined}>
+              {occ.length ? `${(search.index % occ.length) + 1} / ${occ.length}` : search.q ? "无结果" : ""}
             </span>
-            <button className="icon" title="上一个（Shift+Enter）" disabled={!matches.length} onClick={() => stepMatch(true)}>
+            <button className="icon" title="上一个（Shift+Enter）" disabled={!occ.length} onClick={() => stepMatch(true)}>
               ↑
             </button>
-            <button className="icon" title="下一个（Enter）" disabled={!matches.length} onClick={() => stepMatch(false)}>
+            <button className="icon" title="下一个（Enter）" disabled={!occ.length} onClick={() => stepMatch(false)}>
               ↓
             </button>
             <button className="icon" onClick={() => setSearch(null)}>
@@ -1989,10 +2128,10 @@ export function ChatView(props: Props) {
                 ? "Claude 正在工作，继续发送的消息会进入候补，本轮结束后依次发出"
                 : (shownSuggestion() ?? "给 Claude 发消息（Enter 发送，Shift+Enter 换行，/ 命令，@ 文件）")
             }
-            title={shownSuggestion() ? "预测的下一步：Tab 填入后可修改，Enter 直接发送，打字即忽略" : undefined}
+            title={shownSuggestion() ? "预测的下一步：Tab 填入后可修改，Enter 直接发送；打字时隐藏，删空后会再出现" : undefined}
             onChange={(e) => {
-              // 开始打字就丢掉预测（同命令行）
-              if (e.target.value) setSuggestion(null);
+              // 打字时预测只是隐藏（shownSuggestion 要求输入框为空）；删空后静默一会儿再出现
+              if (!e.target.value && input) quietSuggestion();
               setInput(e.target.value);
               updateCompletion(e.target.value, e.target.selectionStart);
             }}

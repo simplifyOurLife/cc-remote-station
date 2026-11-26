@@ -4,7 +4,7 @@ import { ChatCachePanel, ChatPrefsPanel } from "./ChatCachePanel";
 import { listen } from "@tauri-apps/api/event";
 import { DeviceSettings } from "./AccessSettings";
 import { ActivityPanel, summarize } from "./ActivityPanel";
-import { ChatView } from "./ChatView";
+import { ChatFork, ChatView } from "./ChatView";
 import { api, AuditEntry, ChatSession, errorText, forwardState, Host, hostToolbox, McpHostStatus, resumeCommand, Settings } from "./api";
 import { HostForm } from "./HostForm";
 import { HostsPage } from "./HostsPage";
@@ -41,6 +41,8 @@ interface Pane {
   chatSession?: ChatSession;
   /** 对话窗格：新对话的工作目录（从已有对话里点「新对话」时带过来） */
   chatDir?: string;
+  /** 对话窗格：从别的对话分叉过来 */
+  chatFork?: ChatFork;
   /** 对话窗格当前的会话 id（同一会话只允许开一处） */
   chatId?: string | null;
 }
@@ -108,6 +110,16 @@ export default function App() {
   const controls = useRef(new Map<string, PaneControl>());
   /** 各主机 MCP 反向转发状态（只含已连接且开启的） */
   const [mcpStatus, setMcpStatus] = useState<Map<string, McpHostStatus>>(new Map());
+  /** 正在运行（Claude 还在回答）的对话窗格 */
+  const [runningPanes, setRunningPanes] = useState<ReadonlySet<string>>(new Set());
+  const setPaneRunning = (key: string, on: boolean) =>
+    setRunningPanes((s) => {
+      if (s.has(key) === on) return s;
+      const next = new Set(s);
+      if (on) next.add(key);
+      else next.delete(key);
+      return next;
+    });
   /** 云端最近一次调用本机 MCP */
   const [lastActivity, setLastActivity] = useState<AuditEntry | null>(null);
 
@@ -184,8 +196,16 @@ export default function App() {
   };
 
   /** 新开标签并切到工作区；第一次打开时记下，引导第 2 步打勾 */
-  const openTab = (host: Host, session?: string, kind?: "chat", chatSession?: ChatSession, command?: string, chatDir?: string) => {
-    const pane: Pane = { key: newKey(), session, kind, chatSession, command, chatDir };
+  const openTab = (
+    host: Host,
+    session?: string,
+    kind?: "chat",
+    chatSession?: ChatSession,
+    command?: string,
+    chatDir?: string,
+    chatFork?: ChatFork,
+  ) => {
+    const pane: Pane = { key: newKey(), session, kind, chatSession, command, chatDir, chatFork };
     const tab: Tab = {
       key: newKey(),
       host,
@@ -344,7 +364,7 @@ export default function App() {
     else if (mod && e.key === "F4" && activeKey) closeTab(activeKey);
     else if (e.altKey && e.key === "F12" && activeTab) openTab(activeTab.host);
     // 对话窗格里的 Ctrl+Alt+N 由对话自己处理（换新会话），这里只管其它地方：开新对话标签
-    else if (mod && e.altKey && k === "n" && activeTab && !(e.target instanceof Element && e.target.closest(".chat-pane")))
+    else if (mod && e.altKey && k === "n" && activeTab?.host.claude && !(e.target instanceof Element && e.target.closest(".chat-pane")))
       openTab(activeTab.host, undefined, "chat");
     else return false;
     return true;
@@ -507,8 +527,15 @@ export default function App() {
                         return (
                           <li key={h.id} className="access-host">
                             <span className="grow">
-                              <b>{h.name}</b> {!st && <span className="muted">未连接：打开它的对话或终端后建立映射</span>}
-                              {st && (
+                              <b>{h.name}</b>{" "}
+                              {!st && (
+                                <span className="muted">
+                                  {h.mcpAutostart ? "正在启动" : "未连接：打开它的对话或终端后建立映射（可在「MCP 工具」里改成打开应用就建立）"}
+                                </span>
+                              )}
+                              {st && !st.mode && <span className="muted">{st.note ?? "正在连接"}</span>}
+                              {st?.mode && <span className="fwd-via">{st.mode === "own" ? "独立连接" : "借用终端连接"}</span>}
+                              {st?.mode && (
                                 <span className="forward-list">
                                   {st.forwards.map((f) => (
                                     <span key={f.name} className={f.error ? "form-error inline" : ""} title={f.error ?? undefined}>
@@ -562,7 +589,7 @@ export default function App() {
               {tabs.map((t) => (
                 <div
                   key={t.key}
-                  className={`tab ${t.key === activeKey ? "active" : ""}`}
+                  className={`tab ${t.key === activeKey ? "active" : ""} ${t.panes.some((p) => runningPanes.has(p.key)) ? "running" : ""}`}
                   title={`${t.title || t.host.name}\n中键点击关闭`}
                   onClick={() => activate(t.key)}
                   // 中键关闭（和浏览器一致）；mousedown 拦掉中键自动滚动
@@ -571,7 +598,14 @@ export default function App() {
                   onContextMenu={(e) => tabMenu(e, t)}
                 >
                   {t.attention && <span className="tab-dot" />}
-                  <span className="tab-kind">{t.panes[0].kind === "chat" ? "对话" : "终端"}</span>
+                  {t.panes.some((p) => runningPanes.has(p.key)) ? (
+                    <span className="tab-kind running" title="Claude 正在回答">
+                      <span className="spinner" />
+                      运行中
+                    </span>
+                  ) : (
+                    <span className="tab-kind">{t.panes[0].kind === "chat" ? "对话" : "终端"}</span>
+                  )}
                   <span className="tab-title">
                     {t.host.name}
                     {t.panes.length > 1 && <span className="muted"> [{t.panes.length}]</span>}
@@ -600,10 +634,14 @@ export default function App() {
                     {hosts.map((h) => (
                       <div key={h.id} className="menu-item new-tab-row">
                         <span className="grow">{h.name}</span>
-                        <button className="primary" onClick={() => openTab(h, undefined, "chat")}>
-                          对话
+                        {h.claude && (
+                          <button className="primary" onClick={() => openTab(h, undefined, "chat")}>
+                            对话
+                          </button>
+                        )}
+                        <button className={h.claude ? "" : "primary"} onClick={() => openTab(h)}>
+                          终端
                         </button>
-                        <button onClick={() => openTab(h)}>终端</button>
                       </div>
                     ))}
                     {hosts.length === 0 && (
@@ -621,18 +659,29 @@ export default function App() {
             </div>
             {activeKey && (
               <div className="tab-tools">
-                <button className="icon" title={kbd("向右分屏一个终端（Ctrl+Shift+D）")} onClick={() => splitPane(activeKey, "row")}>
-                  ‖
+                <button className="act-btn" title={kbd("向右分屏一个终端（Ctrl+Shift+D）")} onClick={() => splitPane(activeKey, "row")}>
+                  <i>‖</i>
+                  <span>右分屏</span>
                 </button>
-                <button className="icon" title={kbd("向下分屏一个终端（Ctrl+Shift+E）")} onClick={() => splitPane(activeKey, "col")}>
-                  ═
+                <button className="act-btn" title={kbd("向下分屏一个终端（Ctrl+Shift+E）")} onClick={() => splitPane(activeKey, "col")}>
+                  <i>═</i>
+                  <span>下分屏</span>
                 </button>
-                <button className="icon" title="在右侧并排一个新对话" onClick={() => splitPane(activeKey, "row", "chat")}>
-                  ＋对话
-                </button>
+                {activeTab?.host.claude && (
+                  <button className="act-btn" title="在右侧并排一个新对话" onClick={() => splitPane(activeKey, "row", "chat")}>
+                    <i>＋</i>
+                    <span>并排对话</span>
+                  </button>
+                )}
                 <div>
-                  <button ref={snippetsBtn} className="icon" title="快捷命令" onClick={() => setShowSnippets((s) => !s)}>
-                    ⚡
+                  <button
+                    ref={snippetsBtn}
+                    className={`act-btn${showSnippets ? " on" : ""}`}
+                    title="快捷命令：一键发送到当前终端（在「设置」里编辑）"
+                    onClick={() => setShowSnippets((s) => !s)}
+                  >
+                    <i>⚡</i>
+                    <span>快捷命令</span>
                   </button>
                   {showSnippets && (
                     <PopupMenu anchor={snippetsBtn} onClose={() => setShowSnippets(false)}>
@@ -709,9 +758,12 @@ export default function App() {
                       onFocus={() => t.activePane !== p.key && patchTab(t.key, { activePane: p.key })}
                       onTitle={(title) => patchTab(t.key, { title })}
                       onAttention={() => (t.key !== activeKey || page !== "workspace") && patchTab(t.key, { attention: true })}
+                      onRunning={(on) => setPaneRunning(p.key, on)}
                       initialSession={p.chatSession}
                       initialDir={p.chatDir}
                       onNewChat={(dir) => openTab(t.host, undefined, "chat", undefined, undefined, dir)}
+                      initialFork={p.chatFork}
+                      onFork={(f) => openTab(t.host, undefined, "chat", undefined, undefined, undefined, f)}
                       onSession={(chatId) => setPaneChatId(t.key, p.key, chatId)}
                       onOpenSession={(s, newTab) => openChatSession(t, p.key, s, newTab)}
                       onResumeInTerminal={(s) => resumeInTerminal(t, p.key, s)}

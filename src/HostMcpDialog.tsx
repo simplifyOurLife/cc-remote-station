@@ -40,6 +40,8 @@ export function HostMcpDialog({
   const [rows, setRows] = useState<ToolRow[]>(() => initRows(initialHost, settings));
   /** 这台主机单独的命令管控模式；null 跟随全局 */
   const [cmdMode, setCmdMode] = useState<CommandMode | null>(initialHost.commandMode ?? null);
+  /** 打开应用就建立端口映射 */
+  const [autostart, setAutostart] = useState(!!initialHost.mcpAutostart);
   /** 每保存一次加一，注册页据此重新读取（保存会重建连接和转发） */
   const [version, setVersion] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -49,7 +51,9 @@ export function HostMcpDialog({
 
   const tools = rowsToTools(rows, settings);
   const dirty =
-    toolsKey(mcp, mcp ? tools : null) !== toolsKey(host.mcp, host.mcp ? hostTools(host) : null) || cmdMode !== (host.commandMode ?? null);
+    toolsKey(mcp, mcp ? tools : null) !== toolsKey(host.mcp, host.mcp ? hostTools(host) : null) ||
+    cmdMode !== (host.commandMode ?? null) ||
+    autostart !== !!host.mcpAutostart;
   const invalid = mcp && rowProblems(rows).size > 0;
   const savedTools = host.mcp ? hostTools(host) : [];
   /** 已保存的设置里没转发的工具，注册页显示为灰色 */
@@ -62,7 +66,7 @@ export function HostMcpDialog({
     setError("");
     try {
       // secret 传 undefined：不动已保存的密码/口令
-      const saved = await api.hostSave({ ...host, mcp: nextMcp, tools: rowsToTools(nextRows, settings), commandMode: cmdMode });
+      const saved = await api.hostSave({ ...host, mcp: nextMcp, tools: rowsToTools(nextRows, settings), commandMode: cmdMode, mcpAutostart: autostart });
       setHost(saved);
       setVersion((v) => v + 1);
       onHostSaved(saved);
@@ -128,11 +132,26 @@ export function HostMcpDialog({
 
         {tab === "fwd" ? (
           <>
-            <p className="muted small mcp-tab-lead">连接主机时为勾选的工具建立转发：云主机 127.0.0.1:端口 → 本机目标。端口默认取工具箱里的默认映射端口。</p>
+            <p className="muted small mcp-tab-lead">
+              为勾选的工具建立转发：云主机 127.0.0.1:端口 → 本机目标，端口默认取工具箱里的默认映射端口。能免密登录的主机单独开一条连接专门转发，和终端、对话互不影响。
+            </p>
             <label className="checkbox">
               <input type="checkbox" checked={mcp} onChange={(e) => setMcp(e.target.checked)} />
               连接时转发 MCP 工具
             </label>
+            {mcp && (
+              <div className="row host-command-mode">
+                <span>建立端口映射：</span>
+                <Select
+                  value={autostart ? "launch" : "connect"}
+                  onChange={(v) => setAutostart(v === "launch")}
+                  options={[
+                    { value: "connect", label: "第一次连这台主机时", hint: "打开它的终端或对话时建立，之后一直保持，断了自动重连" },
+                    { value: "launch", label: "打开 cc-remote-station 时", hint: "应用一启动就建立，不用先开终端；登录要验证码的主机仍要等终端连上后借用它的连接" },
+                  ]}
+                />
+              </div>
+            )}
             {mcp && <HostToolsTable rows={rows} onChange={setRows} settings={settings} status={status} />}
             {mcp && rows.some((r) => r.name === BUILTIN_NAME && r.on) && (
               <div className="row host-command-mode">
@@ -160,6 +179,7 @@ export function HostMcpDialog({
                     setMcp(host.mcp);
                     setRows(initRows(host, settings));
                     setCmdMode(host.commandMode ?? null);
+                    setAutostart(!!host.mcpAutostart);
                     setError("");
                   }}
                 >

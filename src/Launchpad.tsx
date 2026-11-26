@@ -114,7 +114,7 @@ export function Launchpad({
           </div>
           <div className="launchpad-hosts">
             {shown.map((h) => {
-              const online = mcpStatus.has(h.id);
+              const online = !!mcpStatus.get(h.id)?.mode;
               return (
                 <div key={h.id} className="launchpad-host">
                   <div className="launchpad-host-name">
@@ -127,10 +127,12 @@ export function Launchpad({
                     {h.port !== 22 && `:${h.port}`}
                   </code>
                   <div className="launchpad-host-actions">
-                    <button className="primary" title="图形界面和云端 Claude Code 协作" onClick={() => onChat(h)}>
-                      对话
-                    </button>
-                    <button title="像 SSH 一样操作云主机" onClick={() => onTerminal(h)}>
+                    {h.claude && (
+                      <button className="primary" title="图形界面和云端 Claude Code 协作" onClick={() => onChat(h)}>
+                        对话
+                      </button>
+                    )}
+                    <button className={h.claude ? "" : "primary"} title="像 SSH 一样操作云主机" onClick={() => onTerminal(h)}>
                       终端
                     </button>
                   </div>

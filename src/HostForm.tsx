@@ -3,7 +3,7 @@ import { api, Auth, BUILTIN_NAME, errorText, Host } from "./api";
 import { NumberInput } from "./NumberInput";
 import { Combo, Select } from "./Select";
 
-const emptyHost: Host = { id: "", name: "", host: "", port: 22, user: "root", auth: { kind: "password" }, jump: null, tmux: false, mcp: true, tools: [{ name: BUILTIN_NAME, remotePort: null }], group: null, dir: null };
+const emptyHost: Host = { id: "", name: "", host: "", port: 22, user: "root", auth: { kind: "password" }, jump: null, tmux: false, claude: true, mcp: true, tools: [{ name: BUILTIN_NAME, remotePort: null }], group: null, dir: null };
 
 export function HostForm({
   initial,
@@ -120,13 +120,24 @@ export function HostForm({
           />
         </label>
         <label className="checkbox">
-          <input type="checkbox" checked={host.tmux} onChange={(e) => set({ tmux: e.target.checked })} />
-          保持会话（tmux）：断线后 Claude Code 不中断，重连自动接回；需服务器已装 tmux
+          <input
+            type="checkbox"
+            checked={host.claude}
+            // 没装 Claude Code 时 MCP 转发没人用，一并关掉；重新勾上时恢复默认的转发
+            onChange={(e) => set({ claude: e.target.checked, mcp: e.target.checked })}
+          />
+          已安装 Claude Code：不勾则只当 SSH 主机用，不显示「开始对话」，也不转发 MCP 工具
         </label>
         <label className="checkbox">
-          <input type="checkbox" checked={host.mcp} onChange={(e) => set({ mcp: e.target.checked })} />
-          连接时转发 MCP 工具：具体转发哪些、注册到 Claude，在主机卡片的「MCP 转发」里设置
+          <input type="checkbox" checked={host.tmux} onChange={(e) => set({ tmux: e.target.checked })} />
+          保持会话（tmux）：断线后终端不中断，重连自动接回；需服务器已装 tmux
         </label>
+        {host.claude && (
+          <label className="checkbox">
+            <input type="checkbox" checked={host.mcp} onChange={(e) => set({ mcp: e.target.checked })} />
+            连接时转发 MCP 工具：具体转发哪些、注册到 Claude，在主机卡片的「MCP 转发」里设置
+          </label>
+        )}
         {error && <p className="form-error">{error}</p>}
         <div className="dialog-actions">
           <button type="button" onClick={onCancel}>
