@@ -199,9 +199,9 @@ export function ChatStatus({
         <button
           className="hot-compact"
           onClick={onHotCompact}
-          title={`上下文已超过 200k，缓存还在（上次回复不到 1 小时），现在 /compact 最便宜${
-            hotCompactPct(used, model) !== null ? `，预计约消耗 5 小时额度的 ${pctText(hotCompactPct(used, model)!)}` : ""
-          }。\n隔久了再压缩，要按完整上下文重新计费一次。`}
+          title={`上下文已超过 200k，缓存还在（上次回复不到 1 小时），现在 /compact 最便宜，预计约消耗 5 小时额度的 ${pctText(
+            hotCompactPct(used, model),
+          )}。\n隔久了再压缩，要按完整上下文重新计费一次。`}
         >
           趁热压缩
         </button>

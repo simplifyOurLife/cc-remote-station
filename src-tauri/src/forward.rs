@@ -101,6 +101,50 @@ async fn wait(stop: &Notify, d: Duration) -> bool {
     tokio::time::timeout(d, stop.notified()).await.is_ok()
 }
 
+/// 云主机上的端口登记：~/.cache/ccws/fwd-<端口> 记着替本机占着这个端口的 sshd 会话进程
+/// （pid、启动时刻、哪台电脑）。sshd 会话进程不可转储，普通用户查不到谁占着端口，只能自己记。
+/// exec 通道里 shell 的 $PPID 就是这条连接的 sshd 会话进程
+const MARK_DIR: &str = "~/.cache/ccws";
+/// 进程启动时刻（/proc/pid/stat 第 22 列），防 pid 被复用后误杀
+const START_OF: &str = "sed 's/.*) //' /proc/$1/stat | cut -d' ' -f20";
+
+/// 本机标识，只留字母数字，直接拼进云端命令
+fn machine() -> String {
+    let name = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_default();
+    let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+    if name.is_empty() { "pc".into() } else { name }
+}
+
+/// 记下这些端口现在由本连接的 sshd 会话占着
+async fn mark(conn: &Arc<Conn>, ports: &[u16]) {
+    let ports = ports.iter().map(u16::to_string).collect::<Vec<_>>().join(" ");
+    let cmd = format!(
+        "st() {{ {START_OF}; }}; d={MARK_DIR}; mkdir -p $d && s=$(st $PPID) && for p in {ports}; do echo \"$PPID $s {}\" > $d/fwd-$p; done",
+        machine()
+    );
+    if let Err(e) = conn.exec(&cmd, None).await {
+        log::warn!("登记云端端口失败：{e:#}");
+    }
+}
+
+/// 端口申请失败时调用：登记的是本机、另一条（已断的）连接，且那个 sshd 进程还在，就结束它。
+/// 别的电脑、别的程序占着的不碰。返回是否结束了旧会话
+async fn reclaim(conn: &Arc<Conn>, port: u16) -> bool {
+    let cmd = format!(
+        "st() {{ {START_OF}; }}; read pid s who < {MARK_DIR}/fwd-{port} || exit 1; \
+         [ \"$who\" = {} ] && [ \"$pid\" != \"$PPID\" ] && [ \"$(st $pid)\" = \"$s\" ] || exit 1; \
+         case $(cat /proc/$pid/comm) in sshd*) ;; *) exit 1;; esac; kill $pid && echo $pid",
+        machine()
+    );
+    match conn.exec(&cmd, None).await {
+        Ok(o) if o.code == 0 => {
+            log::warn!("云端端口 {port} 被本机已断开的旧会话占着，已结束它（PID {}）", String::from_utf8_lossy(&o.stdout).trim());
+            true
+        }
+        _ => false,
+    }
+}
+
 fn ptr(c: &Arc<Conn>) -> usize {
     Arc::as_ptr(c) as usize
 }
@@ -178,16 +222,35 @@ async fn run(app: AppHandle, host_id: String, stop: Arc<Notify>, status: Arc<Mut
         let mut next_bind = Instant::now();
         let stopped = loop {
             if Instant::now() >= next_bind && states.iter().any(|s| s.error.is_some()) {
+                let mut bound = vec![];
                 for (f, s) in list.iter().zip(&mut states) {
-                    if s.error.is_some() {
-                        s.error = conn.forward(f).await.err().map(|e| {
-                            format!(
-                                "云端端口 {} 申请失败：{e:#}。可能被占用（服务器上还留着本机已断开的旧会话，或另一台电脑连着这台主机用了同一端口，可在「MCP 工具箱 → 这台电脑」里换端口），或服务器禁止转发。每 {} 秒自动重试",
-                                f.remote_port,
-                                RETRY_BIND.as_secs()
-                            )
-                        });
+                    if s.error.is_none() {
+                        continue;
                     }
+                    let mut r = conn.forward(f).await;
+                    // 被本机以前留下的旧会话占着：结束它再申请一次，不干等服务器回收
+                    if r.is_err() && reclaim(&conn, f.remote_port).await {
+                        for _ in 0..5 {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            r = conn.forward(f).await;
+                            if r.is_ok() {
+                                break;
+                            }
+                        }
+                    }
+                    if r.is_ok() {
+                        bound.push(f.remote_port);
+                    }
+                    s.error = r.err().map(|e| {
+                        format!(
+                            "云端端口 {} 申请失败：{e:#}。可能被占用（另一台电脑连着这台主机用了同一端口，或服务器上别的程序在用，可在「MCP 工具箱 → 这台电脑」里换端口），或服务器禁止转发。每 {} 秒自动重试",
+                            f.remote_port,
+                            RETRY_BIND.as_secs()
+                        )
+                    });
+                }
+                if !bound.is_empty() {
+                    mark(&conn, &bound).await;
                 }
                 next_bind = Instant::now() + RETRY_BIND;
                 set(mode, None, states.clone());

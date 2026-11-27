@@ -2188,14 +2188,13 @@ button.activity-line:hover:not(:disabled)::after {
 .tab-kind.running {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 6px 0 9px;
+  padding: 0 7px;
   color: var(--cyan);
   border-color: var(--cyan);
   box-shadow: 0 0 6px rgb(45 226 255 / 0.35);
 }
 .tab-title {
-  max-width: 280px;
+  max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -4899,6 +4898,35 @@ button.outline-item.hit .outline-no {
   max-width: 320px;
   max-height: 240px;
   object-fit: contain;
+  cursor: zoom-in;
+}
+.chat-thumb img {
+  cursor: zoom-in;
+}
+/* 全屏看图 */
+.image-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgb(5 6 12 / 0.88);
+  cursor: zoom-out;
+  animation: image-viewer-in 0.15s ease-out;
+}
+.image-viewer img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border: 1px solid var(--cyan);
+  box-shadow: 0 0 24px rgb(45 226 255 / 0.25);
+}
+@keyframes image-viewer-in {
+  from {
+    opacity: 0;
+  }
 }
 .msg-actions {
   position: absolute;

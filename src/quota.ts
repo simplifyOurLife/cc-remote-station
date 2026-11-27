@@ -1,61 +1,56 @@
 /**
- * 5 小时额度的估算：额度只报已用比例、不报总量，只能拿实际花费和比例的变化在本机慢慢积累。
- * - 通用口径「每美元占百分之几」：result.total_cost_usd（CLI 按模型价格算好的，含子代理）对两次 5H 采样之间的涨幅。
- * - 冷启动单独实测：发送前后各取一次 5H 比例，记「上下文 token → 涨了多少」。整轮（含后续每次工具调用重读
- *   全量上下文）都算在里面，不用猜缓存读写的权重。
- * 终端里、别的设备上的用量也算在同一个额度里，所以估出来偏保守（百分比偏高）。
+ * 冷启动（缓存过期后继续旧会话）占 5 小时额度多少的估算。
  *
- * 实测（2026-11）：rate_limit_event 只在进程第一次请求时来一次，所以另外用 get_usage 的回执补采样。
+ * 5H 比例是整个账号的：别的机器、终端里的 claude 也在推它，应用只看得到自己对话的花费，
+ * 所以「美元 → 百分比」的通用换算会随别处用量漂移（实测 2026-11 从 $3.3/% 漂到 $2/%），不能用。
+ * 能测准的只有冷启动第一次调用：把整段上下文重新写入缓存，几秒内比例跳一截。
+ * 于是只实测这一步：发送前最后一次采样 → 第一次调用结束（出现第二次调用或本轮结束）后马上查一次。
+ * 期间别的对话有动静就丢掉这个样本；样本按模型分开，取中位数抵消 1% 的取整和偶发污染。
+ *
+ * 实测（2026-11-25/26，Opus）：146k 上下文 11 秒内 +5%，77k 8 秒内 +3%，约每 10 万 token 3.5%。
+ * rate_limit_event 只在进程第一次请求时来一次，采样主要靠 get_usage 回执。
  */
 import { api } from "./api";
 
-/** v3：从「等价 token」改成按美元；冷启动单独校准 */
-const KEY = "ccws.quotaCalib.v3";
-/** 累计观察到这么多个百分点的变化才给估算（比例只精确到 1%） */
-const READY_PCT = 5;
-const COLD_READY_PCT = 3;
-/** 超过后等比缩小：旧数据逐渐淡出，换套餐后能跟上 */
-const KEEP_PCT = 100;
-const COLD_KEEP_PCT = 30;
+const KEY = "ccws.quotaCold.v4";
+type Family = "opus" | "sonnet" | "haiku";
+/** 还没实测时的默认值（每 10 万 token 占百分之几）：Opus 实测，其余按输入价等比 */
+const DEFAULT_PER_100K: Record<Family, number> = { opus: 3.5, sonnet: 2.1, haiku: 0.7 };
+/** 上下文太小时涨幅只有 0–1%，取整误差比信号大，不记 */
+const MIN_CTX = 50_000;
+/** 每个模型留最近几个样本 */
+const KEEP = 9;
 
-interface Calib {
-  usd: number;
-  pct: number;
-  /** 实测过的冷启动：上下文 token 合计、对应的涨幅合计 */
-  coldTokens: number;
-  coldPct: number;
-}
+const family = (model: string | null): Family => (model && /haiku/i.test(model) ? "haiku" : model && /sonnet/i.test(model) ? "sonnet" : "opus");
 
-let calib: Calib = load();
-/** 上次采样以来花掉的美元（额度是账号级的，所有对话合在一起算） */
-let pendingUsd = 0;
-/** 各对话进程上次报告的累计花费 */
-const costs = new Map<string, number>();
-let last: { pct: number; resetsAt: number } | null = null;
-/** 正在实测的冷启动：started = 这轮已有回复（之后的采样不能当「发送前」），done = 这轮结束了 */
-let cold: { hostId: string; ctx: number; before: { pct: number; resetsAt: number } | null; started: boolean; done: boolean } | null = null;
+type Point = { pct: number; resetsAt: number };
 
-function load(): Calib {
+let samples: Record<Family, number[]> = load();
+let last: Point | null = null;
+/** 各对话进程本轮见过的消息 id（一条 id 一次 API 调用） */
+const calls = new Map<string, Set<string>>();
+/**
+ * 正在实测的冷启动。before = 第一次回复前最近的采样；first = 第一次调用的消息 id；
+ * closing = 第一次调用已结束，等下一次采样当「之后」；dirty = 期间别的会话有动静
+ */
+let cold: {
+  hostId: string;
+  session: string | null;
+  ctx: number;
+  family: Family;
+  before: Point | null;
+  first: string | null;
+  closing: boolean;
+  dirty: boolean;
+} | null = null;
+
+function load(): Record<Family, number[]> {
+  const empty = { opus: [], sonnet: [], haiku: [] };
   try {
-    const c = JSON.parse(localStorage.getItem(KEY) ?? "null");
-    if (c?.usd > 0 && c?.pct > 0) return { coldTokens: 0, coldPct: 0, ...c };
+    return { ...empty, ...JSON.parse(localStorage.getItem(KEY) ?? "{}") };
   } catch {
-    // 当作没有数据
+    return empty;
   }
-  return { usd: 0, pct: 0, coldTokens: 0, coldPct: 0 };
-}
-
-function save(hostId: string) {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(calib));
-  } catch {
-    // 存不下只是重启后重新积累
-  }
-  log(hostId, "calib", {
-    ...calib,
-    pctPerUsd: calib.usd ? calib.pct / calib.usd : null,
-    coldPctPer100k: calib.coldTokens ? (calib.coldPct * 1e5) / calib.coldTokens : null,
-  });
 }
 
 /** 埋点：按主机攒几秒再追加到云端 ~/.cache/cc-workstation/quota.jsonl，排查估算问题时云端 Claude 直接读 */
@@ -71,67 +66,73 @@ function flushLog() {
   logBuf.clear();
 }
 
-const sameWindow = (a: { resetsAt: number }, b: { resetsAt: number }) => Math.abs(a.resetsAt - b.resetsAt) < 120;
+const sameWindow = (a: Point, b: Point) => Math.abs(a.resetsAt - b.resetsAt) < 120;
 
 /** 一次 5H 比例采样（0–100，resetsAt 秒） */
 function sample(pct: number, resetsAt: number, source: string, hostId: string) {
   const cur = { pct, resetsAt };
-  // 窗口重置过（resetsAt 变了或比例回落）就丢掉这段
-  const counted = !!last && sameWindow(last, cur) && pct >= last.pct && pendingUsd > 0;
-  log(hostId, "sample", { source, pct, resetsAt, prevPct: last?.pct ?? null, usdSince: pendingUsd, counted });
-  if (counted) {
-    calib = { ...calib, usd: calib.usd + pendingUsd, pct: calib.pct + pct - last!.pct };
-    if (calib.pct > KEEP_PCT) calib = { ...calib, usd: (calib.usd * KEEP_PCT) / calib.pct, pct: KEEP_PCT };
-    save(hostId);
-  }
-  pendingUsd = 0;
+  log(hostId, "sample", { source, pct, resetsAt, prevPct: last?.pct ?? null });
   last = cur;
-
   if (!cold) return;
-  if (!cold.started) cold.before = cur;
-  else if (cold.done) {
-    const b = cold.before;
-    const ok = !!b && sameWindow(b, cur) && pct >= b.pct;
-    log(cold.hostId, "cold_result", { ctx: cold.ctx, before: b?.pct ?? null, after: pct, delta: b ? pct - b.pct : null, counted: ok });
-    if (ok) {
-      calib = { ...calib, coldTokens: calib.coldTokens + cold.ctx, coldPct: calib.coldPct + pct - b!.pct };
-      if (calib.coldPct > COLD_KEEP_PCT) calib = { ...calib, coldTokens: (calib.coldTokens * COLD_KEEP_PCT) / calib.coldPct, coldPct: COLD_KEEP_PCT };
-      save(cold.hostId);
-    }
-    cold = null;
+  if (!cold.first) cold.before = cur;
+  else if (cold.closing) finishCold(cur);
+}
+
+function finishCold(after: Point) {
+  const c = cold!;
+  cold = null;
+  const b = c.before;
+  const delta = b && sameWindow(b, after) && after.pct >= b.pct ? after.pct - b.pct : null;
+  const counted = delta !== null && !c.dirty && c.ctx >= MIN_CTX;
+  const per100k = delta === null ? null : (delta * 1e5) / c.ctx;
+  log(c.hostId, "cold_result", { ctx: c.ctx, family: c.family, before: b?.pct ?? null, after: after.pct, delta, per100k, dirty: c.dirty, counted });
+  if (!counted) return;
+  samples = { ...samples, [c.family]: [...samples[c.family], per100k!].slice(-KEEP) };
+  try {
+    localStorage.setItem(KEY, JSON.stringify(samples));
+  } catch {
+    // 存不下只是重启后重新积累
   }
+  log(c.hostId, "calib", { samples });
 }
 
 /**
- * 喂入云端 claude 的每个事件（chatId 区分对话进程，total_cost_usd 是进程内累计；hostId 决定埋点写到哪台主机）。
- * 返回 true 表示冷启动这轮刚结束，调用方应马上查一次 get_usage 作为「发送后」的采样。
+ * 喂入云端 claude 的每个事件（chatId 区分对话进程；hostId 决定埋点写到哪台主机）。
+ * 返回 true 表示冷启动的第一次调用刚结束，调用方应马上查一次 get_usage 作为「之后」的采样。
  */
 export function observeQuota(e: Record<string, any>, chatId: string | null, hostId: string): boolean {
-  if (e.type === "assistant" && cold) cold.started = true;
+  const key = chatId ?? "";
+  const mine = !!cold && !!e.session_id && e.session_id === cold.session;
+  if (cold && e.session_id && !mine && (e.type === "assistant" || e.type === "result")) cold.dirty = true;
+
+  if (e.type === "assistant") {
+    const id = e.message?.id;
+    if (id) calls.set(key, (calls.get(key) ?? new Set()).add(id));
+    if (mine && id && !cold!.closing) {
+      if (!cold!.first) cold!.first = id;
+      else if (id !== cold!.first) return (cold!.closing = true);
+    }
+    return false;
+  }
   if (e.type === "result") {
-    const key = chatId ?? "";
-    const total = typeof e.total_cost_usd === "number" ? e.total_cost_usd : 0;
-    const prev = costs.get(key) ?? 0;
-    const usd = total >= prev ? total - prev : total;
-    pendingUsd += usd;
-    costs.set(key, total);
     const u = e.usage ?? {};
     log(hostId, "turn", {
       session: e.session_id,
       models: Object.keys(e.modelUsage ?? {}),
-      usd,
-      calls: Array.isArray(u.iterations) ? u.iterations.length : null,
+      usd: e.total_cost_usd,
+      calls: calls.get(key)?.size ?? 0,
       input: u.input_tokens,
       write: u.cache_creation_input_tokens,
       read: u.cache_read_input_tokens,
       output: u.output_tokens,
       durationMs: e.duration_ms,
-      cold: !!cold?.started,
+      cold: mine,
     });
-    if (cold?.started) {
-      cold.done = true;
-      return true;
-    }
+    calls.delete(key);
+    // 只调用了一次就结束（直接回复）：第一次调用到这里才算完
+    if (mine && cold!.first && !cold!.closing) return (cold!.closing = true);
+    // 没回复就结束了（报错、被中断）：这次不算
+    if (mine && !cold!.first) cold = null;
     return false;
   }
   if (e.type === "rate_limit_event") {
@@ -143,54 +144,39 @@ export function observeQuota(e: Record<string, any>, chatId: string | null, host
     const t = w?.resets_at ? Date.parse(w.resets_at) : NaN;
     if (typeof w?.utilization === "number" && !isNaN(t)) sample(w.utilization, t / 1000, "get_usage", hostId);
   }
-  if (e.type === "exit") costs.delete(chatId ?? "");
+  if (e.type === "exit") calls.delete(key);
   return false;
 }
 
-/** 用户确认按冷启动发出：开始实测这一轮（发送前的比例取最近一次采样，回复前到的采样会更新它）；info 是给埋点的当时情形 */
-export function startCold(hostId: string, ctx: number, info: Record<string, unknown>) {
-  cold = { hostId, ctx, before: last, started: false, done: false };
-  log(hostId, "cold_start", { ctx, beforePct: last?.pct ?? null, ...info });
+/** 用户确认按冷启动发出：开始实测（「之前」取最近一次采样，第一次回复前到的采样会更新它）；info 是给埋点的当时情形 */
+export function startCold(hostId: string, session: string | null, ctx: number, model: string | null, info: Record<string, unknown>) {
+  cold = { hostId, session, ctx, family: family(model), before: last, first: null, closing: false, dirty: false };
+  log(hostId, "cold_start", { ctx, session, model, beforePct: last?.pct ?? null, ...info });
 }
 
-/** 各模型普通输入的 API 价格（美元 / 百万 token）；缓存写入 1 小时 ×2，缓存读 ×0.1，输出 ×5 */
-function inputPrice(model: string | null): number {
-  if (model && /haiku/i.test(model)) return 1;
-  if (model && /sonnet/i.test(model)) return 3;
-  return 5;
+/** 重新写入 10 万 token 缓存占百分之几：实测 2 次以上取中位数，只有 1 次就和默认值折中 */
+function per100k(model: string | null): { v: number; measured: number } {
+  const f = family(model);
+  const s = [...samples[f]].sort((a, b) => a - b);
+  if (!s.length) return { v: DEFAULT_PER_100K[f], measured: 0 };
+  const mid = s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+  return { v: s.length >= 2 ? mid : (mid + DEFAULT_PER_100K[f]) / 2, measured: s.length };
 }
 
-function usdPct(usd: number): number | null {
-  return calib.pct >= READY_PCT ? (usd * calib.pct) / calib.usd : null;
+/** 冷启动重建缓存（只算第一次调用）大约占 5 小时额度的百分之几；measured = 用了几次实测 */
+export function coldEstimate(ctx: number, model: string | null): { pct: number; measured: number } {
+  const k = per100k(model);
+  return { pct: (ctx * k.v) / 1e5, measured: k.measured };
 }
 
 /**
- * 冷启动这一轮大约占 5 小时额度的百分之几：有实测数据就用实测（measured）；
- * 否则按价格给区间——低值只算整段重新写入缓存，高值再加约 10 次工具调用各重读一遍上下文。
+ * 缓存还在时 /compact 大约占百分之几，按缓存写入折算：重读一遍上下文（缓存读是 1 小时写入价的 1/20）
+ * + 约 4k 摘要输出（输出价是写入价的 2.5 倍，折合 1 万写入）
  */
-export function coldEstimate(ctx: number, model: string | null): { lo: number; hi: number; measured: boolean } | null {
-  if (calib.coldPct >= COLD_READY_PCT) {
-    const v = (ctx * calib.coldPct) / calib.coldTokens;
-    return { lo: v, hi: v, measured: true };
-  }
-  const p = (ctx * inputPrice(model)) / 1e6;
-  const lo = usdPct(p * 2);
-  const hi = usdPct(p * 3);
-  return lo === null || hi === null ? null : { lo, hi, measured: false };
-}
-
-/** 缓存还在时 /compact 大约占百分之几：重读一遍上下文 + 约 4k 的摘要输出 */
-export function hotCompactPct(ctx: number, model: string | null): number | null {
-  return usdPct(((ctx * 0.1 + 4000 * 5) * inputPrice(model)) / 1e6);
+export function hotCompactPct(ctx: number, model: string | null): number {
+  return ((ctx * 0.05 + 10_000) * per100k(model).v) / 1e5;
 }
 
 export function pctText(p: number): string {
   return p < 1 ? "不到 1%" : `${Math.round(p)}%`;
-}
-
-/** 区间：两端取整后相同就只写一个数 */
-export function rangeText(r: { lo: number; hi: number }): string {
-  const lo = pctText(r.lo);
-  const hi = pctText(r.hi);
-  return lo === hi ? lo : r.lo < 1 ? `不到 1%–${hi}` : `${Math.round(r.lo)}%–${hi}`;
 }

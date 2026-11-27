@@ -903,12 +903,22 @@ impl AppState {
     }
 }
 
-/// 读历史会话：有本机缓存就只增量拉新增部分，读完更新缓存
+/// 读历史会话：有本机缓存就只增量拉新增部分，读完更新缓存。
+/// 网络抖一下连接断了（输出不完整）就重连再读一次，不用用户手动重试
 #[tauri::command]
 async fn chat_history(state: State<'_, AppState>, host_id: String, file: String) -> CmdResult<Vec<Value>> {
-    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
     let root = state.cache_root();
-    let lines = chat::history(&conn, &file, Some(&chat::cache_path(&root, &host_id, &file))).await?;
+    let cache = chat::cache_path(&root, &host_id, &file);
+    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
+    let lines = match chat::history(&conn, &file, Some(&cache)).await {
+        Ok(l) => l,
+        Err(e) if conn.handle.is_closed() || conn.dead() => {
+            log::warn!("读取会话时连接断开，重连重试：{e:#}");
+            let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
+            chat::history(&conn, &file, Some(&cache)).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
     tauri::async_runtime::spawn_blocking(move || chat::cache_prune(&root));
     Ok(lines)
 }

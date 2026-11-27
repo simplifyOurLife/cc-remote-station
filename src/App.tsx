@@ -590,7 +590,7 @@ export default function App() {
                 <div
                   key={t.key}
                   className={`tab ${t.key === activeKey ? "active" : ""} ${t.panes.some((p) => runningPanes.has(p.key)) ? "running" : ""}`}
-                  title={`${t.title || t.host.name}\n中键点击关闭`}
+                  title={`${t.host.name}${t.title ? ` ▸ ${t.title}` : ""}${t.panes.some((p) => runningPanes.has(p.key)) ? "\nClaude 正在回答" : ""}\n中键点击关闭`}
                   onClick={() => activate(t.key)}
                   // 中键关闭（和浏览器一致）；mousedown 拦掉中键自动滚动
                   onMouseDown={(e) => e.button === 1 && e.preventDefault()}
@@ -599,17 +599,15 @@ export default function App() {
                 >
                   {t.attention && <span className="tab-dot" />}
                   {t.panes.some((p) => runningPanes.has(p.key)) ? (
-                    <span className="tab-kind running" title="Claude 正在回答">
+                    <span className="tab-kind running">
                       <span className="spinner" />
-                      运行中
                     </span>
                   ) : (
                     <span className="tab-kind">{t.panes[0].kind === "chat" ? "对话" : "终端"}</span>
                   )}
                   <span className="tab-title">
-                    {t.host.name}
+                    {t.title || t.host.name}
                     {t.panes.length > 1 && <span className="muted"> [{t.panes.length}]</span>}
-                    {t.title && <span className="muted"> ▸ {t.title}</span>}
                   </span>
                   <button
                     className="icon"

@@ -30,8 +30,10 @@ pub struct Conn {
 
 /// 这么久内确认过活着的连接直接复用，不再探测
 const PROBE_FRESH: Duration = Duration::from_secs(10);
-/// 探测只等一个来回，这么久没回应就判定已断
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// 探测等这么久没回应、期间也没收到任何数据才判定已断。
+/// 不能太短：本机在往上传大块数据（工具返回文件内容、发图片）时，ping 排在上行数据后面，
+/// 跨境链路上几秒很常见，误判会掐掉连接上正在传的历史会话、终端和工具转发
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 开通道也只等一个来回；死连接上会一直挂着，要等心跳超时（约 45 秒）才报错
 const OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -63,14 +65,20 @@ impl Conn {
         if self.checked.lock().unwrap().elapsed() < PROBE_FRESH {
             return true;
         }
-        let ok = matches!(tokio::time::timeout(PROBE_TIMEOUT, self.handle.send_ping()).await, Ok(Ok(())))
-            && !self.handle.is_closed();
+        let since = Instant::now();
+        let ping = matches!(tokio::time::timeout(PROBE_TIMEOUT, self.handle.send_ping()).await, Ok(Ok(())));
+        let ok = (ping || *self.checked.lock().unwrap() > since) && !self.handle.is_closed();
         if ok {
             *self.checked.lock().unwrap() = Instant::now();
         } else {
             self.kill();
         }
         ok
+    }
+
+    /// 已判定断开（探测失败或开通道超时）
+    pub fn dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
     }
 
     fn kill(self: &Arc<Self>) {
@@ -105,17 +113,23 @@ impl Conn {
         let _ = tokio::time::timeout(PROBE_TIMEOUT, self.handle.cancel_tcpip_forward("127.0.0.1", port)).await;
     }
 
-    /// 开会话通道，超时就判定连接已断
+    /// 开会话通道，超时且这段时间里没收到任何数据就判定连接已断。
+    /// 别的通道在传大块输出（读历史会话）时，开通道的回应排在数据后面，高延迟链路上常超过 8 秒：
+    /// 这时连接明明活着，接着等，不能断开——断了会连带正在传的输出一起丢（「输出不完整」）
     pub async fn open_channel(self: &Arc<Self>) -> Result<russh::Channel<client::Msg>> {
-        match tokio::time::timeout(OPEN_TIMEOUT, self.handle.channel_open_session()).await {
-            Ok(ch) => {
-                let ch = ch?;
-                *self.checked.lock().unwrap() = Instant::now();
-                Ok(ch)
-            }
-            Err(_) => {
-                self.kill();
-                bail!("云主机 {} 秒无响应，连接已断开，请重试", OPEN_TIMEOUT.as_secs())
+        let mut open = Box::pin(self.handle.channel_open_session());
+        loop {
+            match tokio::time::timeout(OPEN_TIMEOUT, &mut open).await {
+                Ok(ch) => {
+                    let ch = ch?;
+                    *self.checked.lock().unwrap() = Instant::now();
+                    return Ok(ch);
+                }
+                Err(_) if self.checked.lock().unwrap().elapsed() < OPEN_TIMEOUT && !self.handle.is_closed() => continue,
+                Err(_) => {
+                    self.kill();
+                    bail!("云主机 {} 秒无响应，连接已断开，请重试", OPEN_TIMEOUT.as_secs())
+                }
             }
         }
     }

@@ -1,4 +1,5 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ImageViewer } from "./ImageViewer";
 import { Loading } from "./Loading";
 import { ConnectScreen } from "./ConnectScreen";
 import { Logo } from "./Logo";
@@ -7,7 +8,7 @@ import { hostDateTime, hostShortTime, HostTz, tzLabel, useHostTz } from "./hostT
 import { Channel } from "@tauri-apps/api/core";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { ask } from "./modal";
+import { ask, choose } from "./modal";
 import { PlanCard, QuestionCard } from "./InteractiveCards";
 import { api, ChatSession, errorText, Host, PermissionMode, resumeCommand } from "./api";
 import {
@@ -52,7 +53,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { ChatStatus, nextMode } from "./ChatStatus";
 import { PermissionCard, ToolCard } from "./ToolCard";
 import { kbd, modKey } from "./platform";
-import { coldEstimate, observeQuota, rangeText, startCold } from "./quota";
+import { coldEstimate, observeQuota, pctText, startCold } from "./quota";
 import { promptSuggestionsOn } from "./prefs";
 
 /**
@@ -381,6 +382,7 @@ export function ChatView(props: Props) {
   /** 搜索开关：区分大小写、只搜我的提问（关掉搜索框后保留） */
   const [searchOpt, setSearchOpt] = useState({ cs: false, mine: false });
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const paneRef = useRef<HTMLDivElement>(null);
   const [showCommands, setShowCommands] = useState(false);
   const [uploading, setUploading] = useState(false);
   /** /resume 的会话选择框：q 为过滤关键词 */
@@ -629,7 +631,7 @@ export function ChatView(props: Props) {
     if (e.type === "prompt_suggestion" && typeof e.suggestion === "string" && promptSuggestionsOn()) setSuggestion(e.suggestion.trim() || null);
     // 压缩完没有新回复，上下文大小要主动查（reduce 已把旧值清空，回执会填上）
     if (e.type === "system" && e.subtype === "compact_boundary") write(contextRequest());
-    // 冷启动这轮刚结束：马上查一次额度，作为实测的「发送后」
+    // 冷启动的第一次调用刚结束：马上查一次额度，作为实测的「重建缓存之后」
     if (observeQuota(e, chatIdRef.current, propsRef.current.host.id)) write(usageRequest());
     setState((s) => reduce(s, e));
   };
@@ -690,7 +692,7 @@ export function ChatView(props: Props) {
     } else if (m[1] === "continue") {
       // 优先当前目录最近的会话，没有就取全部里最近的（列表已按时间倒序）
       const latest = sessions?.find((s) => s.cwd === cwd) ?? sessions?.[0];
-      if (latest) openSession(latest, false);
+      if (latest) openSession(latest, false, false);
       else setState((s) => system(s, "没有可以继续的历史会话"));
     } else if (m[1] === "clear") {
       switchTo(emptyState, cwd);
@@ -910,7 +912,7 @@ export function ChatView(props: Props) {
     const ctx = coldTokens()!;
     const est = coldEstimate(ctx, priceModel);
     setColdAck(state.lastActive);
-    startCold(host.id, ctx, { session: state.sessionId, model: priceModel, idleMin: Math.round((Date.now() - state.lastActive!) / 60_000), est });
+    startCold(host.id, state.sessionId, ctx, priceModel, { idleMin: Math.round((Date.now() - state.lastActive!) / 60_000), est });
     write(usageRequest());
   };
   const resumeSeq = useRef(0);
@@ -971,7 +973,7 @@ export function ChatView(props: Props) {
           ),
         ),
       );
-      propsRef.current.onTitle(s.title.slice(0, 30));
+      propsRef.current.onTitle((loadTitles()[s.sessionId] ?? s.title).slice(0, 30));
       if (cached) {
         setLoadingSession(null);
         refreshFromCloud(seq, remote, hist, cached.length);
@@ -985,9 +987,29 @@ export function ChatView(props: Props) {
     }
   };
 
-  /** 同一会话不能两个进程同时写：已在别处打开就切过去，否则按 newTab 开新标签或在本窗格继续 */
-  const openSession = (s: ChatSession, newTab: boolean) => {
-    if (!propsRef.current.onOpenSession(s, newTab)) resume(s);
+  /**
+   * 同一会话不能两个进程同时写：已在别处打开就切过去，否则按 newTab 开新标签或在本窗格继续。
+   * 本窗格已有对话时先问，防误点；正在回答时说明会中断。careful = false：用户明确要切（/continue、Ctrl+E 选择框），空闲时不问
+   */
+  const openSession = async (s: ChatSession, newTab: boolean, careful = true) => {
+    // 点的就是当前会话
+    if (!newTab && s.sessionId === state.sessionId) return;
+    if (propsRef.current.onOpenSession(s, newTab)) return;
+    const busy = !!state.sessionId || state.items.some((i) => i.kind === "user");
+    if (state.running || (careful && busy)) {
+      const name = titles[s.sessionId] ?? s.title;
+      const r = await choose(
+        state.running
+          ? `当前对话还在回答中。在这个标签里打开「${name}」会中断这次回答（已经保存的部分不会丢）。\n\n可以改为在新标签里打开，让当前回答继续。`
+          : `在这个标签里换成「${name}」？当前对话不会丢，之后可以从左侧列表再打开。\n\n提示：Ctrl+点击或中键点击会直接在新标签打开，不弹这个提示。`,
+        state.running
+          ? { title: "切换会话", kind: "warning", okLabel: "中断并切换", altLabel: "新标签打开" }
+          : { title: "切换会话", okLabel: "在这里打开", altLabel: "新标签打开" },
+      );
+      if (r === "alt") propsRef.current.onOpenSession(s, true);
+      if (r !== "ok") return;
+    }
+    resume(s);
   };
 
   /** 「新对话」按钮：本窗格还空着（没发过消息）或 inPlace（Shift+点击）就在这里开始，否则新开标签，免得打断当前对话 */
@@ -1099,6 +1121,9 @@ export function ChatView(props: Props) {
 
   /** 正在就地重命名的会话（WebView 里的 prompt() 不可靠，改成列表内输入框） */
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
+  /** 正在全屏查看的图片 */
+  const [viewImage, setViewImage] = useState<string | null>(null);
+  const closeImage = useCallback(() => setViewImage(null), []);
   const commitRename = () => {
     if (!renaming) return;
     const next = { ...titles };
@@ -1106,6 +1131,8 @@ export function ChatView(props: Props) {
     else delete next[renaming.id];
     setRenaming(null);
     setTitles(next);
+    // 改的是当前打开的会话：标签名跟着变
+    if (renaming.id === state.sessionId) propsRef.current.onTitle(renaming.value.trim() || basename(cwd));
     try {
       localStorage.setItem(TITLES_KEY, JSON.stringify(next));
     } catch {
@@ -1304,14 +1331,22 @@ export function ChatView(props: Props) {
     else setReveal(pick.key);
   };
 
+  /** 打开搜索框并选中里面的字；对话里选中了一小段单行文字就拿它当关键词（和浏览器一致） */
+  const openSearch = () => {
+    const sel = window.getSelection()?.toString().trim() ?? "";
+    const pick = sel && sel.length <= 100 && !sel.includes("\n") ? sel : null;
+    setSearch((s) => (pick ? { q: pick, index: 0 } : (s ?? { q: "", index: 0 })));
+    requestAnimationFrame(() => searchInputRef.current?.select());
+  };
+
   // 对话窗格里的快捷键（尽量和 IDEA 一致）；全局的在 App 里
-  const onPaneKeyDown = (e: React.KeyboardEvent) => {
+  const onPaneKeyDown = (e: React.KeyboardEvent | KeyboardEvent) => {
     const mod = modKey(e);
     const k = e.key.toLowerCase();
     const typing = e.target instanceof HTMLElement && /^(INPUT|TEXTAREA)$/.test(e.target.tagName);
     const plain = mod && !e.shiftKey && !e.altKey;
     let run: (() => void) | null = null;
-    if (plain && k === "f") run = () => setSearch((s) => s ?? { q: "", index: 0 });
+    if (plain && k === "f") run = openSearch;
     else if (e.key === "F3" && search) run = () => stepMatch(e.shiftKey);
     else if (plain && k === "e")
       run = () => {
@@ -1327,6 +1362,21 @@ export function ChatView(props: Props) {
     e.preventDefault();
     run();
   };
+  // 点了消息区空白、标签栏之后焦点落到 body，按键到不了窗格：当前聚焦的可见对话窗格在 window 上兜底接住。
+  // 焦点在窗格内、终端、别的输入框或弹窗里时不管
+  const paneKeysRef = useRef(onPaneKeyDown);
+  paneKeysRef.current = onPaneKeyDown;
+  useEffect(() => {
+    if (!visible || !focused) return;
+    const key = (e: KeyboardEvent) => {
+      const t = e.target instanceof Element ? e.target : null;
+      if (t && t !== document.body && t.closest(".chat-pane, .xterm, input, textarea, select, [role=dialog]")) return;
+      // 工作区被切走时是 display:none
+      if (paneRef.current?.offsetParent) paneKeysRef.current(e);
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, [visible, focused]);
 
   // ---- 输入框：/ 命令与 @ 文件补全 ----
 
@@ -1437,12 +1487,12 @@ export function ChatView(props: Props) {
 
   const pickSession = (s: ChatSession) => {
     setPicker(null);
-    openSession(s, false);
+    openSession(s, false, false);
     inputRef.current?.focus();
   };
 
   return (
-    <div className={`chat-pane terminal-pane ${focused ? "focused" : ""}`} onMouseDown={props.onFocus} onKeyDown={onPaneKeyDown}>
+    <div ref={paneRef} className={`chat-pane terminal-pane ${focused ? "focused" : ""}`} onMouseDown={props.onFocus} onKeyDown={onPaneKeyDown}>
       {booting &&
         (firstLoad ? (
           <ConnectScreen
@@ -1621,7 +1671,7 @@ export function ChatView(props: Props) {
                     onAuxClick={(e) => e.button === 1 && openSession(s, true)}
                     onContextMenu={(e) =>
                       openMenu(e, [
-                        { label: "打开", onClick: () => openSession(s, false) },
+                        { label: "打开", onClick: () => openSession(s, false, false) },
                         { label: "在新标签打开", hint: kbd("Ctrl+点击"), onClick: () => openSession(s, true) },
                         { label: "在终端中继续", hint: "claude --resume", onClick: () => resumeInTerminal(s) },
                         { label: "复制恢复命令", onClick: () => copyText(resumeCommand(s), "恢复命令") },
@@ -1957,7 +2007,8 @@ export function ChatView(props: Props) {
                 </div>
                 {item.blocks.map((b, i) => {
                   if (b.type === "text") return item.kind === "user" ? <div key={i} className="user-text">{b.text}</div> : <Markdown key={i} text={b.text} />;
-                  if (b.type === "image") return <img key={i} className="chat-image" src={b.src} />;
+                  if (b.type === "image")
+                    return <img key={i} className="chat-image" src={b.src} title="点击查看大图" onClick={() => setViewImage(b.src)} />;
                   if (b.type === "thinking")
                     return (
                       <details key={i} className="thinking">
@@ -2028,7 +2079,7 @@ export function ChatView(props: Props) {
             <div className="chat-attachments">
               {images.map((src, i) => (
                 <div key={i} className="chat-thumb">
-                  <img src={src} />
+                  <img src={src} title="点击查看大图" onClick={() => setViewImage(src)} />
                   <button className="icon" onClick={() => setImages(images.filter((_, j) => j !== i))}>
                     ×
                   </button>
@@ -2064,11 +2115,15 @@ export function ChatView(props: Props) {
                 {(() => {
                   const est = coldEstimate(coldTokens()!, priceModel);
                   return (
-                    est && (
-                      <span title={est.measured ? "按此前冷启动的实测（整轮，含后续工具调用重读上下文）" : "按价格估算：低值是直接回复，高值是还要调用约 10 次工具（每次都重读整段上下文）。实测几次冷启动后会更准"}>
-                        （这一轮预计约消耗 5 小时额度的 <b>{rangeText(est)}</b>）
-                      </span>
-                    )
+                    <span
+                      title={
+                        est.measured >= 2
+                          ? `按此前 ${est.measured} 次冷启动实测的中位数，只算第一次调用重建缓存；之后每次工具调用按缓存读另计`
+                          : "按默认系数估算（Opus 约每 10 万 token 3.5%），只算第一次调用重建缓存。实测几次冷启动后会更准"
+                      }
+                    >
+                      （重新激活预计约消耗 5 小时额度的 <b>{pctText(est.pct)}</b>，之后按任务正常消耗）
+                    </span>
                   );
                 })()}
                 。发送消息或执行 /compact 都会按完整上下文重新计费一次。只是追问一两句就直接发；还要继续很多轮，先 /compact
@@ -2148,6 +2203,7 @@ export function ChatView(props: Props) {
           </div>
         </div>
       </div>
+      {viewImage && <ImageViewer src={viewImage} onClose={closeImage} />}
     </div>
   );
 }
