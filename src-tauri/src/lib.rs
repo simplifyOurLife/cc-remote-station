@@ -2,6 +2,7 @@ mod chat;
 mod forward;
 mod hosts;
 mod mcp;
+mod preview;
 mod settings;
 mod ssh;
 mod terminal;
@@ -997,6 +998,26 @@ async fn chat_files(state: State<'_, AppState>, host_id: String, cwd: String) ->
     Ok(chat::list_files(&conn, &cwd).await?)
 }
 
+/// 预览云主机上的文件（相对路径按对话的工作目录解析）
+#[tauri::command]
+async fn file_preview(state: State<'_, AppState>, host_id: String, cwd: String, path: String) -> CmdResult<preview::FilePreview> {
+    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
+    Ok(preview::read(&conn, &cwd, &path).await?)
+}
+
+#[tauri::command]
+async fn files_exist(state: State<'_, AppState>, host_id: String, cwd: String, paths: Vec<String>) -> CmdResult<Vec<bool>> {
+    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
+    Ok(preview::exists(&conn, &cwd, &paths).await?)
+}
+
+/// 把云主机上的文件存到用户在「另存为」里选的本机路径
+#[tauri::command]
+async fn file_download(state: State<'_, AppState>, host_id: String, cwd: String, path: String, dest: String) -> CmdResult<()> {
+    let (conn, _) = get_or_connect(&state, &host_id, None, &Credentials::default()).await?;
+    Ok(preview::download(&conn, &cwd, &path, std::path::Path::new(&dest)).await?)
+}
+
 /// 回答登录中途的验证码弹窗；answers 为 null 表示取消
 #[tauri::command]
 fn ssh_prompt_answer(state: State<'_, AppState>, id: String, answers: Option<Vec<String>>) {
@@ -1218,6 +1239,9 @@ pub fn run() {
             chat_files,
             chat_delete,
             chat_upload,
+            file_preview,
+            files_exist,
+            file_download,
             save_text
         ])
         .build(tauri::generate_context!())

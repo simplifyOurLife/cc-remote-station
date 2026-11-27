@@ -4923,6 +4923,126 @@ button.outline-item.hit .outline-no {
   border: 1px solid var(--cyan);
   box-shadow: 0 0 24px rgb(45 226 255 / 0.25);
 }
+/* ---------- 文件预览抽屉 ---------- */
+.file-preview {
+  position: relative;
+  flex-shrink: 0;
+  min-width: 300px;
+  max-width: 80%;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--wire);
+  background: var(--deck);
+  outline: none;
+}
+.file-preview-resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  z-index: 2;
+  width: 6px;
+  cursor: col-resize;
+}
+.file-preview-resize:hover {
+  background: rgb(45 226 255 / 0.3);
+}
+.file-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 8px 6px 12px;
+  border-bottom: 1px solid var(--wire);
+}
+.file-preview-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  margin-right: 6px;
+}
+.file-preview-title b,
+.file-preview-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-preview-title b {
+  color: var(--cyan);
+  font-family: var(--font-mono);
+}
+.file-preview-title span {
+  font-size: 11.5px;
+}
+.file-preview-modes {
+  display: flex;
+  gap: 4px;
+  padding: 6px 12px 0;
+}
+.file-preview-modes button.active {
+  color: var(--cyan);
+  box-shadow: inset 0 -2px 0 var(--cyan);
+}
+.file-preview-meta {
+  padding: 4px 12px;
+  font-size: 11.5px;
+}
+.file-preview-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.file-preview-body .pad {
+  padding: 12px;
+}
+.file-preview-body .diff {
+  max-height: none;
+  margin: 8px 12px;
+}
+.file-preview-code.hljs {
+  min-width: max-content;
+  padding: 4px 0;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+}
+.file-preview-code .ln {
+  display: flex;
+}
+.file-preview-code .ln.hit {
+  background: rgb(45 226 255 / 0.1);
+  box-shadow: inset 2px 0 0 var(--cyan);
+}
+.file-preview-code .no {
+  flex-shrink: 0;
+  width: calc(var(--digits) * 1ch + 20px);
+  padding-right: 12px;
+  text-align: right;
+  color: var(--dim);
+  opacity: 0.6;
+  user-select: none;
+}
+.file-preview-md {
+  padding: 8px 16px;
+}
+.file-preview-image {
+  display: block;
+  max-width: calc(100% - 24px);
+  margin: 12px;
+}
+/* 可点开预览的路径 */
+.markdown code.file-link,
+.tool-summary .file-link {
+  cursor: pointer;
+  text-decoration: underline dotted rgb(45 226 255 / 0.6);
+  text-underline-offset: 3px;
+}
+.markdown code.file-link:hover,
+.tool-summary .file-link:hover {
+  color: #fff;
+}
 @keyframes image-viewer-in {
   from {
     opacity: 0;

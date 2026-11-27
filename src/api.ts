@@ -276,6 +276,21 @@ export interface OpenOptions {
   session: string | null;
 }
 
+/** 云主机上一个文件的预览 */
+export interface FilePreviewData {
+  /** 解析后的绝对路径 */
+  path: string;
+  size: number;
+  /** 修改时间，Unix 秒 */
+  mtime: number;
+  kind: "text" | "image" | "binary";
+  text: string | null;
+  /** 图片的 data URL */
+  image: string | null;
+  /** 文件较大，只读了前一部分 */
+  truncated: boolean;
+}
+
 export interface UpdateInfo {
   version: string;
   current: string;
@@ -367,6 +382,10 @@ export const api = {
   saveText: (path: string, text: string) => invoke<void>("save_text", { path, text }),
   /** 把本机文件传到云主机，返回远端路径 */
   chatUpload: (hostId: string, path: string) => invoke<string>("chat_upload", { hostId, path }),
+  /** 相对路径按 cwd 解析 */
+  filePreview: (hostId: string, cwd: string, path: string) => invoke<FilePreviewData>("file_preview", { hostId, cwd, path }),
+  filesExist: (hostId: string, cwd: string, paths: string[]) => invoke<boolean[]>("files_exist", { hostId, cwd, paths }),
+  fileDownload: (hostId: string, cwd: string, path: string, dest: string) => invoke<void>("file_download", { hostId, cwd, path, dest }),
 };
 
 /** 主机用的工具；从没配过时只有内置工具 */

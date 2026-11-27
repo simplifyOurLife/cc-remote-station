@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useContext, useState } from "react";
 import { toolSummary } from "./chatModel";
 import type { PermissionRequest, SubStep, ToolResult } from "./chatModel";
+import { FileLinkContext, PreviewTarget } from "./fileLinks";
 
 const ICONS: Record<string, string> = {
   Bash: "❯",
@@ -21,8 +22,18 @@ function icon(name: string) {
   return ICONS[name] ?? "⚙";
 }
 
+/** 读写文件的工具：摘要里的路径可点开预览。Read 高亮读的行，Edit 默认看改动 */
+function fileTarget(name: string, input: Record<string, any>): PreviewTarget | null {
+  const path = input.file_path ?? input.notebook_path;
+  if (typeof path !== "string" || !["Read", "Write", "Edit", "MultiEdit", "NotebookEdit"].includes(name)) return null;
+  if (name === "Read" && input.offset) return { path, line: input.offset, endLine: input.limit ? input.offset + input.limit - 1 : input.offset };
+  const edits = name === "Edit" ? [input] : name === "MultiEdit" ? (input.edits ?? []) : [];
+  if (edits.length) return { path, edits: edits.map((e: any) => ({ oldText: e.old_string ?? "", newText: e.new_string ?? "" })) };
+  return { path };
+}
+
 /** 简易 diff：旧内容标红、新内容标绿（Edit 的 old/new 片段本来就不长） */
-function Diff({ oldText, newText }: { oldText: string; newText: string }) {
+export function Diff({ oldText, newText }: { oldText: string; newText: string }) {
   return (
     <pre className="diff">
       {oldText.split("\n").map((l, i) => (
@@ -95,12 +106,29 @@ export function ToolCard({
   // 待办清单和改文件默认展开（用户最关心），其余默认折叠
   const [open, setOpen] = useState(name === "TodoWrite" || name === "Edit" || name === "MultiEdit");
   const status = !result ? "pending" : result.isError ? "error" : "ok";
+  const links = useContext(FileLinkContext);
+  const file = links && fileTarget(name, input);
   return (
     <div className={`tool-card ${status}`}>
       <div className="tool-head" onClick={() => setOpen(!open)}>
         <span className="tool-icon">{icon(name)}</span>
         <b>{name}</b>
-        <span className="tool-summary">{toolSummary(name, input)}</span>
+        <span className="tool-summary">
+          {file ? (
+            <span
+              className="file-link"
+              title="点击预览文件"
+              onClick={(e) => {
+                e.stopPropagation();
+                links?.open(file);
+              }}
+            >
+              {file.path}
+            </span>
+          ) : (
+            toolSummary(name, input)
+          )}
+        </span>
         {steps && steps.length > 0 && <span className="muted">{steps.filter((s) => s.kind === "tool").length} 步</span>}
         <span className="tool-status" title={status === "pending" ? "执行中" : status === "error" ? "失败" : "完成"}>
           {status === "pending" ? "RUN" : status === "error" ? "ERR" : "OK"}

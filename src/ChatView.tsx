@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ImageViewer } from "./ImageViewer";
+import { FilePreview } from "./FilePreview";
+import { FileLinkContext, FileLinks, PreviewTarget } from "./fileLinks";
 import { Loading } from "./Loading";
 import { ConnectScreen } from "./ConnectScreen";
 import { Logo } from "./Logo";
@@ -240,6 +242,8 @@ interface Props {
   onOpenSession: (s: ChatSession, newTab: boolean) => boolean;
   /** 新开终端标签，用 claude --resume 接着聊这个会话 */
   onResumeInTerminal: (s: ChatSession) => void;
+  /** 新开终端标签并执行这条命令（文件预览的「在终端打开」） */
+  onRunInTerminal: (command: string) => void;
 }
 
 interface Completion {
@@ -1124,6 +1128,41 @@ export function ChatView(props: Props) {
   /** 正在全屏查看的图片 */
   const [viewImage, setViewImage] = useState<string | null>(null);
   const closeImage = useCallback(() => setViewImage(null), []);
+  /** 右侧预览抽屉里的文件 */
+  const [preview, setPreview] = useState<PreviewTarget | null>(null);
+  // 正文里像路径的行内代码要远端确认存在：结果按「目录+路径」缓存，同一时刻的查询攒成一次 SSH 调用
+  const existCache = useRef(new Map<string, Promise<boolean>>());
+  const existQueue = useRef<{ key: string; path: string; resolve: (ok: boolean) => void }[]>([]);
+  const fileLinks = useMemo<FileLinks>(() => {
+    const flush = () => {
+      const q = existQueue.current;
+      existQueue.current = [];
+      api.filesExist(host.id, cwd, q.map((x) => x.path)).then(
+        (r) => q.forEach((x, i) => x.resolve(r[i])),
+        () =>
+          q.forEach((x) => {
+            // 没连上不算「不存在」，下次再查
+            existCache.current.delete(x.key);
+            x.resolve(false);
+          }),
+      );
+    };
+    return {
+      open: setPreview,
+      exists: (path) => {
+        const key = `${cwd}\0${path}`;
+        let p = existCache.current.get(key);
+        if (!p) {
+          p = new Promise((resolve) => {
+            if (!existQueue.current.length) setTimeout(flush, 80);
+            existQueue.current.push({ key, path, resolve });
+          });
+          existCache.current.set(key, p);
+        }
+        return p;
+      },
+    };
+  }, [host.id, cwd]);
   const commitRename = () => {
     if (!renaming) return;
     const next = { ...titles };
@@ -1492,6 +1531,7 @@ export function ChatView(props: Props) {
   };
 
   return (
+    <FileLinkContext.Provider value={fileLinks}>
     <div ref={paneRef} className={`chat-pane terminal-pane ${focused ? "focused" : ""}`} onMouseDown={props.onFocus} onKeyDown={onPaneKeyDown}>
       {booting &&
         (firstLoad ? (
@@ -2203,7 +2243,17 @@ export function ChatView(props: Props) {
           </div>
         </div>
       </div>
+      {preview && (
+        <FilePreview
+          hostId={host.id}
+          cwd={cwd}
+          target={preview}
+          onClose={() => setPreview(null)}
+          onOpenTerminal={(dir) => props.onRunInTerminal(`cd '${dir.replace(/'/g, `'\\''`)}'`)}
+        />
+      )}
       {viewImage && <ImageViewer src={viewImage} onClose={closeImage} />}
     </div>
+    </FileLinkContext.Provider>
   );
 }

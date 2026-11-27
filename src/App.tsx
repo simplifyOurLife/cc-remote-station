@@ -765,6 +765,7 @@ export default function App() {
                       onSession={(chatId) => setPaneChatId(t.key, p.key, chatId)}
                       onOpenSession={(s, newTab) => openChatSession(t, p.key, s, newTab)}
                       onResumeInTerminal={(s) => resumeInTerminal(t, p.key, s)}
+                      onRunInTerminal={(cmd) => openTab(t.host, undefined, undefined, undefined, cmd)}
                     />
                   ) : (
                     <TerminalView
